@@ -93,8 +93,7 @@ func main() {
 		// 预读 index.html（SPA 回退时直接返回，避免 FileServer 重定向）
 		indexHTML, _ := fs.ReadFile(subFS, "index.html")
 
-		// SPA 回退：所有 /admin/* 路径优先尝试静态文件，找不到则返回 index.html
-		r.GET("/admin/*filepath", func(c *gin.Context) {
+		serveAdmin := func(c *gin.Context) {
 			fp := c.Param("filepath")
 			// 尝试打开请求的文件（排除目录和根路径）
 			if fp != "/" {
@@ -110,7 +109,11 @@ func main() {
 			}
 			// 文件不存在或者是目录 → 直接返回 index.html 字节（让 React Router 处理）
 			c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
-		})
+		}
+
+		// 同时处理 /admin 和 /admin/*，避免依赖自动补斜杠重定向。
+		r.GET("/admin", serveAdmin)
+		r.GET("/admin/*filepath", serveAdmin)
 	}
 
 	// 根路径重定向到管理后台（使用 302 避免浏览器永久缓存）

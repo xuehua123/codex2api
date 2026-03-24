@@ -34,6 +34,7 @@ export default function Accounts() {
   })
   const [submitting, setSubmitting] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set())
   const [batchLoading, setBatchLoading] = useState(false)
   const { toast, showToast } = useToast()
 
@@ -104,12 +105,18 @@ export default function Accounts() {
   }
 
   const handleRefresh = async (account: AccountRow) => {
+    setRefreshingIds((prev) => new Set(prev).add(account.id))
     try {
       await api.refreshAccount(account.id)
-      showToast('刷新成功')
-      void reload()
+      showToast('刷新请求已发送')
     } catch (error) {
       showToast(`刷新失败: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setRefreshingIds((prev) => {
+        const next = new Set(prev)
+        next.delete(account.id)
+        return next
+      })
     }
   }
 
@@ -238,9 +245,15 @@ export default function Accounts() {
                         <TableCell className="text-[14px] text-muted-foreground">{formatRelativeTime(account.updated_at)}</TableCell>
                         <TableCell className="text-right">
                           <div className="flex items-center gap-1.5 justify-end">
-                            <Button variant="outline" size="sm" onClick={() => void handleRefresh(account)} title="刷新 AT">
-                              <RefreshCw className="size-3" />
-                              刷新
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={refreshingIds.has(account.id)}
+                              onClick={() => void handleRefresh(account)}
+                              title="刷新 AT"
+                            >
+                              <RefreshCw className={`size-3 ${refreshingIds.has(account.id) ? 'animate-spin' : ''}`} />
+                              {refreshingIds.has(account.id) ? '刷新中' : '刷新'}
                             </Button>
                             <Button variant="destructive" size="sm" onClick={() => void handleDelete(account)}>
                               <Trash2 className="size-3" />
