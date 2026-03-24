@@ -78,10 +78,19 @@ func main() {
 	r.Use(loggerMiddleware())
 
 	handler := proxy.NewHandler(store, cfg.APIKeys, db)
+
+	// 全局 RPM 限流器（支持运行时动态调整）
+	rateLimiter := proxy.NewRateLimiter(cfg.GlobalRPM)
+	r.Use(rateLimiter.Middleware())
+	if cfg.GlobalRPM > 0 {
+		log.Printf("全局限流: %d RPM", cfg.GlobalRPM)
+	}
+	log.Printf("每账号并发上限: %d", cfg.MaxConcurrency)
+
 	handler.RegisterRoutes(r)
 
 	// 管理后台 API
-	adminHandler := admin.NewHandler(store, db)
+	adminHandler := admin.NewHandler(store, db, rateLimiter)
 	adminHandler.RegisterRoutes(r)
 
 	// 管理后台前端静态文件

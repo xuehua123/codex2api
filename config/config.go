@@ -44,12 +44,14 @@ type RedisConfig struct {
 
 // Config 全局配置
 type Config struct {
-	Port     int             `yaml:"port"`
-	APIKeys  []string        `yaml:"api_keys"`
-	ProxyURL string          `yaml:"proxy_url"`
-	Database DatabaseConfig  `yaml:"database"`
-	Redis    RedisConfig     `yaml:"redis"`
-	Accounts []AccountConfig `yaml:"accounts"` // 可选：首次启动时通过 YAML/环境变量导入 RT 到数据库
+	Port           int             `yaml:"port"`
+	APIKeys        []string        `yaml:"api_keys"`
+	ProxyURL       string          `yaml:"proxy_url"`
+	MaxConcurrency int             `yaml:"max_concurrency"` // 每账号最大并发数，默认 2
+	GlobalRPM      int             `yaml:"global_rpm"`      // 全局 RPM 限制，0 = 不限制
+	Database       DatabaseConfig  `yaml:"database"`
+	Redis          RedisConfig     `yaml:"redis"`
+	Accounts       []AccountConfig `yaml:"accounts"` // 可选：首次启动时通过 YAML/环境变量导入 RT 到数据库
 }
 
 // Load 从 YAML 文件加载配置，环境变量覆盖
@@ -123,6 +125,18 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// 限流配置环境变量覆盖
+	if v := os.Getenv("CODEX_MAX_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MaxConcurrency = n
+		}
+	}
+	if v := os.Getenv("CODEX_GLOBAL_RPM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.GlobalRPM = n
+		}
+	}
+
 	// 校验必需配置
 	if cfg.Database.Host == "" {
 		return nil, fmt.Errorf("必须配置 PostgreSQL (database.host 或 DATABASE_HOST)")
@@ -135,6 +149,11 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Redis.Addr == "" {
 		return nil, fmt.Errorf("必须配置 Redis (redis.addr 或 REDIS_ADDR)")
+	}
+
+	// 限流默认值
+	if cfg.MaxConcurrency <= 0 {
+		cfg.MaxConcurrency = 2
 	}
 
 	return cfg, nil

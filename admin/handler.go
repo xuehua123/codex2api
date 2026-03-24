@@ -13,18 +13,20 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	store *auth.Store
-	db    *database.DB
+	store       *auth.Store
+	db          *database.DB
+	rateLimiter *proxy.RateLimiter
 }
 
 // NewHandler 创建管理后台处理器
-func NewHandler(store *auth.Store, db *database.DB) *Handler {
-	return &Handler{store: store, db: db}
+func NewHandler(store *auth.Store, db *database.DB, rl *proxy.RateLimiter) *Handler {
+	return &Handler{store: store, db: db, rateLimiter: rl}
 }
 
 // RegisterRoutes 注册管理 API 路由
@@ -42,6 +44,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/keys", h.CreateAPIKey)
 	api.DELETE("/keys/:id", h.DeleteAPIKey)
 	api.GET("/health", h.GetHealth)
+	api.GET("/settings", h.GetSettings)
+	api.PUT("/settings", h.UpdateSettings)
 }
 
 // ==================== Stats ====================
@@ -402,4 +406,59 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 		return
 	}
 	writeMessage(c, http.StatusOK, "已删除")
+}
+
+// ==================== Settings ====================
+
+type settingsResponse struct {
+	MaxConcurrency int `json:"max_concurrency"`
+	GlobalRPM      int `json:"global_rpm"`
+}
+
+type updateSettingsReq struct {
+	MaxConcurrency *int `json:"max_concurrency"`
+	GlobalRPM      *int `json:"global_rpm"`
+}
+
+// GetSettings 获取当前系统设置
+func (h *Handler) GetSettings(c *gin.Context) {
+	c.JSON(http.StatusOK, settingsResponse{
+		MaxConcurrency: h.store.GetMaxConcurrency(),
+		GlobalRPM:      h.rateLimiter.GetRPM(),
+	})
+}
+
+// UpdateSettings 更新系统设置（实时生效）
+func (h *Handler) UpdateSettings(c *gin.Context) {
+	var req updateSettingsReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	if req.MaxConcurrency != nil {
+		v := *req.MaxConcurrency
+		if v < 1 {
+			v = 1
+		}
+		if v > 50 {
+			v = 50
+		}
+		h.store.SetMaxConcurrency(v)
+		log.Printf("设置已更新: max_concurrency = %d", v)
+	}
+
+	if req.GlobalRPM != nil {
+		v := *req.GlobalRPM
+		if v < 0 {
+			v = 0
+		}
+		h.rateLimiter.UpdateRPM(v)
+		log.Printf("设置已更新: global_rpm = %d", v)
+	}
+
+	c.JSON(http.StatusOK, settingsResponse{
+		MaxConcurrency: h.store.GetMaxConcurrency(),
+		GlobalRPM:      h.rateLimiter.GetRPM(),
+	})
 }

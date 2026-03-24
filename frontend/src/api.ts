@@ -8,6 +8,7 @@ import type {
   HealthResponse,
   MessageResponse,
   StatsResponse,
+  SystemSettings,
   UsageLogsResponse,
   UsageStats,
 } from './types'
@@ -72,4 +73,7 @@ export const api = {
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
   clearUsageLogs: () =>
     request<MessageResponse>('/usage/logs', { method: 'DELETE' }),
+  getSettings: () => request<SystemSettings>('/settings'),
+  updateSettings: (data: Partial<SystemSettings>) =>
+    request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
 }

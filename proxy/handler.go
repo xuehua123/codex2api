@@ -231,10 +231,14 @@ func (h *Handler) Responses(c *gin.Context) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account := h.store.Next()
 		if account == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": gin.H{"message": "无可用账号", "type": "server_error"},
-			})
-			return
+			// 排队等待可用账号（最多 30s）
+			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
+			if account == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
+				})
+				return
+			}
 		}
 
 		start := time.Now()
@@ -431,10 +435,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		account := h.store.Next()
 		if account == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": gin.H{"message": "无可用账号", "type": "server_error"},
-			})
-			return
+			// 排队等待可用账号（最多 30s）
+			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
+			if account == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
+				})
+				return
+			}
 		}
 
 		start := time.Now()

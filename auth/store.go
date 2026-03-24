@@ -108,22 +108,24 @@ func (a *Account) GetLastUsedAt() time.Time {
 
 // Store 多账号管理器（PG + Redis）
 type Store struct {
-	mu          sync.RWMutex
-	accounts    []*Account
-	globalProxy string
-	db          *database.DB
-	tokenCache  *cache.TokenCache
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
+	mu             sync.RWMutex
+	accounts       []*Account
+	globalProxy    string
+	maxConcurrency int64 // 每账号最大并发数
+	db             *database.DB
+	tokenCache     *cache.TokenCache
+	stopCh         chan struct{}
+	wg             sync.WaitGroup
 }
 
 // NewStore 创建账号管理器
 func NewStore(cfg *config.Config, db *database.DB, tc *cache.TokenCache) *Store {
 	return &Store{
-		globalProxy: cfg.ProxyURL,
-		db:          db,
-		tokenCache:  tc,
-		stopCh:      make(chan struct{}),
+		globalProxy:    cfg.ProxyURL,
+		maxConcurrency: int64(cfg.MaxConcurrency),
+		db:             db,
+		tokenCache:     tc,
+		stopCh:         make(chan struct{}),
 	}
 }
 
@@ -242,8 +244,8 @@ func (s *Store) Stop() {
 
 // ==================== 最少连接调度 ====================
 
-// Next 获取下一个可用账号（最少连接调度）
-// 选择 ActiveRequests 最小的可用账号，原子操作递增计数
+// Next 获取下一个可用账号（最少连接调度 + 并发上限）
+// 选择 ActiveRequests 最小的可用账号，可用账号的并发不能超过 maxConcurrency
 func (s *Store) Next() *Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -256,6 +258,9 @@ func (s *Store) Next() *Account {
 			continue
 		}
 		load := atomic.LoadInt64(&acc.ActiveRequests)
+		if load >= s.maxConcurrency {
+			continue // 超过并发上限，跳过
+		}
 		if load < bestLoad {
 			bestLoad = load
 			best = acc
@@ -270,6 +275,37 @@ func (s *Store) Next() *Account {
 	return best
 }
 
+// WaitForAvailable 等待可用账号（带超时的请求排队）
+func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Account {
+	deadline := time.After(timeout)
+	backoff := 50 * time.Millisecond
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-deadline:
+			return nil
+		default:
+			acc := s.Next()
+			if acc != nil {
+				return acc
+			}
+			// 等待一下再重试（指数退避，最大 500ms）
+			select {
+			case <-time.After(backoff):
+				if backoff < 500*time.Millisecond {
+					backoff *= 2
+				}
+			case <-ctx.Done():
+				return nil
+			case <-deadline:
+				return nil
+			}
+		}
+	}
+}
+
 // Release 释放账号（请求完成后调用，递减并发计数）
 func (s *Store) Release(acc *Account) {
 	if acc == nil {
@@ -278,7 +314,15 @@ func (s *Store) Release(acc *Account) {
 	atomic.AddInt64(&acc.ActiveRequests, -1)
 }
 
-// ==================== 账号热加载 ====================
+// SetMaxConcurrency 动态更新每账号并发上限
+func (s *Store) SetMaxConcurrency(n int) {
+	atomic.StoreInt64(&s.maxConcurrency, int64(n))
+}
+
+// GetMaxConcurrency 获取当前每账号并发上限
+func (s *Store) GetMaxConcurrency() int {
+	return int(atomic.LoadInt64(&s.maxConcurrency))
+}
 
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）
 func (s *Store) AddAccount(acc *Account) {

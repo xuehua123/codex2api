@@ -54,6 +54,11 @@ export interface HealthResponse {
   total: number
 }
 
+export interface SystemSettings {
+  max_concurrency: number
+  global_rpm: number
+}
+
 export interface UsageStats {
   total_requests: number
   total_tokens: number

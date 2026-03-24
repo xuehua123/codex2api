@@ -5,7 +5,7 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
-import type { APIKeyRow, HealthResponse } from '../types'
+import type { APIKeyRow, HealthResponse, SystemSettings } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { formatRelativeTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -30,10 +30,13 @@ export default function Settings() {
   const [newKeyName, setNewKeyName] = useState('')
   const [newKeyValue, setNewKeyValue] = useState('')
   const [createdKey, setCreatedKey] = useState<string | null>(null)
+  const [settingsForm, setSettingsForm] = useState<SystemSettings>({ max_concurrency: 2, global_rpm: 0 })
+  const [savingSettings, setSavingSettings] = useState(false)
   const { toast, showToast } = useToast()
 
   const loadSettingsData = useCallback(async () => {
-    const [health, keysResponse] = await Promise.all([api.getHealth(), api.getAPIKeys()])
+    const [health, keysResponse, settings] = await Promise.all([api.getHealth(), api.getAPIKeys(), api.getSettings()])
+    setSettingsForm(settings)
     return {
       health,
       keys: keysResponse.keys ?? [],
@@ -81,6 +84,19 @@ export default function Settings() {
   const handleCopy = (text: string) => {
     void navigator.clipboard.writeText(text)
     showToast('已复制到剪贴板')
+  }
+
+  const handleSaveSettings = async () => {
+    setSavingSettings(true)
+    try {
+      const updated = await api.updateSettings(settingsForm)
+      setSettingsForm(updated)
+      showToast('设置已保存，实时生效')
+    } catch (error) {
+      showToast(`保存失败: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setSavingSettings(false)
+    }
   }
 
   const { health, keys } = data
@@ -221,6 +237,39 @@ export default function Settings() {
                 </div>
               </div>
             </div>
+          </CardContent>
+        </Card>
+
+        {/* Protection Settings */}
+        <Card className="mb-4">
+          <CardContent className="p-6">
+            <h3 className="text-base font-semibold text-foreground mb-4">流量保护</h3>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4 mb-4">
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">每账号最大并发</label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={settingsForm.max_concurrency}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_concurrency: parseInt(e.target.value) || 1 }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">每个账号同时处理的最大请求数（范围 1~50）</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">全局 RPM 限制</label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={settingsForm.global_rpm}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, global_rpm: parseInt(e.target.value) || 0 }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">每分钟最大请求数，0 = 不限制</p>
+              </div>
+            </div>
+            <Button onClick={() => void handleSaveSettings()} disabled={savingSettings}>
+              {savingSettings ? '保存中...' : '保存设置'}
+            </Button>
           </CardContent>
         </Card>
 
