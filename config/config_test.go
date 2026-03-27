@@ -7,6 +7,7 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 		"CODEX_PORT",
 		"PORT",
 		"ADMIN_SECRET",
+		"TRUSTED_PROXIES",
 		"DATABASE_DRIVER",
 		"DATABASE_PATH",
 		"DATABASE_HOST",
@@ -55,6 +56,7 @@ func TestLoadAllowsExplicitSQLiteAndMemory(t *testing.T) {
 		"CODEX_PORT",
 		"PORT",
 		"ADMIN_SECRET",
+		"TRUSTED_PROXIES",
 		"DATABASE_DRIVER",
 		"DATABASE_PATH",
 		"DATABASE_HOST",
@@ -97,6 +99,7 @@ func TestLoadReadsAdminSecretFromEnv(t *testing.T) {
 		"CODEX_PORT",
 		"PORT",
 		"ADMIN_SECRET",
+		"TRUSTED_PROXIES",
 		"DATABASE_DRIVER",
 		"DATABASE_PATH",
 		"DATABASE_HOST",
@@ -125,5 +128,51 @@ func TestLoadReadsAdminSecretFromEnv(t *testing.T) {
 
 	if got := cfg.AdminSecret; got != "from-env-secret" {
 		t.Fatalf("AdminSecret = %q, want %q", got, "from-env-secret")
+	}
+}
+
+func TestLoadParsesTrustedProxies(t *testing.T) {
+	keys := []string{
+		"CODEX_PORT",
+		"PORT",
+		"ADMIN_SECRET",
+		"TRUSTED_PROXIES",
+		"DATABASE_DRIVER",
+		"DATABASE_PATH",
+		"DATABASE_HOST",
+		"DATABASE_PORT",
+		"DATABASE_USER",
+		"DATABASE_PASSWORD",
+		"DATABASE_NAME",
+		"DATABASE_SSLMODE",
+		"CACHE_DRIVER",
+		"REDIS_ADDR",
+		"REDIS_PASSWORD",
+		"REDIS_DB",
+	}
+	for _, key := range keys {
+		t.Setenv(key, "")
+	}
+
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 127.0.0.1, ::1")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+
+	if got, want := len(cfg.TrustedProxies), 3; got != want {
+		t.Fatalf("len(TrustedProxies) = %d, want %d", got, want)
+	}
+	if got, want := cfg.TrustedProxies[0], "10.0.0.0/8"; got != want {
+		t.Fatalf("TrustedProxies[0] = %q, want %q", got, want)
+	}
+	if got, want := cfg.TrustedProxies[1], "127.0.0.1"; got != want {
+		t.Fatalf("TrustedProxies[1] = %q, want %q", got, want)
+	}
+	if got, want := cfg.TrustedProxies[2], "::1"; got != want {
+		t.Fatalf("TrustedProxies[2] = %q, want %q", got, want)
 	}
 }

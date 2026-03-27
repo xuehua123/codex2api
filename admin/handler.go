@@ -29,6 +29,7 @@ type Handler struct {
 	cache          cache.TokenCache
 	db             *database.DB
 	rateLimiter    *proxy.RateLimiter
+	authGuard      *authGuard
 	cpuSampler     *cpuSampler
 	startedAt      time.Time
 	pgMaxConns     int
@@ -56,6 +57,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		cache:          tc,
 		db:             db,
 		rateLimiter:    rl,
+		authGuard:      newAuthGuard(authGuardConfig{blockDuration: 5 * time.Minute, tarpitDuration: 3 * time.Second, queueTimeout: time.Second, maxConcurrent: 5}),
 		cpuSampler:     newCPUSampler(),
 		startedAt:      time.Now(),
 		databaseDriver: db.Driver(),
@@ -115,12 +117,32 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 // adminAuthMiddleware 管理接口鉴权中间件
 func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		clientIP := c.ClientIP()
+
 		adminSecret, _ := h.resolveAdminSecret(c.Request.Context())
 		if adminSecret == "" {
 			// 未配置管理密钥，跳过鉴权
 			c.Next()
 			return
 		}
+
+		if h.authGuard.IsBlocked(clientIP) {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error": "密码错误次数过多，IP 已被封禁 5 分钟，请稍后再试",
+			})
+			c.Abort()
+			return
+		}
+
+		release, ok := h.authGuard.Acquire(c.Request.Context())
+		if !ok {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error": "系统验证队列满载，请稍后再试",
+			})
+			c.Abort()
+			return
+		}
+		defer release()
 
 		adminKey := c.GetHeader("X-Admin-Key")
 		if adminKey == "" {
@@ -132,12 +154,16 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 		}
 
 		if adminKey != adminSecret {
+			h.authGuard.RegisterFailure(clientIP)
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": "管理密钥无效或缺失",
 			})
 			c.Abort()
 			return
 		}
+
+		h.authGuard.RecordSuccess(clientIP)
+
 		c.Next()
 	}
 }
@@ -347,14 +373,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	}
 
 	// 按行分割，支持批量添加
-	lines := strings.Split(req.RefreshToken, "\n")
-	var tokens []string
-	for _, line := range lines {
-		t := strings.TrimSpace(line)
-		if t != "" {
-			tokens = append(tokens, t)
-		}
-	}
+	tokens := parseImportTokenLines(strings.Split(req.RefreshToken, "\n"))
 
 	if len(tokens) == 0 {
 		writeError(c, http.StatusBadRequest, "未找到有效的 Refresh Token")
@@ -367,15 +386,18 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	successCount := 0
 	failCount := 0
 
-	for i, rt := range tokens {
+	for i, token := range tokens {
 		name := req.Name
 		if name == "" {
+			name = token.name
+		}
+		if name == "" {
 			name = fmt.Sprintf("account-%d", i+1)
-		} else if len(tokens) > 1 {
+		} else if req.Name != "" && len(tokens) > 1 {
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
 
-		id, err := h.db.InsertAccount(ctx, name, rt, req.ProxyURL)
+		id, err := h.db.InsertAccount(ctx, name, token.refreshToken, req.ProxyURL)
 		if err != nil {
 			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -387,7 +409,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		// 热加载：直接加入内存池
 		newAcc := &auth.Account{
 			DBID:         id,
-			RefreshToken: rt,
+			RefreshToken: token.refreshToken,
 			ProxyURL:     req.ProxyURL,
 		}
 		h.store.AddAccount(newAcc)
@@ -441,7 +463,7 @@ func (h *Handler) ImportAccounts(c *gin.Context) {
 	}
 }
 
-// importAccountsTXT 通过 TXT 文件导入（每行一个 RT）
+// importAccountsTXT 通过 TXT 文件导入（每行一个 RT 或 CPA 原始行）
 func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
@@ -461,18 +483,7 @@ func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	// 按行分割，去重
-	lines := strings.Split(string(data), "\n")
-	seen := make(map[string]bool)
-	var tokens []importToken
-	for _, line := range lines {
-		t := strings.TrimSpace(line)
-		t = strings.TrimPrefix(t, "\xef\xbb\xbf") // 去除 UTF-8 BOM
-		if t != "" && !seen[t] {
-			seen[t] = true
-			tokens = append(tokens, importToken{refreshToken: t})
-		}
-	}
+	tokens := parseImportTokenLines(strings.Split(string(data), "\n"))
 
 	if len(tokens) == 0 {
 		writeError(c, http.StatusBadRequest, "文件中未找到有效的 Refresh Token")

@@ -66,10 +66,11 @@ func (c *CacheConfig) Label() string {
 // Config 全局核心环境配置（物理隔离的服务器参数）
 // 业务逻辑参数（如 ProxyURL，APIKeys，MaxConcurrency）已全部移至数据库 SystemSettings 进行化
 type Config struct {
-	Port        int
-	AdminSecret string
-	Database    DatabaseConfig
-	Cache       CacheConfig
+	Port           int
+	AdminSecret    string
+	TrustedProxies []string
+	Database       DatabaseConfig
+	Cache          CacheConfig
 }
 
 // Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
@@ -89,6 +90,16 @@ func Load(envPath string) (*Config, error) {
 		fmt.Sscanf(port, "%d", &cfg.Port)
 	}
 	cfg.AdminSecret = strings.TrimSpace(os.Getenv("ADMIN_SECRET"))
+
+	// 可信反向代理列表（逗号分隔；为空则禁用转发头信任）
+	if v := os.Getenv("TRUSTED_PROXIES"); v != "" {
+		for _, raw := range strings.Split(v, ",") {
+			proxy := strings.TrimSpace(raw)
+			if proxy != "" {
+				cfg.TrustedProxies = append(cfg.TrustedProxies, proxy)
+			}
+		}
+	}
 
 	// 数据库配置
 	cfg.Database.Driver = normalizeDriver(os.Getenv("DATABASE_DRIVER"), "postgres")

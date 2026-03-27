@@ -29,6 +29,12 @@ export default defineConfig({
     emptyOutDir: true,
     chunkSizeWarningLimit: 1000
   },
+  test: {
+    environment: 'jsdom',
+    setupFiles: './src/test/setup.ts',
+    globals: true,
+    clearMocks: true,
+  },
   server: {
     proxy: {
       '/api': 'http://localhost:8080',

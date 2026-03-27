@@ -135,6 +135,9 @@ func main() {
 	// 6. 启动 HTTP 服务
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	if err := configureTrustedProxies(r, cfg.TrustedProxies); err != nil {
+		log.Fatalf("可信反向代理配置失败: %v", err)
+	}
 	r.Use(gin.Recovery())
 	r.Use(loggerMiddleware())
 

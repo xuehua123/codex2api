@@ -22,6 +22,12 @@ import type {
 const BASE = '/api/admin'
 export const ADMIN_AUTH_REQUIRED_EVENT = 'codex2api:admin-auth-required'
 const ADMIN_AUTH_RESET_KEY = 'admin_auth_reset_at'
+export const AUTH_REQUIRED_EVENT = ADMIN_AUTH_REQUIRED_EVENT
+
+export interface AdminAuthRequiredDetail {
+  status: number
+  message: string
+}
 
 export function getAdminKey(): string {
   return localStorage.getItem('admin_key') ?? ''
@@ -39,10 +45,14 @@ export function setAdminKey(key: string) {
   }
 }
 
-export function resetAdminAuthState() {
+function emitAuthRequired(detail: AdminAuthRequiredDetail) {
   clearAdminKey()
-  localStorage.setItem(ADMIN_AUTH_RESET_KEY, String(Date.now()))
-  window.dispatchEvent(new Event(ADMIN_AUTH_REQUIRED_EVENT))
+  localStorage.setItem(ADMIN_AUTH_RESET_KEY, JSON.stringify({ at: Date.now(), ...detail }))
+  window.dispatchEvent(new CustomEvent<AdminAuthRequiredDetail>(ADMIN_AUTH_REQUIRED_EVENT, { detail }))
+}
+
+export function resetAdminAuthState(message = '') {
+  emitAuthRequired({ status: 401, message })
 }
 
 function extractAdminErrorMessage(body: string, status: number): string {
@@ -80,10 +90,11 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   if (!res.ok) {
     const body = await res.text()
-    if (res.status === 401) {
-      resetAdminAuthState()
+    const message = extractAdminErrorMessage(body, res.status)
+    if (res.status === 401 || res.status === 429) {
+      emitAuthRequired({ status: res.status, message })
     }
-    throw new Error(extractAdminErrorMessage(body, res.status))
+    throw new Error(message)
   }
 
   return (await res.json()) as T

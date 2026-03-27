@@ -13,22 +13,42 @@ export default function AuthGate({ children }: PropsWithChildren) {
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
+  const extractAuthError = useCallback(async (res: Response, fallback: string) => {
+    const body = await res.text()
+    if (!body.trim()) return fallback
+    try {
+      const parsed = JSON.parse(body) as { error?: string }
+      if (typeof parsed.error === 'string' && parsed.error.trim()) {
+        return parsed.error
+      }
+    } catch {
+      // ignore parse failure
+    }
+    return fallback
+  }, [])
+
   const checkAuth = useCallback(async () => {
     try {
       const headers: Record<string, string> = {}
       const key = getAdminKey()
       if (key) headers['X-Admin-Key'] = key
       const res = await fetch('/api/admin/health', { headers })
-      if (res.status === 401) {
-        setAdminKey('')
-        setStatus('need_login')
-      } else {
+      if (res.ok) {
+        setError('')
         setStatus('authenticated')
+        return
       }
+      if (res.status === 401 || res.status === 429) {
+        setAdminKey('')
+        setError(await extractAuthError(res, t('auth.error')))
+        setStatus('need_login')
+        return
+      }
+      setStatus('authenticated')
     } catch {
       setStatus('authenticated')
     }
-  }, [])
+  }, [extractAuthError, t])
 
   useEffect(() => {
     void checkAuth()
@@ -39,23 +59,37 @@ export default function AuthGate({ children }: PropsWithChildren) {
       void checkAuth()
     }, 30000)
 
-    const handleAuthRequired = () => {
-      setError('')
+    const handler = (event: Event) => {
+      const authEvent = event as CustomEvent<{ message?: string }>
+      setAdminKey('')
+      setError(authEvent.detail?.message ?? '')
       setInputKey('')
       setStatus('need_login')
     }
 
     const handleStorage = (event: StorageEvent) => {
       if (event.key === 'admin_auth_reset_at') {
-        handleAuthRequired()
+        let message = ''
+        if (event.newValue) {
+          try {
+            const parsed = JSON.parse(event.newValue) as { message?: string }
+            message = parsed.message ?? ''
+          } catch {
+            message = ''
+          }
+        }
+        setAdminKey('')
+        setError(message)
+        setInputKey('')
+        setStatus('need_login')
       }
     }
 
-    window.addEventListener(ADMIN_AUTH_REQUIRED_EVENT, handleAuthRequired)
+    window.addEventListener(ADMIN_AUTH_REQUIRED_EVENT, handler)
     window.addEventListener('storage', handleStorage)
     return () => {
       window.clearInterval(timer)
-      window.removeEventListener(ADMIN_AUTH_REQUIRED_EVENT, handleAuthRequired)
+      window.removeEventListener(ADMIN_AUTH_REQUIRED_EVENT, handler)
       window.removeEventListener('storage', handleStorage)
     }
   }, [checkAuth])
@@ -71,11 +105,14 @@ export default function AuthGate({ children }: PropsWithChildren) {
       const res = await fetch('/api/admin/health', {
         headers: { 'X-Admin-Key': inputKey.trim() },
       })
-      if (res.status === 401) {
-        setError(t('auth.error'))
-      } else {
+      if (res.ok) {
         setAdminKey(inputKey.trim())
+        setError('')
         setStatus('authenticated')
+      } else {
+        setAdminKey('')
+        setError(await extractAuthError(res, t('auth.error')))
+        setStatus('need_login')
       }
     } catch {
       setError(t('auth.error'))
