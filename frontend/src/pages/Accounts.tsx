@@ -962,6 +962,8 @@ export default function Accounts() {
           show={showAssignProxyModal}
           title={t('accounts.batchAssignProxyTitle')}
           onClose={() => setShowAssignProxyModal(false)}
+          contentClassName="sm:max-w-[760px] overflow-visible"
+          bodyClassName="overflow-visible pb-6"
           footer={(
             <div className="flex items-center gap-2">
               <Button
@@ -992,6 +994,7 @@ export default function Accounts() {
                 onValueChange={setAssignProxyValue}
                 options={proxyOptions}
                 disabled={loadingProxyOptions}
+                className="w-full"
                 placeholder={loadingProxyOptions ? t('accounts.loadingProxyOptions') : t('accounts.batchAssignProxyPlaceholder')}
               />
             </div>
