@@ -51,7 +51,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	account.Mu().RUnlock()
 
 	if !hasToken {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "账号没有可用的 Access Token，请先刷新"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "账号当前没有可用的 Access Token。请先刷新；如果刷新仍失败，请检查该账号绑定的代理或出口地区是否可用"})
 		return
 	}
 

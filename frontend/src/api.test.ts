@@ -25,4 +25,23 @@ describe('api auth handling', () => {
 
     window.removeEventListener(AUTH_REQUIRED_EVENT, listener as EventListener)
   })
+
+  it('sends batch proxy assignment payload for selected accounts', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ message: 'ok', updated: 2 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    ))
+
+    await expect(api.batchAssignAccountsProxy([11, 22], 'socks5://10.0.0.2:10005')).resolves.toEqual({
+      message: 'ok',
+      updated: 2,
+    })
+
+    expect(fetch).toHaveBeenCalledWith('/api/admin/accounts/batch-assign-proxy', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ ids: [11, 22], proxy_url: 'socks5://10.0.0.2:10005' }),
+    }))
+  })
 })

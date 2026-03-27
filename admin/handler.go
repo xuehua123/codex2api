@@ -85,6 +85,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
+	api.POST("/accounts/batch-assign-proxy", h.BatchAssignAccountsProxy)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
 	api.POST("/accounts/batch-test", h.BatchTest)
@@ -357,6 +358,11 @@ type addAccountReq struct {
 	Name         string `json:"name"`
 	RefreshToken string `json:"refresh_token"`
 	ProxyURL     string `json:"proxy_url"`
+}
+
+type batchAssignAccountsProxyReq struct {
+	IDs      []int64 `json:"ids"`
+	ProxyURL string  `json:"proxy_url"`
 }
 
 // AddAccount 添加新账号（支持批量：refresh_token 按行分割）
@@ -706,6 +712,42 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 	h.store.RemoveAccount(id)
 
 	writeMessage(c, http.StatusOK, "账号已删除")
+}
+
+// BatchAssignAccountsProxy 批量给账号分配代理
+func (h *Handler) BatchAssignAccountsProxy(c *gin.Context) {
+	var req batchAssignAccountsProxyReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if len(req.IDs) == 0 {
+		writeError(c, http.StatusBadRequest, "请至少选择一个账号")
+		return
+	}
+
+	proxyURL := strings.TrimSpace(req.ProxyURL)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	updated, err := h.db.UpdateAccountsProxy(ctx, req.IDs, proxyURL)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "代理分配失败: "+err.Error())
+		return
+	}
+
+	for _, id := range req.IDs {
+		if account := h.store.FindByID(id); account != nil {
+			account.Mu().Lock()
+			account.ProxyURL = proxyURL
+			account.Mu().Unlock()
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "代理分配完成",
+		"updated": updated,
+	})
 }
 
 // RefreshAccount 手动刷新账号 AT

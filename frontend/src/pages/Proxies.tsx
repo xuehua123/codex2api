@@ -322,6 +322,7 @@ export default function Proxies() {
                       <th className="p-3 font-semibold">{t('proxies.colStatus')}</th>
                       <th className="p-3 font-semibold">{t('proxies.colLocation')}</th>
                       <th className="p-3 font-semibold">{t('proxies.colIp')}</th>
+                      <th className="p-3 font-semibold">{t('proxies.colBoundAccounts')}</th>
                       <th className="p-3 font-semibold">{t('proxies.colLatency')}</th>
                       <th className="p-3 font-semibold text-right">{t('proxies.colActions')}</th>
                     </tr>
@@ -398,6 +399,11 @@ export default function Proxies() {
                             ) : (
                               <span className="text-xs text-muted-foreground">-</span>
                             )}
+                          </td>
+                          <td className="p-3">
+                            <span className="inline-flex px-2 py-0.5 rounded-full text-xs font-bold bg-primary/10 text-primary">
+                              {p.bound_accounts ?? 0}
+                            </span>
                           </td>
                           {/* Latency */}
                           <td className="p-3">

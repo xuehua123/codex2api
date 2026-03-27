@@ -414,11 +414,27 @@ type ProxyRow struct {
 	TestIP        string    `json:"test_ip"`
 	TestLocation  string    `json:"test_location"`
 	TestLatencyMs int       `json:"test_latency_ms"`
+	BoundAccounts int       `json:"bound_accounts"`
 }
 
 // ListProxies 获取所有代理
 func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies ORDER BY id`)
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT
+			p.id,
+			p.url,
+			p.label,
+			p.enabled,
+			p.created_at,
+			COALESCE(p.test_ip, ''),
+			COALESCE(p.test_location, ''),
+			COALESCE(p.test_latency_ms, 0),
+			COUNT(a.id) AS bound_accounts
+		FROM proxies p
+		LEFT JOIN accounts a ON a.proxy_url = p.url
+		GROUP BY p.id, p.url, p.label, p.enabled, p.created_at, p.test_ip, p.test_location, p.test_latency_ms
+		ORDER BY p.id
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -428,7 +444,7 @@ func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
 	for rows.Next() {
 		p := &ProxyRow{}
 		var createdAtRaw interface{}
-		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
+		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs, &p.BoundAccounts); err != nil {
 			return nil, err
 		}
 		p.CreatedAt, err = parseDBTimeValue(createdAtRaw)
@@ -550,6 +566,32 @@ func (db *DB) UpdateProxyTestResult(ctx context.Context, id int64, ip, location 
 		`UPDATE proxies SET test_ip = $1, test_location = $2, test_latency_ms = $3 WHERE id = $4`,
 		ip, location, latencyMs, id)
 	return err
+}
+
+// UpdateAccountsProxy 批量更新账号绑定代理
+func (db *DB) UpdateAccountsProxy(ctx context.Context, ids []int64, proxyURL string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	args := make([]interface{}, 0, len(ids)+1)
+	args = append(args, proxyURL)
+	placeholders := make([]string, len(ids))
+	for i, id := range ids {
+		args = append(args, id)
+		placeholders[i] = fmt.Sprintf("$%d", i+2)
+	}
+
+	query := fmt.Sprintf(
+		"UPDATE accounts SET proxy_url = $1, updated_at = CURRENT_TIMESTAMP WHERE id IN (%s)",
+		strings.Join(placeholders, ","),
+	)
+	res, err := db.conn.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	affected, _ := res.RowsAffected()
+	return int(affected), nil
 }
 
 // ==================== Usage Logs（批量写入） ====================
@@ -1259,15 +1301,13 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 
 // ==================== Accounts ====================
 
-// ListActive 获取所有状态为 active 的账号
-func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
-	query := `
+// ListAccounts 获取所有账号
+func (db *DB) ListAccounts(ctx context.Context) ([]*AccountRow, error) {
+	rows, err := db.conn.QueryContext(ctx, `
 		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, created_at, updated_at
 		FROM accounts
-		WHERE status = 'active'
 		ORDER BY id
-	`
-	rows, err := db.conn.QueryContext(ctx, query)
+	`)
 	if err != nil {
 		return nil, fmt.Errorf("查询账号失败: %w", err)
 	}
@@ -1312,6 +1352,21 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+// ListActive 获取所有状态为 active 的账号
+func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
+	accounts, err := db.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var active []*AccountRow
+	for _, account := range accounts {
+		if account.Status == "active" {
+			active = append(active, account)
+		}
+	}
+	return active, nil
 }
 
 // UpdateCredentials 原子合并更新账号的 credentials（JSONB || 运算符，不覆盖已有字段）

@@ -379,6 +379,25 @@ export default function Accounts() {
     void reload()
   }
 
+  const handleBatchAssignProxy = async () => {
+    if (selected.size === 0) return
+    const currentValue = accounts.find((account) => selected.has(account.id))?.proxy_url ?? ''
+    const nextProxyUrl = window.prompt(t('accounts.batchAssignProxyPrompt'), currentValue)
+    if (nextProxyUrl === null) return
+
+    setBatchLoading(true)
+    try {
+      const result = await api.batchAssignAccountsProxy([...selected], nextProxyUrl.trim())
+      showToast(t('accounts.batchAssignProxyDone', { updated: result.updated }))
+      setSelected(new Set())
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.batchAssignProxyFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setBatchLoading(false)
+    }
+  }
+
   const handleBatchTest = async () => {
     setBatchTesting(true)
     try {
@@ -556,6 +575,9 @@ export default function Accounts() {
           <div className="flex items-center justify-between gap-3 px-4 py-2.5 mb-4 rounded-2xl bg-primary/10 border border-primary/20 text-sm font-semibold text-primary">
             <span>{t('common.selected', { count: selected.size })}</span>
             <div className="flex items-center gap-1.5">
+              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchAssignProxy()}>
+                {t('accounts.batchAssignProxy')}
+              </Button>
               <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchRefresh()}>
                 {t('accounts.batchRefresh')}
               </Button>

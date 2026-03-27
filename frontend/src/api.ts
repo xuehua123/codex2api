@@ -160,6 +160,11 @@ export const api = {
   getModels: () => request<{ models: string[] }>('/models'),
   batchTestAccounts: () =>
     request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', { method: 'POST' }),
+  batchAssignAccountsProxy: (ids: number[], proxy_url: string) =>
+    request<{ message: string; updated: number }>('/accounts/batch-assign-proxy', {
+      method: 'POST',
+      body: JSON.stringify({ ids, proxy_url }),
+    }),
   cleanBanned: () =>
     request<{ message: string; cleaned: number }>('/accounts/clean-banned', { method: 'POST' }),
   cleanRateLimited: () =>
@@ -193,6 +198,7 @@ export interface ProxyRow {
   test_ip: string
   test_location: string
   test_latency_ms: number
+  bound_accounts: number
 }
 
 export interface ProxyTestResult {
