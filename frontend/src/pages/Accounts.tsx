@@ -16,6 +16,7 @@ import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import {
   Table,
   TableBody,
@@ -27,6 +28,7 @@ import {
 import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, Upload, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
+import { buildAccountProxyOptions } from './accountProxyOptions'
 
 export default function Accounts() {
   const { t } = useTranslation()
@@ -62,6 +64,11 @@ export default function Accounts() {
   const [oauthName, setOauthName] = useState('')
   const [oauthGenerating, setOauthGenerating] = useState(false)
   const [oauthCompleting, setOauthCompleting] = useState(false)
+  const [showAssignProxyModal, setShowAssignProxyModal] = useState(false)
+  const [assignProxyValue, setAssignProxyValue] = useState('')
+  const [proxyOptions, setProxyOptions] = useState<{ value: string; label: string }[]>([])
+  const [loadingProxyOptions, setLoadingProxyOptions] = useState(false)
+  const [proxyLabelMap, setProxyLabelMap] = useState<Record<string, string>>({})
   const fileInputRef = useRef<HTMLInputElement>(null)
   const jsonInputRef = useRef<HTMLInputElement>(null)
   const { toast, showToast } = useToast()
@@ -93,6 +100,23 @@ export default function Accounts() {
 
     return () => window.clearTimeout(timer)
   }, [accounts, reloadSilently])
+
+  useEffect(() => {
+    const loadProxyLabels = async () => {
+      try {
+        const result = await api.listProxies()
+        const nextMap: Record<string, string> = {}
+        for (const proxy of result.proxies ?? []) {
+          nextMap[proxy.url] = proxy.label ?? ''
+        }
+        setProxyLabelMap(nextMap)
+      } catch {
+        // ignore
+      }
+    }
+
+    void loadProxyLabels()
+  }, [])
 
   const totalAccounts = accounts.length
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
@@ -382,14 +406,31 @@ export default function Accounts() {
   const handleBatchAssignProxy = async () => {
     if (selected.size === 0) return
     const currentValue = accounts.find((account) => selected.has(account.id))?.proxy_url ?? ''
-    const nextProxyUrl = window.prompt(t('accounts.batchAssignProxyPrompt'), currentValue)
-    if (nextProxyUrl === null) return
+    setAssignProxyValue(currentValue)
+    setShowAssignProxyModal(true)
 
+    setLoadingProxyOptions(true)
+    try {
+      const result = await api.listProxies()
+      setProxyOptions(buildAccountProxyOptions(result.proxies ?? [], {
+        clearBinding: t('accounts.clearProxyBinding'),
+        unlabeled: t('proxies.unlabeled'),
+        boundAccounts: (count) => t('accounts.boundAccountsCount', { count }),
+      }))
+    } catch (error) {
+      showToast(t('accounts.loadProxyOptionsFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setLoadingProxyOptions(false)
+    }
+  }
+
+  const submitBatchAssignProxy = async () => {
     setBatchLoading(true)
     try {
-      const result = await api.batchAssignAccountsProxy([...selected], nextProxyUrl.trim())
+      const result = await api.batchAssignAccountsProxy([...selected], assignProxyValue.trim())
       showToast(t('accounts.batchAssignProxyDone', { updated: result.updated }))
       setSelected(new Set())
+      setShowAssignProxyModal(false)
       void reload()
     } catch (error) {
       showToast(t('accounts.batchAssignProxyFailed', { error: getErrorMessage(error) }), 'error')
@@ -615,6 +656,7 @@ export default function Accounts() {
                       <TableHead className="text-[13px] font-semibold">ID</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.email')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.plan')}</TableHead>
+                      <TableHead className="text-[13px] font-semibold">{t('accounts.currentProxy')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.status')}</TableHead>
                       <TableHead
                         className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
@@ -655,6 +697,22 @@ export default function Accounts() {
                           className="text-[13px] font-medium"
                         >
                           {account.plan_type || '-'}
+                        </TableCell>
+                        <TableCell className="max-w-[240px]">
+                          {account.proxy_url ? (
+                            <div className="space-y-1">
+                              {proxyLabelMap[account.proxy_url] ? (
+                                <div className="text-[13px] font-semibold text-foreground truncate">
+                                  {proxyLabelMap[account.proxy_url]}
+                                </div>
+                              ) : null}
+                              <div className="text-[12px] font-mono text-muted-foreground break-all">
+                                {account.proxy_url}
+                              </div>
+                            </div>
+                          ) : (
+                            <span className="text-[12px] text-muted-foreground">{t('accounts.noProxyAssigned')}</span>
+                          )}
                         </TableCell>
                         <TableCell>
                           <div className="space-y-1">
@@ -898,6 +956,46 @@ export default function Accounts() {
               )}
             </div>
           )}
+        </Modal>
+
+        <Modal
+          show={showAssignProxyModal}
+          title={t('accounts.batchAssignProxyTitle')}
+          onClose={() => setShowAssignProxyModal(false)}
+          footer={(
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setShowAssignProxyModal(false)}
+              >
+                {t('common.cancel')}
+              </Button>
+              <Button
+                disabled={batchLoading || loadingProxyOptions}
+                onClick={() => void submitBatchAssignProxy()}
+              >
+                {batchLoading ? t('accounts.savingProxyAssignment') : t('common.confirm')}
+              </Button>
+            </div>
+          )}
+        >
+          <div className="space-y-3">
+            <p className="text-sm text-muted-foreground">
+              {t('accounts.batchAssignProxyModalDesc', { count: selected.size })}
+            </p>
+            <div>
+              <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                {t('accounts.batchAssignProxySelectLabel')}
+              </label>
+              <Select
+                value={assignProxyValue}
+                onValueChange={setAssignProxyValue}
+                options={proxyOptions}
+                disabled={loadingProxyOptions}
+                placeholder={loadingProxyOptions ? t('accounts.loadingProxyOptions') : t('accounts.batchAssignProxyPlaceholder')}
+              />
+            </div>
+          </div>
         </Modal>
 
         <Modal

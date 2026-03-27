@@ -223,9 +223,19 @@
     "batchDeleteDone": "批量删除完成：成功 {{success}}，失败 {{fail}}",
     "batchRefreshDone": "批量刷新完成：成功 {{success}}，失败 {{fail}}",
     "batchAssignProxy": "分配代理",
-    "batchAssignProxyPrompt": "输入要分配给已选账号的代理 URL。留空表示清空代理绑定。",
+    "batchAssignProxyTitle": "批量分配代理",
+    "batchAssignProxyModalDesc": "为已选中的 {{count}} 个账号分配代理。下拉项会显示该代理当前已绑定的账号数量。",
+    "batchAssignProxySelectLabel": "选择代理",
+    "batchAssignProxyPlaceholder": "从代理池中选择一个代理",
     "batchAssignProxyDone": "批量分配代理完成：已更新 {{updated}} 个账号",
     "batchAssignProxyFailed": "批量分配代理失败：{{error}}",
+    "savingProxyAssignment": "保存中...",
+    "loadingProxyOptions": "正在加载代理列表...",
+    "loadProxyOptionsFailed": "加载代理列表失败：{{error}}",
+    "clearProxyBinding": "清空代理绑定",
+    "boundAccountsCount": "已绑定 {{count}} 个账号",
+    "currentProxy": "当前代理",
+    "noProxyAssigned": "未绑定",
     "batchTestDone": "批量测试完成：成功 {{success}} / 封禁 {{banned}} / 限流 {{rateLimited}} / 失败 {{failed}}",
     "batchTestFailed": "批量测试失败：{{error}}",
     "cleanBannedTitle": "清理封禁账号",
@@ -510,5 +520,7 @@
     "test": "测试",
     "testProxy": "测试代理",
     "pagination": "共 {{total}} 个代理，第 {{page}}/{{totalPages}} 页"
+    ,
+    "unlabeled": "未命名"
   }
 }

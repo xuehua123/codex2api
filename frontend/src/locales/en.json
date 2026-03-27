@@ -223,9 +223,19 @@
     "batchDeleteDone": "Batch delete complete: {{success}} succeeded, {{fail}} failed",
     "batchRefreshDone": "Batch refresh complete: {{success}} succeeded, {{fail}} failed",
     "batchAssignProxy": "Assign Proxy",
-    "batchAssignProxyPrompt": "Enter the proxy URL to assign to the selected accounts. Leave blank to clear the binding.",
+    "batchAssignProxyTitle": "Assign Proxy",
+    "batchAssignProxyModalDesc": "Assign a proxy to the selected {{count}} accounts. Each option shows how many accounts are already bound to that proxy.",
+    "batchAssignProxySelectLabel": "Select Proxy",
+    "batchAssignProxyPlaceholder": "Choose a proxy from the pool",
     "batchAssignProxyDone": "Proxy assignment complete: updated {{updated}} accounts",
     "batchAssignProxyFailed": "Proxy assignment failed: {{error}}",
+    "savingProxyAssignment": "Saving...",
+    "loadingProxyOptions": "Loading proxies...",
+    "loadProxyOptionsFailed": "Failed to load proxies: {{error}}",
+    "clearProxyBinding": "Clear Proxy Binding",
+    "boundAccountsCount": "{{count}} accounts bound",
+    "currentProxy": "Current Proxy",
+    "noProxyAssigned": "Unassigned",
     "batchTestDone": "Batch test complete: success {{success}} / banned {{banned}} / rate-limited {{rateLimited}} / failed {{failed}}",
     "batchTestFailed": "Batch test failed: {{error}}",
     "cleanBannedTitle": "Clear Banned Accounts",
@@ -504,6 +514,7 @@
     "disabled": "Inactive",
     "test": "Test",
     "testProxy": "Test Proxy",
-    "pagination": "{{total}} proxies, page {{page}}/{{totalPages}}"
+    "pagination": "{{total}} proxies, page {{page}}/{{totalPages}}",
+    "unlabeled": "Unlabeled"
   }
 }
