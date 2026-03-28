@@ -95,6 +95,13 @@ func recyclePooledClientForAccount(account *auth.Account) {
 	recyclePooledClient(account, proxyURL)
 }
 
+func resolveProxyURL(accountProxyURL, fallbackProxyURL string) string {
+	if strings.TrimSpace(accountProxyURL) != "" {
+		return accountProxyURL
+	}
+	return fallbackProxyURL
+}
+
 // getPooledClient 获取或创建连接池中的 HTTP Client（按账号隔离，TTL 自动淘汰）
 func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 	key := clientPoolKey(account, proxyURL)
@@ -141,10 +148,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	proxyURL := account.ProxyURL
 	account.Mu().RUnlock()
 
-	// 代理池优先级: proxyOverride (来自 NextProxy) > account.ProxyURL
-	if proxyOverride != "" {
-		proxyURL = proxyOverride
-	}
+	proxyURL = resolveProxyURL(proxyURL, proxyOverride)
 
 	if accessToken == "" {
 		return nil, fmt.Errorf("无可用 access_token")

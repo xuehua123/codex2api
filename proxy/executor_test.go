@@ -119,6 +119,42 @@ func TestShouldRecyclePooledClient(t *testing.T) {
 	}
 }
 
+func TestResolveProxyURL(t *testing.T) {
+	tests := []struct {
+		name          string
+		accountProxy  string
+		fallbackProxy string
+		want          string
+	}{
+		{
+			name:          "prefers account proxy over fallback",
+			accountProxy:  "socks5://10.0.0.2:10001",
+			fallbackProxy: "http://10.0.0.2:1080",
+			want:          "socks5://10.0.0.2:10001",
+		},
+		{
+			name:          "falls back when account proxy missing",
+			accountProxy:  "",
+			fallbackProxy: "http://10.0.0.2:1080",
+			want:          "http://10.0.0.2:1080",
+		},
+		{
+			name:          "returns empty when neither proxy configured",
+			accountProxy:  "",
+			fallbackProxy: "",
+			want:          "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveProxyURL(tc.accountProxy, tc.fallbackProxy); got != tc.want {
+				t.Fatalf("resolveProxyURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestShouldTransparentRetryStream(t *testing.T) {
 	retryable := streamOutcome{
 		logStatusCode:  logStatusUpstreamStreamBreak,
