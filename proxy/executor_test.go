@@ -89,13 +89,18 @@ func TestShouldRecyclePooledClient(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "goaway calm",
-			err:  errors.New(`http2: server sent GOAWAY and closed the connection; ErrCode=ENHANCE_YOUR_CALM`),
+			name: "connection shutting down",
+			err:  errors.New("http2: client connection is shutting down"),
 			want: true,
 		},
 		{
-			name: "connection shutting down",
-			err:  errors.New("http2: client connection is shutting down"),
+			name: "connection reset",
+			err:  errors.New("read tcp: connection reset by peer"),
+			want: true,
+		},
+		{
+			name: "broken pipe",
+			err:  errors.New("write: broken pipe"),
 			want: true,
 		},
 		{
@@ -122,16 +127,16 @@ func TestShouldTransparentRetryStream(t *testing.T) {
 		penalize:       true,
 	}
 
-	if !shouldTransparentRetryStream(retryable, 0, false, nil, nil) {
+	if !shouldTransparentRetryStream(retryable, 0, 2, false, nil, nil) {
 		t.Fatal("expected early upstream failure to be transparently retried")
 	}
-	if shouldTransparentRetryStream(retryable, maxRetries, false, nil, nil) {
+	if shouldTransparentRetryStream(retryable, 2, 2, false, nil, nil) {
 		t.Fatal("expected retry to stop at maxRetries")
 	}
-	if shouldTransparentRetryStream(retryable, 0, true, nil, nil) {
+	if shouldTransparentRetryStream(retryable, 0, 2, true, nil, nil) {
 		t.Fatal("expected retry to stop after downstream already received bytes")
 	}
-	if shouldTransparentRetryStream(retryable, 0, false, context.Canceled, nil) {
+	if shouldTransparentRetryStream(retryable, 0, 2, false, context.Canceled, nil) {
 		t.Fatal("expected retry to stop when downstream context is canceled")
 	}
 }

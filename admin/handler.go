@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
-	neturl "net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -30,6 +31,7 @@ type Handler struct {
 	db             *database.DB
 	rateLimiter    *proxy.RateLimiter
 	authGuard      *authGuard
+	refreshAccount func(context.Context, int64) error
 	cpuSampler     *cpuSampler
 	startedAt      time.Time
 	pgMaxConns     int
@@ -52,7 +54,7 @@ type chartCacheEntry struct {
 
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
-	return &Handler{
+	handler := &Handler{
 		store:          store,
 		cache:          tc,
 		db:             db,
@@ -67,6 +69,8 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		adminSecretEnv: adminSecretEnv,
 		chartCacheData: make(map[string]*chartCacheEntry),
 	}
+	handler.refreshAccount = handler.refreshSingleAccount
+	return handler
 }
 
 // SetPoolSizes 设置连接池大小跟踪值（由 main.go 在启动时调用）
@@ -91,6 +95,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/batch-test", h.BatchTest)
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
+	api.POST("/accounts/clean-error", h.CleanError)
+	api.GET("/accounts/export", h.ExportAccounts)
+	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/usage/stats", h.GetUsageStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
@@ -181,6 +188,11 @@ func (h *Handler) resolveAdminSecret(ctx context.Context) (string, string) {
 		return "", "disabled"
 	}
 	return settings.AdminSecret, "database"
+}
+
+func (h *Handler) hasConfiguredAdminSecret(ctx context.Context) bool {
+	adminSecret, _ := h.resolveAdminSecret(ctx)
+	return strings.TrimSpace(adminSecret) != ""
 }
 
 // ==================== Stats ====================
@@ -566,7 +578,31 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 	h.importAccountsCommon(c, allTokens, proxyURL)
 }
 
-// importAccountsCommon 公共的去重、插入、刷新逻辑
+// importEvent SSE 导入进度事件
+type importEvent struct {
+	Type      string `json:"type"`                // progress | complete
+	Current   int    `json:"current"`
+	Total     int    `json:"total"`
+	Success   int    `json:"success"`
+	Duplicate int    `json:"duplicate"`
+	Failed    int    `json:"failed"`
+}
+
+func sendImportEvent(c *gin.Context, e importEvent) {
+	data, _ := json.Marshal(e)
+	fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+	c.Writer.Flush()
+}
+
+func setupSSE(c *gin.Context) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Writer.Flush()
+}
+
+// importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑
 func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string) {
 	// 文件内去重
 	seen := make(map[string]bool)
@@ -578,11 +614,10 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
-	defer cancel()
-
-	// 数据库去重
-	existingRTs, err := h.db.GetAllRefreshTokens(ctx)
+	// 数据库去重（独立短超时）
+	dedupeCtx, dedupeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dedupeCancel()
+	existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
 	if err != nil {
 		log.Printf("查询已有 RT 失败: %v", err)
 		existingRTs = make(map[string]bool)
@@ -598,77 +633,107 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		}
 	}
 
+	total := len(unique)
+
 	if len(newTokens) == 0 {
 		c.JSON(http.StatusOK, gin.H{
-			"message":   fmt.Sprintf("所有 %d 个 RT 已存在，无需导入", len(unique)),
+			"message":   fmt.Sprintf("所有 %d 个 RT 已存在，无需导入", total),
 			"success":   0,
 			"duplicate": duplicateCount,
 			"failed":    0,
-			"total":     len(unique),
+			"total":     total,
 		})
 		return
 	}
 
-	successCount := 0
-	failCount := 0
+	// 切换到 SSE 流式响应
+	setupSSE(c)
 
-	sem := make(chan struct{}, 10)
+	var successCount int64
+	var failCount int64
+	var current int64
+	sem := make(chan struct{}, 20) // 并发插入上限
 	var wg sync.WaitGroup
 
+	// 进度推送 goroutine：定时发送，避免每条都写造成 IO 瓶颈
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				cur := int(atomic.LoadInt64(&current))
+				suc := int(atomic.LoadInt64(&successCount))
+				fai := int(atomic.LoadInt64(&failCount))
+				sendImportEvent(c, importEvent{
+					Type: "progress", Current: cur + duplicateCount, Total: total,
+					Success: suc, Duplicate: duplicateCount, Failed: fai,
+				})
+			case <-done:
+				return
+			}
+		}
+	}()
+
 	for i, t := range newTokens {
-		name := t.name
-		if name == "" {
-			name = fmt.Sprintf("import-%d", i+1)
-		}
-
-		id, err := h.db.InsertAccount(ctx, name, t.refreshToken, proxyURL)
-		if err != nil {
-			log.Printf("导入账号 %d 失败: %v", i+1, err)
-			failCount++
-			continue
-		}
-
-		successCount++
-
-		newAcc := &auth.Account{
-			DBID:         id,
-			RefreshToken: t.refreshToken,
-			ProxyURL:     proxyURL,
-		}
-		h.store.AddAccount(newAcc)
-
-		wg.Add(1)
 		sem <- struct{}{}
-		go func(accountID int64) {
+		wg.Add(1)
+		go func(idx int, tok importToken) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-				log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
-			} else {
-				log.Printf("导入账号 %d 刷新成功", accountID)
+
+			name := tok.name
+			if name == "" {
+				name = fmt.Sprintf("import-%d", idx+1)
 			}
-		}(id)
+
+			insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			id, err := h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
+			insertCancel()
+
+			if err != nil {
+				log.Printf("导入账号 %d/%d 失败: %v", idx+1, len(newTokens), err)
+				atomic.AddInt64(&failCount, 1)
+				atomic.AddInt64(&current, 1)
+				return
+			}
+
+			atomic.AddInt64(&successCount, 1)
+			atomic.AddInt64(&current, 1)
+
+			newAcc := &auth.Account{
+				DBID:         id,
+				RefreshToken: tok.refreshToken,
+				ProxyURL:     proxyURL,
+			}
+			h.store.AddAccount(newAcc)
+
+			// 后台异步刷新，不阻塞导入流程
+			go func(accountID int64) {
+				refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
+					log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
+				} else {
+					log.Printf("导入账号 %d 刷新成功", accountID)
+				}
+			}(id)
+		}(i, t)
 	}
 
 	wg.Wait()
+	close(done)
 
-	msg := fmt.Sprintf("成功导入 %d 个账号", successCount)
-	if duplicateCount > 0 {
-		msg += fmt.Sprintf("，%d 个重复跳过", duplicateCount)
-	}
-	if failCount > 0 {
-		msg += fmt.Sprintf("，%d 个失败", failCount)
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":   msg,
-		"success":   successCount,
-		"duplicate": duplicateCount,
-		"failed":    failCount,
-		"total":     len(unique),
+	// 发送完成事件
+	suc := int(atomic.LoadInt64(&successCount))
+	fai := int(atomic.LoadInt64(&failCount))
+	sendImportEvent(c, importEvent{
+		Type: "complete", Current: total, Total: total,
+		Success: suc, Duplicate: duplicateCount, Failed: fai,
 	})
+
+	log.Printf("导入完成: success=%d, duplicate=%d, failed=%d, total=%d", suc, duplicateCount, fai, total)
 }
 
 // GetAccountUsage 查询单个账号的用量统计
@@ -759,10 +824,30 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 		return
 	}
 
-	// 查找运行时账号并触发刷新
-	_ = id // TODO: 实现通过 ID 查找运行时 Account 并触发刷新
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
 
-	writeMessage(c, http.StatusOK, "刷新请求已发送")
+	refreshFn := h.refreshAccount
+	if refreshFn == nil {
+		refreshFn = h.refreshSingleAccount
+	}
+	if err := refreshFn(ctx, id); err != nil {
+		if strings.Contains(err.Error(), "不存在") {
+			writeError(c, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "刷新失败: "+err.Error())
+		return
+	}
+
+	writeMessage(c, http.StatusOK, "账号刷新成功")
+}
+
+func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {
+	if h == nil || h.store == nil {
+		return fmt.Errorf("账号池未初始化")
+	}
+	return h.store.RefreshSingle(ctx, id)
 }
 
 // ==================== Health ====================
@@ -1034,7 +1119,11 @@ type settingsResponse struct {
 	AdminSecret           string `json:"admin_secret"`
 	AdminAuthSource       string `json:"admin_auth_source"`
 	AutoCleanFullUsage    bool   `json:"auto_clean_full_usage"`
+	AutoCleanError        bool   `json:"auto_clean_error"`
 	ProxyPoolEnabled      bool   `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled  bool   `json:"fast_scheduler_enabled"`
+	MaxRetries            int    `json:"max_retries"`
+	AllowRemoteMigration  bool   `json:"allow_remote_migration"`
 	DatabaseDriver        string `json:"database_driver"`
 	DatabaseLabel         string `json:"database_label"`
 	CacheDriver           string `json:"cache_driver"`
@@ -1053,7 +1142,11 @@ type updateSettingsReq struct {
 	AutoCleanRateLimited  *bool   `json:"auto_clean_rate_limited"`
 	AdminSecret           *string `json:"admin_secret"`
 	AutoCleanFullUsage    *bool   `json:"auto_clean_full_usage"`
+	AutoCleanError        *bool   `json:"auto_clean_error"`
 	ProxyPoolEnabled      *bool   `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled  *bool   `json:"fast_scheduler_enabled"`
+	MaxRetries            *int    `json:"max_retries"`
+	AllowRemoteMigration  *bool   `json:"allow_remote_migration"`
 }
 
 // GetSettings 获取当前系统设置
@@ -1079,7 +1172,11 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AdminSecret:           adminSecret,
 		AdminAuthSource:       adminAuthSource,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:        h.store.GetAutoCleanError(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
+		MaxRetries:            h.store.GetMaxRetries(),
+		AllowRemoteMigration:  h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:        h.databaseDriver,
 		DatabaseLabel:         h.databaseLabel,
 		CacheDriver:           h.cacheDriver,
@@ -1094,6 +1191,20 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
+
+	currentAdminSecret := ""
+	if dbSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && dbSettings != nil {
+		currentAdminSecret = dbSettings.AdminSecret
+	}
+	if req.AdminSecret != nil {
+		if h.adminSecretEnv == "" {
+			currentAdminSecret = *req.AdminSecret
+			log.Printf("设置已更新: admin_secret (长度=%d)", len(currentAdminSecret))
+		} else {
+			log.Printf("检测到环境变量 ADMIN_SECRET，忽略前端提交的 admin_secret")
+		}
+	}
+	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
 
 	if req.MaxConcurrency != nil {
 		v := *req.MaxConcurrency
@@ -1179,6 +1290,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: auto_clean_full_usage = %t", *req.AutoCleanFullUsage)
 	}
 
+	if req.AutoCleanError != nil {
+		h.store.SetAutoCleanError(*req.AutoCleanError)
+		log.Printf("设置已更新: auto_clean_error = %t", *req.AutoCleanError)
+	}
+
 	if req.ProxyPoolEnabled != nil {
 		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
 		if *req.ProxyPoolEnabled {
@@ -1187,18 +1303,32 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
 	}
 
-	// 读取当前 admin_secret（如有更新则使用新值）
-	currentAdminSecret := ""
-	if dbSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && dbSettings != nil {
-		currentAdminSecret = dbSettings.AdminSecret
+	if req.FastSchedulerEnabled != nil {
+		h.store.SetFastSchedulerEnabled(*req.FastSchedulerEnabled)
+		log.Printf("设置已更新: fast_scheduler_enabled = %t", *req.FastSchedulerEnabled)
 	}
-	if req.AdminSecret != nil {
-		if h.adminSecretEnv == "" {
-			currentAdminSecret = *req.AdminSecret
-			log.Printf("设置已更新: admin_secret (长度=%d)", len(currentAdminSecret))
-		} else {
-			log.Printf("检测到环境变量 ADMIN_SECRET，忽略前端提交的 admin_secret")
+
+	if req.MaxRetries != nil {
+		v := *req.MaxRetries
+		if v < 0 {
+			v = 0
 		}
+		if v > 10 {
+			v = 10
+		}
+		h.store.SetMaxRetries(v)
+		log.Printf("设置已更新: max_retries = %d", v)
+	}
+
+	if req.AllowRemoteMigration != nil {
+		if *req.AllowRemoteMigration && !hasAdminSecret {
+			writeError(c, http.StatusBadRequest, "请先设置管理密钥，再启用远程迁移")
+			return
+		}
+		h.store.SetAllowRemoteMigration(*req.AllowRemoteMigration)
+		log.Printf("设置已更新: allow_remote_migration = %t", *req.AllowRemoteMigration)
+	} else if !hasAdminSecret {
+		h.store.SetAllowRemoteMigration(false)
 	}
 
 	// 持久化保存到数据库
@@ -1214,13 +1344,17 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanRateLimited:  h.store.GetAutoCleanRateLimited(),
 		AdminSecret:           currentAdminSecret,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:        h.store.GetAutoCleanError(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
+		MaxRetries:            h.store.GetMaxRetries(),
+		AllowRemoteMigration:  h.store.GetAllowRemoteMigration() && hasAdminSecret,
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
 	}
 
-	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() {
+	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {
 		h.store.TriggerAutoCleanupAsync()
 	}
 
@@ -1246,12 +1380,185 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AdminSecret:           adminSecretForDisplay,
 		AdminAuthSource:       adminAuthSource,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:        h.store.GetAutoCleanError(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
+		MaxRetries:            h.store.GetMaxRetries(),
+		AllowRemoteMigration:  h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:        h.databaseDriver,
 		DatabaseLabel:         h.databaseLabel,
 		CacheDriver:           h.cacheDriver,
 		CacheLabel:            h.cacheLabel,
 	})
+}
+
+// ==================== 导出 & 迁移 ====================
+
+type cpaExportEntry struct {
+	Type         string `json:"type"`
+	Email        string `json:"email"`
+	Expired      string `json:"expired"`
+	IDToken      string `json:"id_token"`
+	AccountID    string `json:"account_id"`
+	AccessToken  string `json:"access_token"`
+	LastRefresh  string `json:"last_refresh"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+// ExportAccounts 导出账号（CPA JSON 格式）
+func (h *Handler) ExportAccounts(c *gin.Context) {
+	filter := c.DefaultQuery("filter", "healthy")
+	idsParam := c.Query("ids")
+	remote := c.Query("remote")
+
+	// 远程调用需检查 allow_remote_migration
+	if remote == "true" {
+		if !h.hasConfiguredAdminSecret(c.Request.Context()) {
+			writeError(c, http.StatusForbidden, "请先设置管理密钥，再启用远程迁移")
+			return
+		}
+		if !h.store.GetAllowRemoteMigration() {
+			writeError(c, http.StatusForbidden, "远程迁移未启用，请在系统设置中开启")
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	rows, err := h.db.ListActive(ctx)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+		return
+	}
+
+	// 按指定 ID 过滤
+	var idSet map[int64]bool
+	if idsParam != "" {
+		idSet = make(map[int64]bool)
+		for _, s := range strings.Split(idsParam, ",") {
+			if id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
+				idSet[id] = true
+			}
+		}
+	}
+
+	// 构建运行时状态映射（用于健康过滤）
+	runtimeMap := make(map[int64]*auth.Account)
+	if filter == "healthy" {
+		for _, acc := range h.store.Accounts() {
+			runtimeMap[acc.DBID] = acc
+		}
+	}
+
+	var entries []cpaExportEntry
+	for _, row := range rows {
+		if idSet != nil && !idSet[row.ID] {
+			continue
+		}
+		if filter == "healthy" {
+			acc, ok := runtimeMap[row.ID]
+			if !ok || acc.RuntimeStatus() != "active" {
+				continue
+			}
+		}
+		rt := row.GetCredential("refresh_token")
+		if rt == "" {
+			continue
+		}
+		entries = append(entries, cpaExportEntry{
+			Type:         "codex",
+			Email:        row.GetCredential("email"),
+			Expired:      row.GetCredential("expires_at"),
+			IDToken:      row.GetCredential("id_token"),
+			AccountID:    row.GetCredential("account_id"),
+			AccessToken:  row.GetCredential("access_token"),
+			LastRefresh:  row.UpdatedAt.Format(time.RFC3339),
+			RefreshToken: rt,
+		})
+	}
+
+	if entries == nil {
+		entries = []cpaExportEntry{}
+	}
+	c.JSON(http.StatusOK, entries)
+}
+
+type migrateReq struct {
+	URL      string `json:"url"`
+	AdminKey string `json:"admin_key"`
+}
+
+// MigrateAccounts 从远程 codex2api 实例迁移健康账号（SSE 流式进度）
+func (h *Handler) MigrateAccounts(c *gin.Context) {
+	if !h.hasConfiguredAdminSecret(c.Request.Context()) {
+		writeError(c, http.StatusForbidden, "请先设置管理密钥，再使用远程迁移")
+		return
+	}
+
+	var req migrateReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if req.URL == "" || req.AdminKey == "" {
+		writeError(c, http.StatusBadRequest, "url 和 admin_key 是必填字段")
+		return
+	}
+
+	remoteURL := strings.TrimRight(req.URL, "/")
+	exportURL := remoteURL + "/api/admin/accounts/export?filter=healthy&remote=true"
+
+	fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer fetchCancel()
+
+	httpReq, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, exportURL, nil)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "构建请求失败: "+err.Error())
+		return
+	}
+	httpReq.Header.Set("X-Admin-Key", req.AdminKey)
+
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(httpReq)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, "连接远程实例失败: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		writeError(c, http.StatusBadGateway, fmt.Sprintf("远程实例返回错误 (%d): %s", resp.StatusCode, string(body)))
+		return
+	}
+
+	var remoteAccounts []cpaExportEntry
+	if err := json.NewDecoder(resp.Body).Decode(&remoteAccounts); err != nil {
+		writeError(c, http.StatusBadGateway, "解析远程数据失败: "+err.Error())
+		return
+	}
+
+	if len(remoteAccounts) == 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "远程实例没有可迁移的健康账号", "total": 0, "imported": 0, "duplicate": 0, "failed": 0})
+		return
+	}
+
+	// 转换为 importToken 格式，复用 importAccountsCommon
+	var tokens []importToken
+	for _, entry := range remoteAccounts {
+		rt := strings.TrimSpace(entry.RefreshToken)
+		if rt == "" {
+			continue
+		}
+		name := entry.Email
+		if name == "" {
+			name = "migrate"
+		}
+		tokens = append(tokens, importToken{refreshToken: rt, name: name})
+	}
+
+	log.Printf("远程迁移: 从 %s 拉取到 %d 个账号，开始导入", remoteURL, len(tokens))
+	h.importAccountsCommon(c, tokens, "")
 }
 
 // ==================== Models ====================
@@ -1271,6 +1578,11 @@ func (h *Handler) CleanBanned(c *gin.Context) {
 // CleanRateLimited 清理限流（rate_limited）账号
 func (h *Handler) CleanRateLimited(c *gin.Context) {
 	h.cleanByStatus(c, "rate_limited")
+}
+
+// CleanError 清理错误（error）账号
+func (h *Handler) CleanError(c *gin.Context) {
+	h.cleanByStatus(c, "error")
 }
 
 // cleanByStatus 按运行时状态清理账号
@@ -1437,12 +1749,12 @@ func (h *Handler) TestProxy(c *gin.Context) {
 
 	// 创建使用指定代理的 HTTP client
 	transport := &http.Transport{}
-	proxyURL, err := parseProxyURL(req.URL)
-	if err != nil {
+	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = baseDialer.DialContext
+	if err := auth.ConfigureTransportProxy(transport, req.URL, baseDialer); err != nil {
 		c.JSON(http.StatusOK, gin.H{"success": false, "error": fmt.Sprintf("代理 URL 格式错误: %v", err)})
 		return
 	}
-	transport.Proxy = http.ProxyURL(proxyURL)
 	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
 
 	apiLang := req.Lang
@@ -1493,7 +1805,3 @@ func (h *Handler) TestProxy(c *gin.Context) {
 	})
 }
 
-// parseProxyURL 解析代理 URL
-func parseProxyURL(rawURL string) (*neturl.URL, error) {
-	return neturl.Parse(rawURL)
-}

@@ -79,7 +79,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			auto_clean_rate_limited INTEGER DEFAULT 0,
 			admin_secret TEXT DEFAULT '',
 			auto_clean_full_usage INTEGER DEFAULT 0,
-			proxy_pool_enabled INTEGER DEFAULT 0
+			auto_clean_error INTEGER DEFAULT 0,
+			proxy_pool_enabled INTEGER DEFAULT 0,
+			fast_scheduler_enabled INTEGER DEFAULT 0,
+			max_retries INTEGER DEFAULT 2,
+			allow_remote_migration INTEGER DEFAULT 0
 		);`,
 		`CREATE TABLE IF NOT EXISTS proxies (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,7 +125,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "auto_clean_rate_limited", "INTEGER DEFAULT 0"},
 		{"system_settings", "admin_secret", "TEXT DEFAULT ''"},
 		{"system_settings", "auto_clean_full_usage", "INTEGER DEFAULT 0"},
+		{"system_settings", "auto_clean_error", "INTEGER DEFAULT 0"},
 		{"system_settings", "proxy_pool_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "fast_scheduler_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
+		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
 		{"proxies", "test_ip", "TEXT DEFAULT ''"},
 		{"proxies", "test_location", "TEXT DEFAULT ''"},
 		{"proxies", "test_latency_ms", "INTEGER DEFAULT 0"},

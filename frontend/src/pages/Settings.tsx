@@ -48,10 +48,14 @@ export default function Settings() {
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
     auto_clean_rate_limited: false,
+    auto_clean_error: false,
     admin_secret: '',
     admin_auth_source: 'disabled',
     auto_clean_full_usage: false,
     proxy_pool_enabled: false,
+    fast_scheduler_enabled: false,
+    max_retries: 2,
+    allow_remote_migration: false,
     database_driver: 'postgres',
     database_label: 'PostgreSQL',
     cache_driver: 'redis',
@@ -175,6 +179,7 @@ export default function Settings() {
   const isExternalDatabase = settingsForm.database_driver === 'postgres'
   const isExternalCache = settingsForm.cache_driver === 'redis'
   const showConnectionPool = isExternalDatabase || isExternalCache
+  const canConfigureRemoteMigration = settingsForm.admin_auth_source === 'env' || settingsForm.admin_secret.trim() !== ''
   return (
     <StateShell
       variant="page"
@@ -342,6 +347,17 @@ export default function Settings() {
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.globalRpmRange')}</p>
               </div>
               <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.maxRetries')}</label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={10}
+                  value={settingsForm.max_retries}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_retries: parseInt(e.target.value) || 0 }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.maxRetriesRange')}</p>
+              </div>
+              <div>
                 <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.testModelLabel')}</label>
                 <Select
                   value={settingsForm.test_model}
@@ -424,6 +440,27 @@ export default function Settings() {
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanFullUsageDesc')}</p>
               </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.autoCleanError')}</label>
+                <Select
+                  value={settingsForm.auto_clean_error ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_error: value === 'true' }))}
+                  options={booleanOptions}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanErrorDesc')}</p>
+              </div>
+            </div>
+            <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.scheduler')}</h3>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 mb-4">
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.fastSchedulerEnabled')}</label>
+                <Select
+                  value={settingsForm.fast_scheduler_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, fast_scheduler_enabled: value === 'true' }))}
+                  options={booleanOptions}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.fastSchedulerEnabledDesc')}</p>
+              </div>
             </div>
             <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.security')}</h3>
             <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 mb-4">
@@ -434,11 +471,31 @@ export default function Settings() {
                   placeholder={t('settings.adminSecretPlaceholder')}
                   value={settingsForm.admin_secret}
                   disabled={settingsForm.admin_auth_source === 'env'}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, admin_secret: e.target.value }))}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => {
+                    const nextSecret = e.target.value
+                    return {
+                      ...f,
+                      admin_secret: nextSecret,
+                      allow_remote_migration: nextSecret.trim() === '' ? false : f.allow_remote_migration,
+                    }
+                  })}
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.adminSecretDesc')}</p>
                 {settingsForm.admin_auth_source === 'env' ? (
                   <p className="text-xs text-amber-600 mt-1">{t('settings.adminSecretEnvOverride')}</p>
+                ) : null}
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.allowRemoteMigration')}</label>
+                <Select
+                  value={settingsForm.allow_remote_migration ? 'true' : 'false'}
+                  disabled={!canConfigureRemoteMigration}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, allow_remote_migration: value === 'true' }))}
+                  options={booleanOptions}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.allowRemoteMigrationDesc')}</p>
+                {!canConfigureRemoteMigration ? (
+                  <p className="text-xs text-amber-600 mt-1">{t('settings.allowRemoteMigrationRequiresSecret')}</p>
                 ) : null}
               </div>
             </div>

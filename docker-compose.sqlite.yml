@@ -1,3 +1,5 @@
+name: codex2api-sqlite
+
 services:
   codex2api:
     image: ghcr.io/james-6-23/codex2api:latest
@@ -8,7 +10,9 @@ services:
       - .env
     volumes:
       - sqlite-data:/data
+      - ./logs:/app/logs
     restart: unless-stopped
 
 volumes:
   sqlite-data:
+    name: codex2api-sqlite_sqlite-data

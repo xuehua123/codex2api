@@ -25,7 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, Upload, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 import { buildAccountProxyOptions } from './accountProxyOptions'
@@ -52,10 +52,18 @@ export default function Accounts() {
   const [batchTesting, setBatchTesting] = useState(false)
   const [cleaningBanned, setCleaningBanned] = useState(false)
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false)
+  const [cleaningError, setCleaningError] = useState(false)
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null)
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null)
   const [importing, setImporting] = useState(false)
   const [showImportPicker, setShowImportPicker] = useState(false)
+  const [showExportPicker, setShowExportPicker] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [showMigrate, setShowMigrate] = useState(false)
+  const [migrateUrl, setMigrateUrl] = useState('')
+  const [migrateKey, setMigrateKey] = useState('')
+  const [migrating, setMigrating] = useState(false)
+  const [importProgress, setImportProgress] = useState<{ show: boolean; current: number; total: number; success: number; duplicate: number; failed: number; done: boolean }>({ show: false, current: 0, total: 0, success: 0, duplicate: 0, failed: 0, done: false })
   const [addMethod, setAddMethod] = useState<'rt' | 'oauth'>('rt')
   const [oauthStep, setOauthStep] = useState<'generate' | 'exchange'>('generate')
   const [oauthSession, setOauthSession] = useState<{ session_id: string; auth_url: string } | null>(null)
@@ -268,6 +276,29 @@ export default function Accounts() {
     }
   }
 
+  const readImportSSE = async (res: Response) => {
+    setImportProgress({ show: true, current: 0, total: 0, success: 0, duplicate: 0, failed: 0, done: false })
+    const reader = res.body?.getReader()
+    if (!reader) return
+    const decoder = new TextDecoder()
+    let buffer = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const event = JSON.parse(line.slice(6)) as { type: string; current: number; total: number; success: number; duplicate: number; failed: number }
+          setImportProgress(p => ({ ...p, current: event.current, total: event.total, success: event.success, duplicate: event.duplicate, failed: event.failed, done: event.type === 'complete' }))
+          if (event.type === 'complete') void reload()
+        } catch { /* 忽略解析异常 */ }
+      }
+    }
+  }
+
   const handleFileImport = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     if (!file) return
@@ -281,12 +312,16 @@ export default function Accounts() {
       const formData = new FormData()
       formData.append('file', file)
       const res = await fetch('/api/admin/accounts/import', { method: 'POST', body: formData, headers: getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {} })
-      const data = await res.json()
-      if (!res.ok) {
-        showToast(data.error ? t('accounts.importFailedWithReason', { error: data.error }) : t('accounts.importFailed'), 'error')
+      if (res.headers.get('content-type')?.includes('text/event-stream')) {
+        await readImportSSE(res)
       } else {
-        showToast(t('accounts.importCompleted'))
-        void reload()
+        const data = await res.json()
+        if (!res.ok) {
+          showToast(data.error ? t('accounts.importFailedWithReason', { error: data.error }) : t('accounts.importFailed'), 'error')
+        } else {
+          showToast(t('accounts.importCompleted'))
+          void reload()
+        }
       }
     } catch (error) {
       showToast(t('accounts.importFailedWithReason', { error: getErrorMessage(error) }), 'error')
@@ -308,18 +343,84 @@ export default function Accounts() {
         formData.append('file', files[i])
       }
       const res = await fetch('/api/admin/accounts/import', { method: 'POST', body: formData, headers: getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {} })
-      const data = await res.json()
-      if (!res.ok) {
-        showToast(data.error ? t('accounts.importFailedWithReason', { error: data.error }) : t('accounts.importFailed'), 'error')
+      if (res.headers.get('content-type')?.includes('text/event-stream')) {
+        await readImportSSE(res)
       } else {
-        showToast(t('accounts.importCompleted'))
-        void reload()
+        const data = await res.json()
+        if (!res.ok) {
+          showToast(data.error ? t('accounts.importFailedWithReason', { error: data.error }) : t('accounts.importFailed'), 'error')
+        } else {
+          showToast(t('accounts.importCompleted'))
+          void reload()
+        }
       }
     } catch (error) {
       showToast(t('accounts.importFailedWithReason', { error: getErrorMessage(error) }), 'error')
     } finally {
       setImporting(false)
       if (jsonInputRef.current) jsonInputRef.current.value = ''
+    }
+  }
+
+  const handleExport = async (format: 'json' | 'txt', scope: 'healthy' | 'selected') => {
+    setExporting(true)
+    setShowExportPicker(false)
+    try {
+      const params: { filter: 'healthy' | 'all'; ids?: number[] } = {
+        filter: scope === 'healthy' ? 'healthy' : 'all',
+      }
+      if (scope === 'selected') {
+        params.ids = Array.from(selected)
+        params.filter = 'all'
+      }
+      const data = await api.exportAccounts(params)
+      if (data.length === 0) {
+        showToast(t('accounts.exportNoAccounts'), 'error')
+        return
+      }
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      if (format === 'json') {
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+        downloadBlob(blob, `cpa-${ts}-${data.length}.json`)
+      } else {
+        const text = data.map(e => e.refresh_token).join('\n')
+        const blob = new Blob([text], { type: 'text/plain' })
+        downloadBlob(blob, `rt-${ts}-${data.length}.txt`)
+      }
+      showToast(t('accounts.exportSuccess', { count: data.length }))
+    } catch (error) {
+      showToast(`${t('accounts.exportFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const handleMigrate = async () => {
+    setMigrating(true)
+    setShowMigrate(false)
+    try {
+      const res = await fetch('/api/admin/accounts/migrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {}) },
+        body: JSON.stringify({ url: migrateUrl.trim(), admin_key: migrateKey.trim() }),
+      })
+      if (res.headers.get('content-type')?.includes('text/event-stream')) {
+        await readImportSSE(res)
+      } else {
+        const data = await res.json()
+        if (!res.ok) {
+          showToast(data.error ? `${t('accounts.migrateFailed')}: ${data.error}` : t('accounts.migrateFailed'), 'error')
+        } else {
+          showToast(t('accounts.migrateSuccess', { imported: data.imported ?? 0, duplicate: data.duplicate ?? 0, failed: data.failed ?? 0 }))
+          void reload()
+        }
+      }
+    } catch (error) {
+      showToast(`${t('accounts.migrateFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setMigrating(false)
+      setMigrateUrl('')
+      setMigrateKey('')
     }
   }
 
@@ -344,8 +445,8 @@ export default function Accounts() {
   const handleRefresh = async (account: AccountRow) => {
     setRefreshingIds((prev) => new Set(prev).add(account.id))
     try {
-      await api.refreshAccount(account.id)
-      showToast(t('accounts.refreshRequested'))
+      const result = await api.refreshAccount(account.id)
+      showToast(result.message || t('accounts.refreshRequested'))
       void reloadSilently()
     } catch (error) {
       showToast(t('accounts.refreshFailed', { error: getErrorMessage(error) }), 'error')
@@ -497,6 +598,26 @@ export default function Accounts() {
     }
   }
 
+  const handleCleanError = async () => {
+    const confirmed = await confirm({
+      title: t('accounts.cleanErrorTitle'),
+      description: t('accounts.cleanErrorDesc'),
+      confirmText: t('accounts.cleanConfirm'),
+      tone: 'warning',
+    })
+    if (!confirmed) return
+    setCleaningError(true)
+    try {
+      await api.cleanError()
+      showToast(t('accounts.cleanErrorSuccess'))
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.cleanErrorFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setCleaningError(false)
+    }
+  }
+
   return (
     <StateShell
       variant="page"
@@ -526,6 +647,10 @@ export default function Accounts() {
                 <Timer className="size-3" />
                 {cleaningRateLimited ? t('accounts.cleaning') : t('accounts.cleanRateLimited')}
               </Button>
+              <Button variant="outline" size="sm" disabled={cleaningError} onClick={() => void handleCleanError()}>
+                <AlertTriangle className="size-3" />
+                {cleaningError ? t('accounts.cleaning') : t('accounts.cleanError')}
+              </Button>
               <Button onClick={() => setShowAdd(true)}>
                 <Plus className="size-3.5" />
                 {t('accounts.addAccount')}
@@ -533,6 +658,14 @@ export default function Accounts() {
               <Button variant="outline" disabled={importing} onClick={() => setShowImportPicker(true)}>
                 <Upload className="size-3.5" />
                 {importing ? t('accounts.importing') : t('accounts.importFile')}
+              </Button>
+              <Button variant="outline" disabled={exporting} onClick={() => setShowExportPicker(true)}>
+                <Download className="size-3.5" />
+                {exporting ? t('accounts.exporting') : t('accounts.export')}
+              </Button>
+              <Button variant="outline" disabled={migrating} onClick={() => setShowMigrate(true)}>
+                <ArrowDownToLine className="size-3.5" />
+                {migrating ? t('accounts.migrating') : t('accounts.migrateImport')}
               </Button>
               <input
                 ref={fileInputRef}
@@ -1037,6 +1170,99 @@ export default function Accounts() {
           </div>
         </Modal>
 
+        <Modal
+          show={showExportPicker}
+          title={t('accounts.exportTitle')}
+          contentClassName="sm:max-w-[580px]"
+          onClose={() => setShowExportPicker(false)}
+        >
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              className="flex items-center gap-3 rounded-xl border border-border px-4 py-3.5 text-left hover:bg-muted/50 transition-colors"
+              onClick={() => void handleExport('json', 'healthy')}
+            >
+              <FileJson className="size-5 shrink-0 text-muted-foreground" />
+              <div className="min-w-0">
+                <div className="text-sm font-medium whitespace-nowrap">{t('accounts.exportHealthyJson')}</div>
+                <div className="text-[11px] text-muted-foreground">{t('accounts.exportHealthyJsonDesc')}</div>
+              </div>
+            </button>
+            <button
+              className="flex items-center gap-3 rounded-xl border border-border px-4 py-3.5 text-left hover:bg-muted/50 transition-colors"
+              onClick={() => void handleExport('txt', 'healthy')}
+            >
+              <FileText className="size-5 shrink-0 text-muted-foreground" />
+              <div className="min-w-0">
+                <div className="text-sm font-medium whitespace-nowrap">{t('accounts.exportHealthyTxt')}</div>
+                <div className="text-[11px] text-muted-foreground">{t('accounts.exportHealthyTxtDesc')}</div>
+              </div>
+            </button>
+            <button
+              className="flex items-center gap-3 rounded-xl border border-border px-4 py-3.5 text-left hover:bg-muted/50 transition-colors disabled:opacity-40 disabled:pointer-events-none"
+              disabled={selected.size === 0}
+              onClick={() => void handleExport('json', 'selected')}
+            >
+              <FileJson className="size-5 shrink-0 text-muted-foreground" />
+              <div className="min-w-0">
+                <div className="text-sm font-medium whitespace-nowrap">{t('accounts.exportSelectedJson')}</div>
+                <div className="text-[11px] text-muted-foreground">{t('accounts.exportSelectedJsonDesc')}</div>
+              </div>
+            </button>
+            <button
+              className="flex items-center gap-3 rounded-xl border border-border px-4 py-3.5 text-left hover:bg-muted/50 transition-colors disabled:opacity-40 disabled:pointer-events-none"
+              disabled={selected.size === 0}
+              onClick={() => void handleExport('txt', 'selected')}
+            >
+              <FileText className="size-5 shrink-0 text-muted-foreground" />
+              <div className="min-w-0">
+                <div className="text-sm font-medium whitespace-nowrap">{t('accounts.exportSelectedTxt')}</div>
+                <div className="text-[11px] text-muted-foreground">{t('accounts.exportSelectedTxtDesc')}</div>
+              </div>
+            </button>
+          </div>
+        </Modal>
+
+        <Modal
+          show={showMigrate}
+          title={t('accounts.migrateTitle')}
+          contentClassName="sm:max-w-[520px]"
+          onClose={() => { setShowMigrate(false); setMigrateUrl(''); setMigrateKey('') }}
+        >
+          <div className="space-y-4">
+            <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+              <p>{t('accounts.migrateDesc')}</p>
+            </div>
+            <div>
+              <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.migrateUrlLabel')}</label>
+              <Input
+                placeholder={t('accounts.migrateUrlPlaceholder')}
+                value={migrateUrl}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => setMigrateUrl(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.migrateKeyLabel')}</label>
+              <Input
+                type="password"
+                placeholder={t('accounts.migrateKeyPlaceholder')}
+                value={migrateKey}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => setMigrateKey(e.target.value)}
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <Button variant="outline" onClick={() => { setShowMigrate(false); setMigrateUrl(''); setMigrateKey('') }}>
+                {t('common.cancel')}
+              </Button>
+              <Button
+                onClick={() => void handleMigrate()}
+                disabled={migrating || !migrateUrl.trim() || !migrateKey.trim()}
+              >
+                {migrating ? t('accounts.migrating') : t('accounts.migrateConfirm')}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+
         {testingAccount && (
           <TestConnectionModal
             account={testingAccount}
@@ -1051,12 +1277,61 @@ export default function Accounts() {
           <AccountUsageModal account={usageAccount} onClose={() => setUsageAccount(null)} />
         )}
 
+        <Modal
+          show={importProgress.show}
+          title={importProgress.done ? t('accounts.importDone') : t('accounts.importingProgress')}
+          contentClassName="sm:max-w-[420px]"
+          onClose={() => setImportProgress(p => ({ ...p, show: false }))}
+        >
+          <div className="space-y-4">
+            <div className="w-full h-3 bg-muted rounded-full overflow-hidden">
+              <div
+                className="h-full bg-primary rounded-full transition-all duration-300 ease-out"
+                style={{ width: importProgress.total > 0 ? `${Math.round((importProgress.current / importProgress.total) * 100)}%` : '0%' }}
+              />
+            </div>
+            <div className="text-center text-sm text-muted-foreground">
+              {importProgress.total > 0
+                ? `${importProgress.current} / ${importProgress.total}  (${Math.round((importProgress.current / importProgress.total) * 100)}%)`
+                : t('accounts.importPreparing')}
+            </div>
+            <div className="grid grid-cols-3 gap-3 text-center">
+              <div className="rounded-xl bg-emerald-500/10 px-3 py-2">
+                <div className="text-lg font-bold text-emerald-600">{importProgress.success}</div>
+                <div className="text-[11px] text-muted-foreground">{t('accounts.importSuccess')}</div>
+              </div>
+              <div className="rounded-xl bg-amber-500/10 px-3 py-2">
+                <div className="text-lg font-bold text-amber-600">{importProgress.duplicate}</div>
+                <div className="text-[11px] text-muted-foreground">{t('accounts.importDuplicate')}</div>
+              </div>
+              <div className="rounded-xl bg-red-500/10 px-3 py-2">
+                <div className="text-lg font-bold text-red-600">{importProgress.failed}</div>
+                <div className="text-[11px] text-muted-foreground">{t('accounts.importFailedCount')}</div>
+              </div>
+            </div>
+            {importProgress.done && (
+              <p className="text-xs text-center text-muted-foreground">{t('accounts.importDoneHint')}</p>
+            )}
+          </div>
+        </Modal>
+
         {confirmDialog}
 
         <ToastNotice toast={toast} />
       </>
     </StateShell>
   )
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
 }
 
 function CompactStat({

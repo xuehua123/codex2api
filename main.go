@@ -222,6 +222,7 @@ func main() {
 
 	log.Println("正在关闭...")
 	store.Stop()
+	proxy.CloseErrorLogger()
 	log.Println("已关闭")
 }
 

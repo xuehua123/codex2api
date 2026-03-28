@@ -255,6 +255,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS admin_secret VARCHAR(255) DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_full_usage BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_pool_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_scheduler_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
 
 	CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
@@ -329,7 +333,11 @@ type SystemSettings struct {
 	AutoCleanRateLimited  bool
 	AdminSecret           string
 	AutoCleanFullUsage    bool
+	AutoCleanError        bool
 	ProxyPoolEnabled      bool
+	FastSchedulerEnabled  bool
+	MaxRetries            int
+	AllowRemoteMigration  bool
 }
 
 // GetSystemSettings 加载全局设置
@@ -338,12 +346,17 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	err := db.conn.QueryRowContext(ctx, `
 		SELECT max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 		       auto_clean_unauthorized, auto_clean_rate_limited, COALESCE(admin_secret, ''), COALESCE(auto_clean_full_usage, false),
-		       COALESCE(proxy_pool_enabled, false)
+		       COALESCE(proxy_pool_enabled, false),
+		       COALESCE(fast_scheduler_enabled, false),
+		       COALESCE(max_retries, 2),
+		       COALESCE(allow_remote_migration, false),
+		       COALESCE(auto_clean_error, false)
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
-		&s.ProxyPoolEnabled,
+		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
+		&s.AutoCleanError,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -356,9 +369,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	_, err := db.conn.ExecContext(ctx, `
 		INSERT INTO system_settings (
 			id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
-			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled
+			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
+			fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error
 		)
-		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		ON CONFLICT (id) DO UPDATE SET
 			max_concurrency         = EXCLUDED.max_concurrency,
 			global_rpm              = EXCLUDED.global_rpm,
@@ -371,9 +385,14 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			auto_clean_rate_limited = EXCLUDED.auto_clean_rate_limited,
 			admin_secret            = EXCLUDED.admin_secret,
 			auto_clean_full_usage   = EXCLUDED.auto_clean_full_usage,
-			proxy_pool_enabled      = EXCLUDED.proxy_pool_enabled
+			proxy_pool_enabled      = EXCLUDED.proxy_pool_enabled,
+			fast_scheduler_enabled  = EXCLUDED.fast_scheduler_enabled,
+			max_retries             = EXCLUDED.max_retries,
+			allow_remote_migration  = EXCLUDED.allow_remote_migration,
+			auto_clean_error        = EXCLUDED.auto_clean_error
 	`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
-		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled)
+		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
+		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError)
 	return err
 }
 

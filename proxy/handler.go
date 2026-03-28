@@ -199,7 +199,7 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 	}
 }
 
-func shouldTransparentRetryStream(outcome streamOutcome, attempt int, wroteAnyBody bool, ctxErr, writeErr error) bool {
+func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries int, wroteAnyBody bool, ctxErr, writeErr error) bool {
 	if attempt >= maxRetries {
 		return false
 	}
@@ -261,7 +261,10 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 
 // ==================== /v1/responses ====================
 
-const maxRetries = 2 // 最多重试次数（换号）
+// getMaxRetries 从 store 读取可配置的最大重试次数
+func (h *Handler) getMaxRetries() int {
+	return h.store.GetMaxRetries()
+}
 
 const (
 	logStatusClientClosed        = 499
@@ -270,7 +273,7 @@ const (
 
 // isRetryableStatus 检查是否可重试的上游状态码
 func isRetryableStatus(code int) bool {
-	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable || code == http.StatusUnauthorized
+	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
 }
 
 // Responses 处理 /v1/responses 请求（原生透传，无需协议翻译）
@@ -321,7 +324,18 @@ func (h *Handler) Responses(c *gin.Context) {
 	if re := gjson.GetBytes(codexBody, "reasoning_effort"); re.Exists() && !gjson.GetBytes(codexBody, "reasoning.effort").Exists() {
 		codexBody, _ = sjson.SetBytes(codexBody, "reasoning.effort", re.String())
 	}
+	codexBody = clampReasoningEffort(codexBody)
 	codexBody = sanitizeServiceTierForUpstream(codexBody)
+
+	// 为缺少 description 的客户端执行工具补充默认描述（如 tool_search）
+	codexBody = ensureToolDescriptions(codexBody)
+	// 清理 function tool parameters 中上游不支持的 JSON Schema 关键字
+	codexBody = sanitizeToolSchemas(codexBody)
+
+	// 展开 previous_response_id（将缓存的历史对话上下文注入 input）
+	codexBody, _ = expandPreviousResponse(codexBody)
+	// 保存展开后的 input，用于在 response.completed 时缓存完整上下文
+	expandedInputRaw := gjson.GetBytes(codexBody, "input").Raw
 
 	// 删除 Codex 不支持的参数
 	unsupportedFields := []string{
@@ -337,6 +351,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 
 	// 3. 带重试的上游请求
+	maxRetries := h.getMaxRetries()
 	var lastErr error
 	var lastStatusCode int
 	var lastBody []byte
@@ -381,6 +396,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.Release(account)
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
+			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
 			h.logUsage(&database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses",
@@ -460,6 +476,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
+					// 缓存响应上下文，供后续 previous_response_id 展开使用
+					cacheCompletedResponse([]byte(expandedInputRaw), data)
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -492,6 +510,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
+					// 缓存响应上下文，供后续 previous_response_id 展开使用
+					cacheCompletedResponse([]byte(expandedInputRaw), data)
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -515,7 +535,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
-		if shouldTransparentRetryStream(outcome, attempt, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClientForAccount(account)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
@@ -639,6 +659,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	sessionID := ResolveSessionID(c.GetHeader("Authorization"), codexBody)
 
 	// 3. 带重试的上游请求
+	maxRetries := h.getMaxRetries()
 	var lastErr error
 	var lastStatusCode int
 	var lastBody []byte
@@ -683,6 +704,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.Release(account)
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
+			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
 			h.logUsage(&database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/chat/completions",
@@ -729,6 +751,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		created := time.Now().Unix()
 
 		if isStream {
+			streamTranslator := NewStreamTranslator(chunkID, model)
 			c.Header("Content-Type", "text/event-stream")
 			c.Header("Cache-Control", "no-cache")
 			c.Header("Connection", "keep-alive")
@@ -745,15 +768,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
-				chunk, done := TranslateStreamChunk(data, model, chunkID)
+				chunk, done := streamTranslator.Translate(data)
 
 				eventType := gjson.GetBytes(data, "type").String()
 				if !ttftRecorded && strings.Contains(eventType, ".delta") {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
-				// 累计 delta 字符数
-				if eventType == "response.output_text.delta" {
+				// 累计 delta 字符数（文本 + function call 参数）
+				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
 					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
 				}
 				if eventType == "response.completed" {
@@ -789,6 +812,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			})
 		} else {
 			var fullContent strings.Builder
+			var toolCalls []ToolCallResult
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				eventType := gjson.GetBytes(data, "type").String()
@@ -800,11 +824,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				case "response.output_text.delta":
 					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
 					fullContent.WriteString(gjson.GetBytes(data, "delta").String())
+				case "response.function_call_arguments.delta":
+					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
 				case "response.completed":
 					usage = extractUsage(data)
 					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
+					// 从 response.output 提取 function_call 项
+					toolCalls = ExtractToolCallsFromOutput(data)
 					gotTerminal = true
 					return false
 				case "response.failed":
@@ -821,8 +849,27 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			result, _ = sjson.SetBytes(result, "model", model)
 			result, _ = sjson.SetBytes(result, "choices.0.index", 0)
 			result, _ = sjson.SetBytes(result, "choices.0.message.role", "assistant")
-			result, _ = sjson.SetBytes(result, "choices.0.message.content", fullContent.String())
-			result, _ = sjson.SetBytes(result, "choices.0.finish_reason", "stop")
+
+			if len(toolCalls) > 0 {
+				// 有工具调用: 设置 tool_calls 和对应的 finish_reason
+				contentStr := fullContent.String()
+				if contentStr != "" {
+					result, _ = sjson.SetBytes(result, "choices.0.message.content", contentStr)
+				} else {
+					result, _ = sjson.SetRawBytes(result, "choices.0.message.content", []byte("null"))
+				}
+				for i, tc := range toolCalls {
+					prefix := fmt.Sprintf("choices.0.message.tool_calls.%d", i)
+					result, _ = sjson.SetBytes(result, prefix+".id", tc.ID)
+					result, _ = sjson.SetBytes(result, prefix+".type", "function")
+					result, _ = sjson.SetBytes(result, prefix+".function.name", tc.Name)
+					result, _ = sjson.SetBytes(result, prefix+".function.arguments", tc.Arguments)
+				}
+				result, _ = sjson.SetBytes(result, "choices.0.finish_reason", "tool_calls")
+			} else {
+				result, _ = sjson.SetBytes(result, "choices.0.message.content", fullContent.String())
+				result, _ = sjson.SetBytes(result, "choices.0.finish_reason", "stop")
+			}
 
 			if usage != nil {
 				result, _ = sjson.SetBytes(result, "usage.prompt_tokens", usage.PromptTokens)
@@ -836,7 +883,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
-		if shouldTransparentRetryStream(outcome, attempt, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClientForAccount(account)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
