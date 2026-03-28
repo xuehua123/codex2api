@@ -93,6 +93,6 @@ jobs:
             cd /opt/platform
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
             docker compose pull codex2api
-            docker compose up -d codex2api
+            docker compose up -d --no-deps codex2api
             docker image prune -f
             curl -fsS http://127.0.0.1:8080/health
