@@ -412,7 +412,7 @@ export default function Accounts() {
     setLoadingProxyOptions(true)
     try {
       const result = await api.listProxies()
-      setProxyOptions(buildAccountProxyOptions(result.proxies ?? [], {
+      setProxyOptions(buildAccountProxyOptions((result.proxies ?? []).filter((proxy) => proxy.enabled), {
         clearBinding: t('accounts.clearProxyBinding'),
         unlabeled: t('proxies.unlabeled'),
         boundAccounts: (count) => t('accounts.boundAccountsCount', { count }),
