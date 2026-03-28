@@ -371,6 +371,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		start := time.Now()
 		proxyURL := h.store.NextProxy()
+		account.Mu().RLock()
+		effectiveProxyURL := resolveProxyURL(account.ProxyURL, proxyURL)
+		account.Mu().RUnlock()
 		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -425,7 +428,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		account.Mu().RLock()
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
-		c.Set("x-account-proxy", proxyURL)
+		c.Set("x-account-proxy", effectiveProxyURL)
 		c.Set("x-model", model)
 		c.Set("x-reasoning-effort", reasoningEffort)
 		var firstTokenMs int
@@ -679,6 +682,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		start := time.Now()
 		proxyURL := h.store.NextProxy()
+		account.Mu().RLock()
+		effectiveProxyURL := resolveProxyURL(account.ProxyURL, proxyURL)
+		account.Mu().RUnlock()
 		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -733,7 +739,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		account.Mu().RLock()
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
-		c.Set("x-account-proxy", proxyURL)
+		c.Set("x-account-proxy", effectiveProxyURL)
 		c.Set("x-model", model)
 		c.Set("x-reasoning-effort", reasoningEffort)
 		var firstTokenMs int
