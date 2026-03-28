@@ -28,7 +28,7 @@ Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管
 标准镜像版：
 
 ```bash
-git clone https://github.com/james-6-23/codex2api.git
+git clone https://github.com/xuehua123/codex2api.git
 cd codex2api
 cp .env.example .env
 docker compose pull
@@ -78,8 +78,15 @@ docker compose -f docker-compose.sqlite.local.yml logs -f codex2api
 标准镜像版升级命令：
 
 ```bash
-git pull && docker compose pull && docker compose up -d && docker compose logs -f codex2api
+docker compose pull && docker compose up -d && docker compose logs -f codex2api
 ```
+
+上海生产环境约定：
+
+- 镜像仓库：`ghcr.io/xuehua123/codex2api`
+- 分支自动部署标签：`latest`
+- 追踪/回滚标签：`sha-<gitsha>`
+- 生产机只做 `docker compose pull codex2api && docker compose up -d codex2api`
 
 ### 本地开发模式
 
@@ -271,6 +278,7 @@ codex2api/
 ## 常见注意事项
 
 - `docker-compose.yml` 拉取 GHCR 镜像用于部署；`docker-compose.local.yml` 用 `build: .` 做本地构建
+- 生产环境不要在服务器本地 `build`，统一使用 GHCR 镜像
 - 前端基路径固定为 `/admin/`，本地开发和生产部署一致
 - 本地手动构建 Go 二进制前需先执行 `frontend/` 的 `npm run build`
 - `.env` 只负责端口、数据库、Redis 等物理层配置；业务参数在管理台数据库里维护
