@@ -39,12 +39,17 @@ type AccountInfo struct {
 	PlanType         string `json:"chatgpt_plan_type"`
 }
 
-// RefreshAccessToken 用 RT 换取 AT
-func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL string) (*TokenData, *AccountInfo, error) {
+// RefreshAccessToken 用 RT 或 Session Token 换取 AT
+func RefreshAccessToken(ctx context.Context, tokenStr string, proxyURL string) (*TokenData, *AccountInfo, error) {
+	// 如果是 eyJ 开头，说明是 session_token，使用新的 Session API
+	if strings.HasPrefix(tokenStr, "eyJ") {
+		return RefreshBySessionToken(ctx, tokenStr, proxyURL)
+	}
+
 	data := url.Values{
 		"grant_type":    {"refresh_token"},
 		"client_id":     {ClientID},
-		"refresh_token": {refreshToken},
+		"refresh_token": {tokenStr},
 		"scope":         {RefreshScopes},
 	}
 
@@ -91,7 +96,7 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 
 	// 保留新 RT，如果返回空则保留旧的
 	if strings.TrimSpace(td.RefreshToken) == "" {
-		td.RefreshToken = refreshToken
+		td.RefreshToken = tokenStr
 	}
 
 	// 解析 id_token 获取账号信息
@@ -174,17 +179,99 @@ func parseIDToken(idToken string) *AccountInfo {
 			ChatGPTAccountID string `json:"chatgpt_account_id"`
 			PlanType         string `json:"chatgpt_plan_type"`
 		} `json:"https://api.openai.com/auth"`
+		Profile *struct {
+			Email string `json:"email"`
+		} `json:"https://api.openai.com/profile"`
 	}
 	if err := json.Unmarshal(decoded, &claims); err != nil {
 		return &AccountInfo{}
 	}
 
 	info := &AccountInfo{Email: claims.Email}
+	if info.Email == "" && claims.Profile != nil && claims.Profile.Email != "" {
+		info.Email = claims.Profile.Email
+	}
 	if claims.OpenAIAuth != nil {
 		info.ChatGPTAccountID = claims.OpenAIAuth.ChatGPTAccountID
 		info.PlanType = claims.OpenAIAuth.PlanType
 	}
 	return info
+}
+
+// RefreshBySessionToken 使用 Session Token (eyJ...) 在 API 换取 AT
+func RefreshBySessionToken(ctx context.Context, sessionToken string, proxyURL string) (*TokenData, *AccountInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://chatgpt.com/api/auth/session", nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建会话请求失败: %w", err)
+	}
+
+	req.AddCookie(&http.Cookie{
+		Name:  "__Secure-next-auth.session-token",
+		Value: sessionToken,
+	})
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	client := buildHTTPClient(proxyURL)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("会话刷新请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			return nil, nil, fmt.Errorf("%s", "invalid_grant: "+string(body))
+		}
+		return nil, nil, fmt.Errorf("会话刷新失败 (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var sessionResp struct {
+		AccessToken  string `json:"accessToken"`
+		SessionToken string `json:"sessionToken"`
+		Expires      string `json:"expires"`
+	}
+	if err := json.Unmarshal(body, &sessionResp); err != nil {
+		return nil, nil, fmt.Errorf("解析会话响应失败: %w", err)
+	}
+
+	if sessionResp.AccessToken == "" {
+		if strings.TrimSpace(string(body)) == "{}" {
+			// next-auth session expired/invalid returns {}
+			return nil, nil, fmt.Errorf("invalid_grant: session token invalid or expired")
+		}
+		return nil, nil, fmt.Errorf("解析会话响应失败: accessToken 为空 (body: %s)", string(body)[:min(100, len(body))])
+	}
+
+	td := &TokenData{
+		AccessToken:  sessionResp.AccessToken,
+		RefreshToken: sessionToken,
+	}
+
+	// 从响应中如果获得了新的 Session Token 则进行替换
+	if strings.HasPrefix(sessionResp.SessionToken, "eyJ") {
+		td.RefreshToken = sessionResp.SessionToken
+	}
+
+	// 尽量解析过期时间
+	expiresAt, err := time.Parse(time.RFC3339, sessionResp.Expires)
+	if err == nil {
+		td.ExpiresAt = expiresAt
+		td.ExpiresIn = int64(time.Until(expiresAt).Seconds())
+	} else {
+		td.ExpiresIn = 3600
+		td.ExpiresAt = time.Now().Add(1 * time.Hour)
+	}
+
+	// 从 access_token 中解析出账户邮箱等信息
+	info := parseIDToken(sessionResp.AccessToken)
+
+	return td, info, nil
 }
 
 // authClientPool 认证请求的连接池（按 proxyURL 分组）
@@ -222,8 +309,6 @@ func buildHTTPClient(proxyURL string) *http.Client {
 	}
 	return client
 }
-
-
 
 // BuildHTTPClient builds a proxy-aware HTTP client (exported for admin OAuth flow).
 func BuildHTTPClient(proxyURL string) *http.Client {
