@@ -21,6 +21,7 @@ export interface AccountRow {
   email: string
   plan_type: string
   status: AccountStatus
+  at_only?: boolean
   health_tier?: string
   scheduler_score?: number
   dynamic_concurrency_limit?: number
@@ -60,6 +61,12 @@ export interface AddAccountRequest {
   proxy_url: string
 }
 
+export interface AddATAccountRequest {
+  name?: string
+  access_token: string
+  proxy_url: string
+}
+
 export interface AccountModelStat {
   model: string
   requests: number
@@ -92,6 +99,12 @@ export interface HealthResponse {
   status: 'ok' | string
   available: number
   total: number
+}
+
+export interface AccountEventTrendPoint {
+  bucket: string
+  added: number
+  deleted: number
 }
 
 export interface OpsOverviewResponse {
@@ -164,6 +177,7 @@ export interface SystemSettings {
   admin_auth_source: 'env' | 'database' | 'disabled' | string
   auto_clean_full_usage: boolean
   auto_clean_error: boolean
+  auto_clean_expired: boolean
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   max_retries: number
@@ -172,6 +186,7 @@ export interface SystemSettings {
   database_label: string
   cache_driver: string
   cache_label: string
+  expired_cleaned?: number
 }
 
 export interface CPAExportEntry {
@@ -238,6 +253,7 @@ export interface ChartTimelinePoint {
   output_tokens: number
   reasoning_tokens: number
   cached_tokens: number
+  errors_401: number
 }
 
 export interface ChartModelPoint {

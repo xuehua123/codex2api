@@ -1,6 +1,8 @@
 import type {
+  AccountEventTrendPoint,
   AccountUsageDetail,
   AddAccountRequest,
+  AddATAccountRequest,
   AdminErrorResponse,
   APIKeysResponse,
   AccountsResponse,
@@ -106,6 +108,8 @@ export const api = {
   getAccounts: () => request<AccountsResponse>('/accounts'),
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
+  addATAccount: (data: AddATAccountRequest) =>
+    request<CreateAccountResponse>('/accounts/at', { method: 'POST', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   refreshAccount: (id: number) =>
@@ -144,6 +148,13 @@ export const api = {
     searchParams.set('end', params.end)
     searchParams.set('bucket_minutes', String(params.bucketMinutes))
     return request<ChartAggregation>(`/usage/chart-data?${searchParams.toString()}`)
+  },
+  getAccountEventTrend: (params: { start: string; end: string; bucketMinutes: number }) => {
+    const sp = new URLSearchParams()
+    sp.set('start', params.start)
+    sp.set('end', params.end)
+    sp.set('bucket_minutes', String(params.bucketMinutes))
+    return request<{ trend: AccountEventTrendPoint[] }>(`/accounts/event-trend?${sp.toString()}`)
   },
   getAPIKeys: () => request<APIKeysResponse>('/keys'),
   createAPIKey: (name: string, key?: string) =>

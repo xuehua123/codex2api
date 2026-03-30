@@ -105,6 +105,7 @@
     "modelRanking": "Model Ranking",
     "modelRankingDesc": "Top models by request volume in the selected range.",
     "seriesRequests": "Requests",
+    "series401Errors": "401 Errors",
     "seriesAvgLatency": "Avg Latency",
     "seriesInputTokens": "Input Tokens",
     "seriesOutputTokens": "Output Tokens",
@@ -293,6 +294,7 @@
     "refreshAccessToken": "Refresh Access Token",
     "addMethodTab": "Add Method",
     "addMethodRT": "Refresh Token",
+    "addMethodAT": "Access Token",
     "addMethodOAuth": "OAuth",
     "oauthStep1Title": "Step 1: Generate Authorization Link",
     "oauthStep1Desc": "Click the button below to generate a unique authorization link, then sign in with your OpenAI account.",
@@ -314,7 +316,13 @@
     "oauthNamePlaceholder": "Leave blank to use email as name",
     "oauthProxyUrl": "Proxy URL (optional)",
     "oauthProxyUrlPlaceholder": "e.g. http://127.0.0.1:7890",
-    "oauthRestart": "Restart Authorization"
+    "oauthRestart": "Restart Authorization",
+    "accessTokenLabel": "Access Token",
+    "accessTokenPlaceholder": "One access token per line. Bulk paste is supported.",
+    "importAtTxt": "AT TXT File",
+    "importAtTxtDesc": "One access token per line",
+    "atWarning": "AT-only accounts cannot auto-refresh. You will need to manually update the token after it expires.",
+    "atRefreshDisabled": "AT accounts cannot be refreshed"
   },
   "status": {
     "active": "Available",
@@ -363,7 +371,12 @@
     "justStarted": "Just started",
     "days": "d",
     "hours": "h",
-    "minutes": "m"
+    "minutes": "m",
+    "accountTrendTitle": "Account Add / Delete Trend",
+    "accountTrendDesc": "{{added}} added, {{deleted}} deleted in the selected range",
+    "accountTrendAdded": "Added",
+    "accountTrendDeleted": "Deleted",
+    "accountTrendEmpty": "No account events in the selected range"
   },
   "scheduler": {
     "title": "Scheduler Board",
@@ -477,6 +490,8 @@
     "autoCleanFullUsageDesc": "Checks every 5 minutes and removes accounts with ≥ 100% usage. Accounts with active requests are skipped.",
     "autoCleanError": "Auto clean error accounts",
     "autoCleanErrorDesc": "Checks every 30 seconds and removes accounts in error state (e.g. expired refresh tokens).",
+    "autoCleanExpired": "Auto clean expired accounts",
+    "autoCleanExpiredDesc": "Every 15 minutes, removes accounts older than 30 minutes regardless of usage. Runs immediately when toggled on.",
     "scheduler": "Scheduling",
     "fastSchedulerEnabled": "Fast Scheduler",
     "fastSchedulerEnabledDesc": "Uses an in-memory fast scheduling algorithm, significantly reducing dispatch latency under high concurrency. Recommended for large account pools (100+).",
@@ -491,6 +506,7 @@
     "models": "Model Configuration",
     "modelsDesc": "The following models are currently available:",
     "saveSuccess": "Settings saved",
+    "expiredCleanedResult": "Cleaned {{count}} expired accounts",
     "saveFailed": "Failed to save",
     "apiKeys": "API Keys",
     "keyNamePlaceholder": "Key name (optional)",

@@ -49,6 +49,7 @@ export default function Settings() {
     auto_clean_unauthorized: false,
     auto_clean_rate_limited: false,
     auto_clean_error: false,
+    auto_clean_expired: false,
     admin_secret: '',
     admin_auth_source: 'disabled',
     auto_clean_full_usage: false,
@@ -167,7 +168,11 @@ export default function Settings() {
         resetAdminAuthState()
         return
       }
-      showToast(t('settings.saveSuccess'))
+      if (updated.expired_cleaned && updated.expired_cleaned > 0) {
+        showToast(t('settings.expiredCleanedResult', { count: updated.expired_cleaned }))
+      } else {
+        showToast(t('settings.saveSuccess'))
+      }
     } catch (error) {
       showToast(`${t('settings.saveFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
@@ -448,6 +453,15 @@ export default function Settings() {
                   options={booleanOptions}
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanErrorDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.autoCleanExpired')}</label>
+                <Select
+                  value={settingsForm.auto_clean_expired ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_expired: value === 'true' }))}
+                  options={booleanOptions}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanExpiredDesc')}</p>
               </div>
             </div>
             <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.scheduler')}</h3>

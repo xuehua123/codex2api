@@ -59,6 +59,8 @@ type DB struct {
 	logMu   sync.Mutex
 	logStop chan struct{}
 	logWg   sync.WaitGroup
+	// 预分配日志缓冲以减少内存分配
+	logBufCap int
 }
 
 // usageLogEntry 日志缓冲条目
@@ -102,10 +104,10 @@ func New(driver string, dsn string) (*DB, error) {
 		conn.SetMaxIdleConns(1)
 	} else {
 		// 高并发场景：大量 RT 刷新 + 前端查询 + 使用日志写入 并行
-		conn.SetMaxOpenConns(50)                  // 最大打开连接数（默认无限制，限制避免 PG too many connections）
-		conn.SetMaxIdleConns(25)                  // 空闲连接数（保持足够的热连接避免频繁建连）
-		conn.SetConnMaxLifetime(30 * time.Minute) // 连接最大生存时间（避免长连接僵死）
-		conn.SetConnMaxIdleTime(10 * time.Minute) // 空闲连接最大闲置时间
+		conn.SetMaxOpenConns(100)                  // 增加最大打开连接数以处理更高并发
+		conn.SetMaxIdleConns(50)                   // 增加空闲连接数以保持热连接
+		conn.SetConnMaxLifetime(60 * time.Minute)  // 增加连接最大生存时间
+		conn.SetConnMaxIdleTime(30 * time.Minute)  // 增加空闲连接最大闲置时间
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -116,9 +118,10 @@ func New(driver string, dsn string) (*DB, error) {
 	}
 
 	db := &DB{
-		conn:    conn,
-		driver:  driver,
-		logStop: make(chan struct{}),
+		conn:      conn,
+		driver:    driver,
+		logStop:   make(chan struct{}),
+		logBufCap: 128,
 	}
 	if db.isSQLite() {
 		if err := db.configureSQLite(ctx); err != nil {
@@ -259,6 +262,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_expired BOOLEAN DEFAULT FALSE;
 
 	CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
@@ -270,6 +274,16 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_ip VARCHAR(100) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_location VARCHAR(255) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_latency_ms INT DEFAULT 0;
+
+	CREATE TABLE IF NOT EXISTS account_events (
+		id         SERIAL PRIMARY KEY,
+		account_id INT NOT NULL DEFAULT 0,
+		event_type VARCHAR(20) NOT NULL,
+		source     VARCHAR(30) DEFAULT '',
+		created_at TIMESTAMP DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);
+	CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);
 	`
 	_, err := db.conn.ExecContext(ctx, query)
 	return err
@@ -334,6 +348,7 @@ type SystemSettings struct {
 	AdminSecret           string
 	AutoCleanFullUsage    bool
 	AutoCleanError        bool
+	AutoCleanExpired      bool
 	ProxyPoolEnabled      bool
 	FastSchedulerEnabled  bool
 	MaxRetries            int
@@ -350,13 +365,14 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(fast_scheduler_enabled, false),
 		       COALESCE(max_retries, 2),
 		       COALESCE(allow_remote_migration, false),
-		       COALESCE(auto_clean_error, false)
+		       COALESCE(auto_clean_error, false),
+		       COALESCE(auto_clean_expired, false)
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
-		&s.AutoCleanError,
+		&s.AutoCleanError, &s.AutoCleanExpired,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -370,9 +386,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		INSERT INTO system_settings (
 			id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
-			fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error
+			fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired
 		)
-		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (id) DO UPDATE SET
 			max_concurrency         = EXCLUDED.max_concurrency,
 			global_rpm              = EXCLUDED.global_rpm,
@@ -389,10 +405,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			fast_scheduler_enabled  = EXCLUDED.fast_scheduler_enabled,
 			max_retries             = EXCLUDED.max_retries,
 			allow_remote_migration  = EXCLUDED.allow_remote_migration,
-			auto_clean_error        = EXCLUDED.auto_clean_error
+			auto_clean_error        = EXCLUDED.auto_clean_error,
+			auto_clean_expired      = EXCLUDED.auto_clean_expired
 	`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
-		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError)
+		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired)
 	return err
 }
 
@@ -666,7 +683,8 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
 
-	if bufLen >= 100 {
+	// 增加触发 flush 的阈值，减少 flush 频率
+	if bufLen >= 200 {
 		go db.flushLogs()
 	}
 	return nil
@@ -694,12 +712,12 @@ type UsageLogInput struct {
 	ServiceTier      string
 }
 
-// startLogFlusher 启动后台定时 flush 协程（每 3 秒一次）
+// startLogFlusher 启动后台定时 flush 协程（每 5 秒一次）
 func (db *DB) startLogFlusher() {
 	db.logWg.Add(1)
 	go func() {
 		defer db.logWg.Done()
-		ticker := time.NewTicker(3 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -720,12 +738,22 @@ func (db *DB) flushLogs() {
 		return
 	}
 	batch := db.logBuf
-	db.logBuf = make([]usageLogEntry, 0, 64)
+	db.logBuf = make([]usageLogEntry, 0, db.logBufCap)
 	db.logMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
 
+	// 使用批处理插入优化性能
+	if db.driver == "postgres" {
+		err := db.batchInsertLogs(ctx, batch)
+		if err != nil {
+			log.Printf("批量写入日志失败: %v", err)
+		}
+		return
+	}
+
+	// SQLite 使用事务插入
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		log.Printf("批量写入日志失败（开始事务）: %v", err)
@@ -760,6 +788,58 @@ func (db *DB) flushLogs() {
 	if len(batch) > 10 {
 		log.Printf("批量写入 %d 条使用日志", len(batch))
 	}
+}
+
+// batchInsertLogs 使用 PostgreSQL 的批量插入优化
+// 分批处理以避免 PostgreSQL 65535 参数限制（每行18个参数，每批最多3640行）
+func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	const maxRowsPerBatch = 3000 // 安全阈值，低于3640行的理论上限
+
+	// 分批处理
+	for start := 0; start < len(batch); start += maxRowsPerBatch {
+		end := start + maxRowsPerBatch
+		if end > len(batch) {
+			end = len(batch)
+		}
+		subBatch := batch[start:end]
+
+		if err := db.batchInsertLogsChunk(ctx, subBatch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// batchInsertLogsChunk 插入单批日志（内部辅助函数）
+func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	// 使用 COPY 或批量 VALUES 优化插入性能
+	valueStrings := make([]string, 0, len(batch))
+	valueArgs := make([]interface{}, 0, len(batch)*18)
+	argIdx := 1
+
+	for _, e := range batch {
+		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+7, argIdx+8, argIdx+9,
+			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17))
+		valueArgs = append(valueArgs, e.AccountID, e.Endpoint, e.Model, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
+			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier)
+		argIdx += 18
+	}
+
+	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, endpoint, model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
+		input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier)
+		VALUES %s`, strings.Join(valueStrings, ","))
+
+	_, err := db.conn.ExecContext(ctx, query, valueArgs...)
+	return err
 }
 
 // UsageStats 使用统计
@@ -941,6 +1021,7 @@ type ChartTimelinePoint struct {
 	OutputTokens    int64   `json:"output_tokens"`
 	ReasoningTokens int64   `json:"reasoning_tokens"`
 	CachedTokens    int64   `json:"cached_tokens"`
+	Errors401       int64   `json:"errors_401"`
 }
 
 // ChartModelPoint 模型排行聚合点
@@ -953,6 +1034,13 @@ type ChartModelPoint struct {
 type ChartAggregation struct {
 	Timeline []ChartTimelinePoint `json:"timeline"`
 	Models   []ChartModelPoint    `json:"models"`
+}
+
+// AccountEventPoint 账号事件趋势数据点
+type AccountEventPoint struct {
+	Bucket  string `json:"bucket"`
+	Added   int    `json:"added"`
+	Deleted int    `json:"deleted"`
 }
 
 // AccountModelStat 单个模型的使用统计
@@ -997,7 +1085,8 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 		COALESCE(SUM(input_tokens), 0)        AS input_tokens,
 		COALESCE(SUM(output_tokens), 0)       AS output_tokens,
 		COALESCE(SUM(reasoning_tokens), 0)    AS reasoning_tokens,
-		COALESCE(SUM(cached_tokens), 0)       AS cached_tokens
+		COALESCE(SUM(cached_tokens), 0)       AS cached_tokens,
+		COALESCE(SUM(CASE WHEN status_code = 401 THEN 1 ELSE 0 END), 0) AS errors_401
 	FROM usage_logs
 	WHERE created_at >= $1 AND created_at <= $2
 	  AND status_code <> 499
@@ -1012,7 +1101,7 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 
 	for rows.Next() {
 		var p ChartTimelinePoint
-		if err := rows.Scan(&p.Bucket, &p.Requests, &p.AvgLatency, &p.InputTokens, &p.OutputTokens, &p.ReasoningTokens, &p.CachedTokens); err != nil {
+		if err := rows.Scan(&p.Bucket, &p.Requests, &p.AvgLatency, &p.InputTokens, &p.OutputTokens, &p.ReasoningTokens, &p.CachedTokens, &p.Errors401); err != nil {
 			return nil, err
 		}
 		result.Timeline = append(result.Timeline, p)
@@ -1450,6 +1539,71 @@ func (db *DB) SetError(ctx context.Context, id int64, errorMsg string) error {
 	return err
 }
 
+// BatchSetError 批量标记账号错误状态，分批执行避免 SQL 参数过多
+func (db *DB) BatchSetError(ctx context.Context, ids []int64, errorMsg string) error {
+	const batchSize = 500
+	for i := 0; i < len(ids); i += batchSize {
+		end := i + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[i:end]
+
+		// 构建 $2, $3, ... 占位符（$1 留给 errorMsg）
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, 0, len(batch)+1)
+		args = append(args, errorMsg)
+		for j, id := range batch {
+			placeholders[j] = fmt.Sprintf("$%d", j+2)
+			args = append(args, id)
+		}
+
+		query := fmt.Sprintf(
+			`UPDATE accounts SET status = 'error', error_message = $1, cooldown_reason = '', cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		if _, err := db.conn.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("batch %d-%d failed: %w", i, end, err)
+		}
+	}
+	return nil
+}
+
+// BatchInsertAccountEventsAsync 批量异步插入账号事件
+func (db *DB) BatchInsertAccountEventsAsync(ids []int64, eventType string, source string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		const batchSize = 500
+		for i := 0; i < len(ids); i += batchSize {
+			end := i + batchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			batch := ids[i:end]
+
+			// 构建 VALUES ($1,$2,$3), ($4,$2,$3), ...
+			placeholders := make([]string, len(batch))
+			args := make([]interface{}, 0, len(batch)+2)
+			args = append(args, eventType, source) // $1=eventType, $2=source
+			for j, id := range batch {
+				paramIdx := j + 3 // $3, $4, ...
+				placeholders[j] = fmt.Sprintf("($%d, $1, $2)", paramIdx)
+				args = append(args, id)
+			}
+
+			query := fmt.Sprintf(
+				`INSERT INTO account_events (account_id, event_type, source) VALUES %s`,
+				strings.Join(placeholders, ","),
+			)
+			if _, err := db.conn.ExecContext(ctx, query, args...); err != nil {
+				log.Printf("[账号事件] 批量插入失败 (%d 条): %v", len(batch), err)
+			}
+		}
+	}()
+}
+
 // ClearError 清除账号错误状态
 func (db *DB) ClearError(ctx context.Context, id int64) error {
 	query := `UPDATE accounts SET status = 'active', error_message = '', cooldown_reason = '', cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`
@@ -1513,6 +1667,111 @@ func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) 
 		if rt != "" {
 			result[rt] = true
 		}
+	}
+	return result, rows.Err()
+}
+
+// InsertATAccount 插入 AT-only 账号（无 refresh_token）
+func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken string, proxyURL string) (int64, error) {
+	credentials := map[string]interface{}{
+		"access_token": accessToken,
+	}
+	credJSON, err := json.Marshal(credentials)
+	if err != nil {
+		return 0, err
+	}
+
+	return db.insertRowID(ctx,
+		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3) RETURNING id`,
+		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3)`,
+		name, credJSON, proxyURL,
+	)
+}
+
+// GetAllAccessTokens 获取所有已存在的 access_token（用于 AT 导入去重）
+func (db *DB) GetAllAccessTokens(ctx context.Context) (map[string]bool, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]bool)
+	for rows.Next() {
+		var raw interface{}
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		at := credentialString(raw, "access_token")
+		if at != "" {
+			result[at] = true
+		}
+	}
+	return result, rows.Err()
+}
+
+// ==================== 账号事件 ====================
+
+// InsertAccountEvent 插入一条账号事件记录
+func (db *DB) InsertAccountEvent(ctx context.Context, accountID int64, eventType string, source string) error {
+	_, err := db.conn.ExecContext(ctx,
+		`INSERT INTO account_events (account_id, event_type, source) VALUES ($1, $2, $3)`,
+		accountID, eventType, source,
+	)
+	return err
+}
+
+// InsertAccountEventAsync 异步插入账号事件（不阻塞调用方）
+func (db *DB) InsertAccountEventAsync(accountID int64, eventType string, source string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := db.InsertAccountEvent(ctx, accountID, eventType, source); err != nil {
+			log.Printf("[账号事件] 记录失败: account=%d type=%s source=%s err=%v", accountID, eventType, source, err)
+		}
+	}()
+}
+
+// GetAccountEventTrend 按时间桶聚合账号增删事件
+func (db *DB) GetAccountEventTrend(ctx context.Context, start, end time.Time, bucketMinutes int) ([]AccountEventPoint, error) {
+	if db.isSQLite() {
+		return db.getAccountEventTrendSQLite(ctx, start, end, bucketMinutes)
+	}
+
+	if bucketMinutes < 1 {
+		bucketMinutes = 60
+	}
+
+	query := `
+	SELECT
+		TO_CHAR(
+			date_trunc('minute', created_at)
+			- (EXTRACT(MINUTE FROM created_at)::int % $3) * INTERVAL '1 minute',
+			'YYYY-MM-DD"T"HH24:MI:SS'
+		) AS bucket,
+		COALESCE(SUM(CASE WHEN event_type = 'added' THEN 1 ELSE 0 END), 0) AS added,
+		COALESCE(SUM(CASE WHEN event_type = 'deleted' THEN 1 ELSE 0 END), 0) AS deleted
+	FROM account_events
+	WHERE created_at >= $1 AND created_at <= $2
+	GROUP BY 1
+	ORDER BY 1`
+
+	rows, err := db.conn.QueryContext(ctx, query, start, end, bucketMinutes)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []AccountEventPoint
+	for rows.Next() {
+		var p AccountEventPoint
+		if err := rows.Scan(&p.Bucket, &p.Added, &p.Deleted); err != nil {
+			return nil, err
+		}
+		result = append(result, p)
+	}
+	if result == nil {
+		result = []AccountEventPoint{}
 	}
 	return result, rows.Err()
 }

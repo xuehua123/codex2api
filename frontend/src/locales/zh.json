@@ -105,6 +105,7 @@
     "modelRanking": "模型调用排行",
     "modelRankingDesc": "按请求量展示选定范围内最常用的模型。",
     "seriesRequests": "请求数",
+    "series401Errors": "401 错误",
     "seriesAvgLatency": "平均耗时",
     "seriesInputTokens": "输入 Token",
     "seriesOutputTokens": "输出 Token",
@@ -293,6 +294,7 @@
     "refreshAccessToken": "刷新 AT",
     "addMethodTab": "添加方式",
     "addMethodRT": "Refresh Token",
+    "addMethodAT": "Access Token",
     "addMethodOAuth": "OAuth 授权",
     "oauthStep1Title": "第一步：生成授权链接",
     "oauthStep1Desc": "点击下方按钮生成专属授权链接，在浏览器中完成 OpenAI 账号登录。",
@@ -314,7 +316,13 @@
     "oauthNamePlaceholder": "留空则使用邮箱作为名称",
     "oauthProxyUrl": "代理地址（可选）",
     "oauthProxyUrlPlaceholder": "例如 http://127.0.0.1:7890",
-    "oauthRestart": "重新发起授权"
+    "oauthRestart": "重新发起授权",
+    "accessTokenLabel": "Access Token",
+    "accessTokenPlaceholder": "每行一个 Access Token，支持批量粘贴",
+    "importAtTxt": "AT TXT 文件",
+    "importAtTxtDesc": "每行一个 Access Token",
+    "atWarning": "AT 模式账号无法自动刷新，过期后需手动更新",
+    "atRefreshDisabled": "AT 账号无法刷新"
   },
   "status": {
     "active": "可用",
@@ -363,7 +371,12 @@
     "justStarted": "刚刚启动",
     "days": "天",
     "hours": "小时",
-    "minutes": "分钟"
+    "minutes": "分钟",
+    "accountTrendTitle": "账号增删趋势",
+    "accountTrendDesc": "选定范围内新增 {{added}} 个，删除 {{deleted}} 个账号",
+    "accountTrendAdded": "新增账号",
+    "accountTrendDeleted": "删除账号",
+    "accountTrendEmpty": "选定范围内暂无账号增删记录"
   },
   "scheduler": {
     "title": "调度面板",
@@ -482,6 +495,8 @@
     "autoCleanFullUsageDesc": "开启后，后台每 5 分钟巡检一次，用量 ≥ 100% 的账号会自动清理。正在处理请求的账号不会被清理。",
     "autoCleanError": "自动清理错误账号",
     "autoCleanErrorDesc": "开启后，每 30 秒巡检一次，自动移除 error 状态的账号（如 refresh token 失效）。",
+    "autoCleanExpired": "自动清理过期账号",
+    "autoCleanExpiredDesc": "开启后，每 15 分钟清理加入超过 30 分钟的账号，不管是否被调用过。开启时立即执行一次。",
     "scheduler": "调度优化",
     "fastSchedulerEnabled": "快速调度器",
     "fastSchedulerEnabledDesc": "启用后，账号选择将使用内存快速调度算法，大幅降低高并发场景下的调度延迟。适合大号池（100+ 账号）场景。",
@@ -496,6 +511,7 @@
     "models": "模型配置",
     "modelsDesc": "以下模型当前可用：",
     "saveSuccess": "设置已保存，实时生效",
+    "expiredCleanedResult": "已清理 {{count}} 个过期账号",
     "saveFailed": "保存失败",
     "apiKeys": "API 密钥",
     "keyNamePlaceholder": "密钥名称（可选）",

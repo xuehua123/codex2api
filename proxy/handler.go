@@ -9,10 +9,14 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
+	"github.com/codex2api/config"
 	"github.com/codex2api/database"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -24,6 +28,8 @@ type Handler struct {
 	store      *auth.Store
 	configKeys map[string]bool // 配置文件中的静态 key
 	db         *database.DB
+	cfg        *config.Config       // 全局配置
+	deviceCfg  *DeviceProfileConfig // 设备指纹配置
 
 	// 动态 key 缓存
 	dbKeysMu    sync.RWMutex
@@ -31,13 +37,27 @@ type Handler struct {
 	dbKeysUntil time.Time
 }
 
+type usageLimitDetails struct {
+	message         string
+	planType        string
+	resetsAt        int64
+	resetsInSeconds int64
+}
+
 // NewHandler 创建处理器
-func NewHandler(store *auth.Store, db *database.DB) *Handler {
+func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCfg *DeviceProfileConfig) *Handler {
 	return &Handler{
 		store:      store,
 		configKeys: make(map[string]bool), // 不再使用硬编码，但保留结构以向后兼容逻辑
 		db:         db,
+		cfg:        cfg,
+		deviceCfg:  deviceCfg,
 	}
+}
+
+// NewHandlerWithDeviceProfile 创建处理器（带设备指纹配置）
+func NewHandlerWithDeviceProfile(store *auth.Store, db *database.DB, deviceCfg *DeviceProfileConfig) *Handler {
+	return NewHandler(store, db, nil, deviceCfg)
 }
 
 // refreshDBKeys 从数据库刷新密钥缓存（5 分钟）
@@ -221,7 +241,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.GET("/models", h.ListModels)
 }
 
-// authMiddleware API Key 鉴权中间件
+// authMiddleware API Key 鉴权中间件（增强版，带安全日志）
 func (h *Handler) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 如果没有配置任何密钥，跳过鉴权
@@ -232,26 +252,22 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": gin.H{
-					"message": "缺少 Authorization 头",
-					"type":    "authentication_error",
-					"code":    "missing_api_key",
-				},
-			})
+			// Use standardized error format from api package
+			api.SendError(c, api.ErrMissingAPIKey)
 			c.Abort()
 			return
 		}
 
+		// 清理输入
+		authHeader = security.SanitizeInput(authHeader)
+
 		key := strings.TrimPrefix(authHeader, "Bearer ")
 		if !h.isValidKey(key) {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": gin.H{
-					"message": "无效的 API Key",
-					"type":    "authentication_error",
-					"code":    "invalid_api_key",
-				},
-			})
+			// 记录安全审计日志（脱敏）
+			maskedKey := security.MaskAPIKey(key)
+			security.SecurityAuditLog("AUTH_FAILED", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
+			// Use standardized error format from api package
+			api.SendError(c, api.ErrInvalidAPIKey)
 			c.Abort()
 			return
 		}
@@ -276,22 +292,60 @@ func isRetryableStatus(code int) bool {
 	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
 }
 
-// Responses 处理 /v1/responses 请求（原生透传，无需协议翻译）
+func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
+	if len(body) == 0 {
+		return usageLimitDetails{}, false
+	}
+	if gjson.GetBytes(body, "error.type").String() != "usage_limit_reached" {
+		return usageLimitDetails{}, false
+	}
+	return usageLimitDetails{
+		message:         gjson.GetBytes(body, "error.message").String(),
+		planType:        gjson.GetBytes(body, "error.plan_type").String(),
+		resetsAt:        gjson.GetBytes(body, "error.resets_at").Int(),
+		resetsInSeconds: gjson.GetBytes(body, "error.resets_in_seconds").Int(),
+	}, true
+}
+
+// Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
 func (h *Handler) Responses(c *gin.Context) {
 	// 1. 读取请求体
 	rawBody, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{"message": "读取请求体失败", "type": "invalid_request_error"},
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
+		return
+	}
+
+	// Validate request
+	validator := api.NewValidator(rawBody)
+	rules := api.ResponsesAPIValidationRules()
+	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	result := validator.ValidateRequest(rules)
+	if !result.Valid {
+		api.SendError(c, validator.ToAPIError())
+		return
+	}
+
+	// 检查请求体大小
+	if len(rawBody) > security.MaxRequestBodySize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error": gin.H{"message": "请求体过大", "type": "invalid_request_error"},
 		})
 		return
 	}
 
 	model := gjson.GetBytes(rawBody, "model").String()
-	if model == "" {
+
+	// 验证 model 参数
+	if err := security.ValidateModelName(model); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{"message": "model is required", "type": "invalid_request_error"},
+			"error": gin.H{"message": "model 参数无效", "type": "invalid_request_error"},
 		})
+		return
+	}
+
+	if model == "" {
+		api.SendMissingFieldError(c, "model")
 		return
 	}
 
@@ -355,13 +409,18 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastErr error
 	var lastStatusCode int
 	var lastBody []byte
+	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account := h.store.Next()
+		account := h.store.NextExcluding(excludeAccounts)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
 			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
 			if account == nil {
+				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
 				c.JSON(http.StatusServiceUnavailable, gin.H{
 					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
 				})
@@ -374,7 +433,24 @@ func (h *Handler) Responses(c *gin.Context) {
 		account.Mu().RLock()
 		effectiveProxyURL := resolveProxyURL(account.ProxyURL, proxyURL)
 		account.Mu().RUnlock()
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL)
+		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
+
+		// 提取 API Key 用于设备指纹稳定化
+		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+		apiKey = strings.TrimSpace(apiKey)
+
+		// 使用注入的设备指纹配置
+		deviceCfg := h.deviceCfg
+		if deviceCfg == nil {
+			deviceCfg = &DeviceProfileConfig{
+				StabilizeDeviceProfile: false, // 默认关闭
+			}
+		}
+
+		// 透传下游请求头用于指纹学习
+		downstreamHeaders := c.Request.Header.Clone()
+
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -382,6 +458,14 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
+
+			// 不可重试的结构化错误直接返回
+			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+				ErrorToGinResponse(c, reqErr)
+				return
+			}
+
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			lastErr = reqErr
 			continue
@@ -397,6 +481,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
@@ -420,7 +505,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				continue
 			}
 
-			h.sendUpstreamError(c, resp.StatusCode, errBody)
+			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
 
@@ -625,7 +710,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
 		})
 	} else if lastStatusCode != 0 {
-		h.sendUpstreamError(c, lastStatusCode, lastBody)
+		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 	}
 }
 
@@ -633,8 +718,24 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 1. 读取请求体
 	rawBody, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{"message": "读取请求体失败", "type": "invalid_request_error"},
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
+		return
+	}
+
+	// Validate request
+	validator := api.NewValidator(rawBody)
+	rules := api.ChatCompletionValidationRules()
+	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	result := validator.ValidateRequest(rules)
+	if !result.Valid {
+		api.SendError(c, validator.ToAPIError())
+		return
+	}
+
+	// 检查请求体大小
+	if len(rawBody) > security.MaxRequestBodySize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error": gin.H{"message": "请求体过大", "type": "invalid_request_error"},
 		})
 		return
 	}
@@ -643,6 +744,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if model == "" {
 		model = "gpt-5.4"
 	}
+
+	// 验证 model 参数
+	if err := security.ValidateModelName(model); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"message": "model 参数无效", "type": "invalid_request_error"},
+		})
+		return
+	}
+
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
@@ -653,9 +763,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 2. 翻译请求：OpenAI Chat → Codex Responses
 	codexBody, err := TranslateRequest(rawBody)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{"message": "请求翻译失败: " + err.Error(), "type": "invalid_request_error"},
-		})
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request translation failed: "+err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
 
@@ -666,13 +774,18 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastErr error
 	var lastStatusCode int
 	var lastBody []byte
+	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account := h.store.Next()
+		account := h.store.NextExcluding(excludeAccounts)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
 			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
 			if account == nil {
+				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
 				c.JSON(http.StatusServiceUnavailable, gin.H{
 					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
 				})
@@ -685,7 +798,24 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		account.Mu().RLock()
 		effectiveProxyURL := resolveProxyURL(account.ProxyURL, proxyURL)
 		account.Mu().RUnlock()
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL)
+		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
+
+		// 提取 API Key 用于设备指纹稳定化
+		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+		apiKey = strings.TrimSpace(apiKey)
+
+		// 使用注入的设备指纹配置
+		deviceCfg := h.deviceCfg
+		if deviceCfg == nil {
+			deviceCfg = &DeviceProfileConfig{
+				StabilizeDeviceProfile: false, // 默认关闭
+			}
+		}
+
+		// 透传下游请求头用于指纹学习
+		downstreamHeaders := c.Request.Header.Clone()
+
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -693,6 +823,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
+
+			// 不可重试的结构化错误直接返回
+			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+				ErrorToGinResponse(c, reqErr)
+				return
+			}
+
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			lastErr = reqErr
 			continue
@@ -708,6 +846,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
@@ -731,7 +870,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				continue
 			}
 
-			h.sendUpstreamError(c, resp.StatusCode, errBody)
+			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
 
@@ -976,7 +1115,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
 		})
 	} else if lastStatusCode != 0 {
-		h.sendUpstreamError(c, lastStatusCode, lastBody)
+		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 	}
 }
 
@@ -1090,7 +1229,22 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 		log.Printf("账号 %d 被限速 (plan=%s)，冷却 %v", account.ID(), account.GetPlanType(), cooldown)
 		h.store.MarkCooldown(account, cooldown, "rate_limited")
 	case http.StatusUnauthorized:
-		h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
+		// 原子标志瞬间置位，阻止其他并发请求再选到该账号
+		atomic.StoreInt32(&account.Disabled, 1)
+
+		if h.store.GetAutoCleanUnauthorized() {
+			// 开启自动清理时，401 立即从号池删除
+			log.Printf("账号 %d 收到 401，立即清理", account.ID())
+			if h.db != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_ = h.db.SetError(ctx, account.ID(), "deleted")
+				cancel()
+				h.db.InsertAccountEventAsync(account.ID(), "deleted", "auto_clean_401")
+			}
+			h.store.RemoveAccount(account.ID())
+		} else {
+			h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
+		}
 	}
 }
 
@@ -1271,6 +1425,41 @@ func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte)
 	})
 }
 
+// sendFinalUpstreamError 重试用尽后的最终错误响应：识别 usage_limit_reached 改写为 503，其余透传
+func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []byte) {
+	if statusCode == http.StatusTooManyRequests {
+		if details, ok := parseUsageLimitDetails(body); ok {
+			if details.resetsInSeconds > 0 {
+				c.Header("Retry-After", fmt.Sprintf("%d", details.resetsInSeconds))
+			}
+
+			message := "账号池额度已耗尽，请稍后重试"
+			if details.message != "" {
+				message = fmt.Sprintf("%s：%s", message, details.message)
+			}
+
+			errInfo := gin.H{
+				"message": message,
+				"type":    "server_error",
+				"code":    "account_pool_usage_limit_reached",
+			}
+			if details.planType != "" {
+				errInfo["plan_type"] = details.planType
+			}
+			if details.resetsAt != 0 {
+				errInfo["resets_at"] = details.resetsAt
+			}
+			if details.resetsInSeconds != 0 {
+				errInfo["resets_in_seconds"] = details.resetsInSeconds
+			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errInfo})
+			return
+		}
+	}
+
+	h.sendUpstreamError(c, statusCode, body)
+}
+
 // handleUpstreamError 统一处理上游错误（兼容旧调用）
 func (h *Handler) handleUpstreamError(c *gin.Context, account *auth.Account, statusCode int, body []byte) {
 	h.applyCooldown(account, statusCode, body, nil)
@@ -1286,12 +1475,15 @@ var SupportedModels = []string{
 
 // ListModels 列出可用模型
 func (h *Handler) ListModels(c *gin.Context) {
-	models := make([]gin.H, 0, len(SupportedModels))
+	models := make([]api.Model, 0, len(SupportedModels))
+	now := time.Now().Unix()
 	for _, id := range SupportedModels {
-		models = append(models, gin.H{"id": id, "object": "model", "owned_by": "openai"})
+		models = append(models, api.Model{
+			ID:      id,
+			Object:  "model",
+			Created: now,
+			OwnedBy: "openai",
+		})
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   models,
-	})
+	api.SendList(c, "list", models)
 }

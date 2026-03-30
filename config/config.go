@@ -71,6 +71,7 @@ type Config struct {
 	TrustedProxies []string
 	Database       DatabaseConfig
 	Cache          CacheConfig
+	UseWebsocket   bool // 是否启用 WebSocket 传输
 }
 
 // Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
@@ -99,6 +100,11 @@ func Load(envPath string) (*Config, error) {
 				cfg.TrustedProxies = append(cfg.TrustedProxies, proxy)
 			}
 		}
+	}
+
+	// WebSocket 配置
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("USE_WEBSOCKET"))); v == "true" || v == "1" {
+		cfg.UseWebsocket = true
 	}
 
 	// 数据库配置

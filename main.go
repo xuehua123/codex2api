@@ -14,11 +14,14 @@ import (
 	"time"
 
 	"github.com/codex2api/admin"
+	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
+	"github.com/codex2api/proxy/wsrelay"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
 
@@ -138,11 +141,24 @@ func main() {
 	if err := configureTrustedProxies(r, cfg.TrustedProxies); err != nil {
 		log.Fatalf("可信反向代理配置失败: %v", err)
 	}
-	r.Use(gin.Recovery())
+	r.Use(api.RecoveryMiddleware())
+	r.Use(api.RequestContextMiddleware())
+	r.Use(api.VersionMiddleware())
+	r.Use(api.BodyCacheMiddleware())
+	r.Use(api.CORSMiddleware())
 	r.Use(loggerMiddleware())
+	r.Use(security.SecurityHeadersMiddleware())
+	r.Use(security.RequestSizeLimiter(security.MaxRequestBodySize))
 
 	// handler 不再接收 cfg.APIKeys
-	handler := proxy.NewHandler(store, db)
+	// 从环境变量读取设备指纹配置（后续可从数据库配置）
+	deviceCfg := &proxy.DeviceProfileConfig{
+		StabilizeDeviceProfile: os.Getenv("STABILIZE_DEVICE_PROFILE") == "true",
+	}
+	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
+
+	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
+	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
 
 	r.Use(rateLimiter.Middleware())
 	if settings.GlobalRPM > 0 {
@@ -222,11 +238,12 @@ func main() {
 
 	log.Println("正在关闭...")
 	store.Stop()
+	wsrelay.ShutdownExecutor()
 	proxy.CloseErrorLogger()
 	log.Println("已关闭")
 }
 
-// loggerMiddleware 简单日志中间件
+// loggerMiddleware 简单日志中间件（增强版，支持敏感信息脱敏）
 func loggerMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -241,20 +258,21 @@ func loggerMiddleware() gin.HandlerFunc {
 
 		emailStr := ""
 		if e, ok := email.(string); ok && e != "" {
-			emailStr = e
+			// 脱敏邮箱
+			emailStr = security.MaskEmail(e)
 		}
 		proxyStr := "no proxy"
 		if p, ok := proxyURL.(string); ok && p != "" {
-			proxyStr = p
+			proxyStr = security.SanitizeLog(p)
 		}
 
 		// 构建扩展标签
 		var tags []string
 		if m, ok := modelVal.(string); ok && m != "" {
-			tags = append(tags, m)
+			tags = append(tags, security.SanitizeLog(m))
 		}
 		if e, ok := effortVal.(string); ok && e != "" {
-			tags = append(tags, "effort="+e)
+			tags = append(tags, "effort="+security.SanitizeLog(e))
 		}
 		if t, ok := tierVal.(string); ok && t == "fast" {
 			tags = append(tags, "fast")

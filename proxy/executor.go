@@ -37,12 +37,15 @@ func (e *poolEntry) touch() {
 var clientPool sync.Map // map[string]*poolEntry, key = accountID|proxyURL
 
 // clientPoolTTL 未使用超过此时间的 Client 将被淘汰
-const clientPoolTTL = 2 * time.Minute
+const clientPoolTTL = 5 * time.Minute
+
+// clientPoolCleanupInterval 清理协程执行间隔
+const clientPoolCleanupInterval = 60 * time.Second
 
 func init() {
-	// 后台清理：每 30 秒扫描一次，淘汰过期的 Client
+	// 后台清理：每 60 秒扫描一次，淘汰过期的 Client
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(clientPoolCleanupInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			evictExpiredClients()
@@ -111,7 +114,7 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 		return entry.client
 	}
 
-	transport := NewRustlsTransport(proxyURL)
+	transport := NewUTLSTransport(proxyURL)
 
 	entry := &poolEntry{
 		client: &http.Client{
@@ -135,9 +138,19 @@ const (
 	Originator   = "codex_cli_rs"
 )
 
+// WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
+var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string) (*http.Response, error)
+
 // ExecuteRequest 向 Codex 上游发送请求
 // sessionID 可选，用于 prompt cache 会话绑定
-func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string) (*http.Response, error) {
+// useWebsocket 可选，如果为 true 则使用 WebSocket 连接
+// headers 下游请求头，用于设备指纹学习
+func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
+	// 检查是否使用 WebSocket
+	if len(useWebsocket) > 0 && useWebsocket[0] && WebsocketExecuteFunc != nil {
+		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride)
+	}
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -151,7 +164,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	proxyURL = resolveProxyURL(proxyURL, proxyOverride)
 
 	if accessToken == "" {
-		return nil, fmt.Errorf("无可用 access_token")
+		return nil, ErrNoAvailableAccount()
 	}
 
 	// ==================== Codex 请求体优化 ====================
@@ -180,18 +193,28 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
-		return nil, fmt.Errorf("创建请求失败: %w", err)
+		return nil, ErrInternalError("创建请求失败", err)
 	}
 
 	// ==================== 请求头（伪装 Codex CLI） ====================
-	// 每个账号使用确定性的 ClientProfile（UA + Version），模拟真实用户多样性
-	profile := ProfileForAccount(account.ID())
+	// 应用设备指纹稳定化
+	if IsDeviceProfileStabilizationEnabled(deviceCfg) {
+		profile := ResolveDeviceProfile(account, apiKey, headers, deviceCfg)
+		ApplyDeviceProfileHeaders(req, profile)
+		// 稳定化时也需要设置 Version 头，保持行为一致
+		if profile.HasVersion {
+			req.Header.Set("Version", fmt.Sprintf("%d.%d.%d", profile.Version.major, profile.Version.minor, profile.Version.patch))
+		}
+	} else {
+		// 每个账号使用确定性的 ClientProfile（UA + Version），模拟真实用户多样性
+		profile := ProfileForAccount(account.ID())
+		req.Header.Set("User-Agent", profile.UserAgent)
+		req.Header.Set("Version", profile.Version)
+	}
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("User-Agent", profile.UserAgent)
-	req.Header.Set("Version", profile.Version)
 	req.Header.Set("Originator", Originator)
 	req.Header.Set("Connection", "Keep-Alive")
 	if accountID != "" {
@@ -214,7 +237,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		if shouldRecyclePooledClient(err) {
 			recyclePooledClient(account, proxyURL)
 		}
-		return nil, fmt.Errorf("请求上游失败: %w", err)
+		return nil, ErrUpstream(0, "请求上游失败", err)
 	}
 
 	return resp, nil
@@ -248,7 +271,10 @@ func ResolveSessionID(authHeader string, body []byte) string {
 // ReadSSEStream 从上游 SSE 响应读取事件流
 // callback 返回 true 表示继续读取，false 表示停止
 func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
-	buf := make([]byte, 4096)
+	// 使用 sync.Pool 复用缓冲区，减少 GC 压力
+	buf := sseBufferPool.Get().([]byte)
+	defer sseBufferPool.Put(buf)
+
 	var lineBuf []byte
 	var dataLines [][]byte
 
@@ -295,7 +321,10 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 				if bytes.HasPrefix(line, []byte("data:")) {
 					data := bytes.TrimPrefix(line, []byte("data:"))
 					data = bytes.TrimPrefix(data, []byte(" "))
-					dataLines = append(dataLines, append([]byte(nil), data...))
+					// 使用 copy 避免底层数组共享导致的内存泄漏
+					dataCopy := make([]byte, len(data))
+					copy(dataCopy, data)
+					dataLines = append(dataLines, dataCopy)
 				}
 			}
 		}
@@ -307,7 +336,9 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 					if bytes.HasPrefix(line, []byte("data:")) {
 						data := bytes.TrimPrefix(line, []byte("data:"))
 						data = bytes.TrimPrefix(data, []byte(" "))
-						dataLines = append(dataLines, append([]byte(nil), data...))
+						dataCopy := make([]byte, len(data))
+						copy(dataCopy, data)
+						dataLines = append(dataLines, dataCopy)
 					}
 				}
 				if !emitEvent() {
@@ -318,4 +349,11 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 			return err
 		}
 	}
+}
+
+// sseBufferPool 用于复用 SSE 读取缓冲区
+var sseBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 8192) // 增加到 8KB 提高读取效率
+	},
 }
