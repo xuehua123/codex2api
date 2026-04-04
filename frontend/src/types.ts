@@ -52,6 +52,7 @@ export interface AccountRow {
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
   cooldown_until?: ISODateString
+  locked?: boolean
 }
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
@@ -189,6 +190,7 @@ export interface SystemSettings {
   cache_driver: string
   cache_label: string
   expired_cleaned?: number
+  model_mapping: string
 }
 
 export interface CPAExportEntry {
@@ -236,6 +238,9 @@ export interface UsageLog {
   stream: boolean
   cached_tokens: number
   service_tier: string
+  api_key_id: number
+  api_key_name: string
+  api_key_masked: string
   account_email: string
   created_at: ISODateString
 }
@@ -272,6 +277,7 @@ export interface APIKeyRow {
   id: number
   name: string
   key: string
+  raw_key: string
   created_at: ISODateString
 }
 

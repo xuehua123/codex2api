@@ -150,10 +150,12 @@
     "importTxt": "TXT 文件",
     "importTxtDesc": "支持纯 RT 或 CPA 原版格式，自动提取 RT",
     "importJson": "JSON 文件",
-    "importJsonDesc": "兼容 CLIProxyAPI 凭证 JSON",
+    "importJsonDesc": "兼容 CLIProxyAPI / Sub2Api JSON",
     "export": "导出",
     "exporting": "导出中…",
     "exportTitle": "选择导出方式",
+    "exportScopeHealthy": "所有健康账号",
+    "exportScopeSelected": "已选账号（{{count}} 个）",
     "exportHealthyJson": "CPA JSON（健康）",
     "exportHealthyJsonDesc": "导出所有健康账号",
     "exportHealthyTxt": "TXT（健康）",
@@ -187,7 +189,7 @@
     "email": "邮箱",
     "plan": "计划",
     "status": "状态",
-    "requests": "请求统计",
+    "requests": "请求(7d)",
     "usage": "用量",
     "updatedAt": "更新时间",
     "importTime": "导入时间",
@@ -321,15 +323,31 @@
     "accessTokenPlaceholder": "每行一个 Access Token，支持批量粘贴",
     "importAtTxt": "AT TXT 文件",
     "importAtTxtDesc": "每行一个 Access Token",
+    "importFolder": "选择文件夹",
+    "importFolderDesc": "递归扫描文件夹中的 .txt 和 .json",
+    "folderNoValidFiles": "文件夹中未找到有效的 .txt 或 .json 文件",
+    "dropToImport": "拖放文件到此处导入",
+    "dropHint": "支持 .txt、.json 文件和文件夹",
+    "unsupportedFileType": "不支持的文件类型：{{name}}，仅支持 .txt 和 .json",
     "atWarning": "AT 模式账号无法自动刷新，过期后需手动更新",
-    "atRefreshDisabled": "AT 账号无法刷新"
+    "atRefreshDisabled": "AT 账号无法刷新",
+    "lock": "锁定",
+    "unlock": "解锁",
+    "lockSuccess": "已锁定",
+    "unlockSuccess": "已解锁",
+    "lockFailed": "操作失败：{{error}}",
+    "lockHint": "锁定后，自动清理将跳过此账号",
+    "unlockHint": "解锁后，账号将正常参与自动清理",
+    "filterLocked": "已锁定",
+    "batchLockDone": "批量锁定完成：成功 {{success}}，失败 {{fail}}",
+    "batchUnlockDone": "批量解锁完成：成功 {{success}}，失败 {{fail}}"
   },
   "status": {
     "active": "可用",
     "ready": "就绪",
     "cooldown": "冷却中",
     "rate_limited": "限流",
-    "usage_exhausted": "用量耗尽",
+    "usage_exhausted": "限流中",
     "unauthorized": "封禁",
     "error": "错误",
     "paused": "已暂停",
@@ -448,9 +466,11 @@
     "clearLogs": "清空日志",
     "emptyTitle": "暂无请求记录",
     "emptyDesc": "请求进入代理后，会在这里展示最近日志和状态码。",
+    "emptyFilteredDesc": "当前筛选条件下暂无请求记录，可清除筛选后重试。",
     "tableStatus": "状态",
     "tableModel": "模型",
     "tableAccount": "来源账号",
+    "tableApiKey": "API 密钥",
     "tableEndpoint": "端点",
     "tableType": "类型",
     "tableToken": "TOKEN",
@@ -459,9 +479,11 @@
     "tableDuration": "总耗时",
     "tableTime": "时间",
     "searchEmail": "搜索账号邮箱…",
+    "allApiKeys": "全部密钥",
     "allModels": "全部模型",
     "allEndpoints": "全部端点",
     "allTypes": "全部类型",
+    "unknownApiKey": "未记录",
     "clearFilters": "清除筛选"
   },
   "settings": {
@@ -500,6 +522,10 @@
     "autoCleanExpired": "自动清理过期账号",
     "autoCleanExpiredDesc": "开启后，每 15 分钟清理加入超过 30 分钟的账号，不管是否被调用过。开启时立即执行一次。",
     "scheduler": "调度优化",
+    "display": "显示",
+    "timezone": "系统时区",
+    "timezoneDesc": "控制前端日期/时间显示。修改后页面自动刷新生效。",
+    "timezoneAuto": "自动（浏览器时区）",
     "fastSchedulerEnabled": "快速调度器",
     "fastSchedulerEnabledDesc": "启用后，账号选择将使用内存快速调度算法，大幅降低高并发场景下的调度延迟。适合大号池（100+ 账号）场景。",
     "allowRemoteMigration": "允许远程迁移",
@@ -584,8 +610,113 @@
     "disabled": "禁用",
     "test": "测试",
     "testProxy": "测试代理",
-    "pagination": "共 {{total}} 个代理，第 {{page}}/{{totalPages}} 页"
-    ,
+    "pagination": "共 {{total}} 个代理，第 {{page}}/{{totalPages}} 页",
     "unlabeled": "未命名"
+  },
+  "nav2": {
+    "docs": "使用文档",
+    "apiRef": "API 文档"
+  },
+  "guide": {
+    "title": "使用教程",
+    "description": "了解如何配置和调用 CodexProxy API 端点",
+    "copy": "复制",
+    "copied": "已复制",
+    "endpoints": "API 端点",
+    "endpointsDesc": "CodexProxy 提供三个 API 端点，兼容不同的客户端格式。",
+    "responsesTitle": "POST /v1/responses",
+    "responsesDesc": "Codex Responses API 原生端点，直接透传请求到上游。适用于 Codex CLI、OpenAI SDK 等原生客户端。",
+    "chatTitle": "POST /v1/chat/completions",
+    "chatDesc": "OpenAI Chat Completions 兼容端点。接收 OpenAI 格式请求，自动翻译为 Codex 格式转发，响应翻译回 OpenAI 格式。适用于 ChatGPT 兼容客户端。",
+    "messagesTitle": "POST /v1/messages",
+    "messagesDesc": "Anthropic Messages API 兼容端点。接收 Claude 格式请求，自动翻译为 Codex 格式转发，响应翻译回 Claude 格式。适用于 Claude Code 等 Anthropic 客户端。",
+    "codexTitle": "在 Codex CLI 中使用",
+    "codexDesc": "将以下配置文件添加到 Codex CLI 配置目录中，即可通过本代理使用 Codex 模型。",
+    "codexConfigHint": "请确保以下内容位于 config.toml 文件的开头部分",
+    "codexNoteUnix": "请确保配置目录存在。可运行 mkdir -p ~/.codex 创建目录。",
+    "codexNoteWindows": "按 Win+R，输入 %userprofile%\\.codex 打开配置目录。如目录不存在，请先手动创建。",
+    "claudeCodeTitle": "在 Claude Code 中使用",
+    "claudeCodeDesc": "设置环境变量或编辑 settings.json，即可让 Claude Code 通过本代理使用 Codex 模型。",
+    "claudeCodeNote": "其中 YOUR_API_KEY 是你在系统设置中创建的 API Key。模型映射可在系统设置中配置。",
+    "claudeEnvNote": "这些环境变量仅在当前终端会话中生效。如需永久配置，请添加到 ~/.bashrc 或 ~/.zshrc 中。",
+    "claudeSettingsNote": "或者直接编辑 Claude Code 的 settings.json 配置文件（二选一即可）。",
+    "authTitle": "认证方式",
+    "authDesc": "所有端点均支持以下认证方式（优先级从高到低）：",
+    "authBearer": "Authorization: Bearer <key>（标准方式）",
+    "authXApiKey": "x-api-key: <key>（Anthropic SDK 默认）",
+    "authAnthropicToken": "anthropic-auth-token: <key>（备用兼容）",
+    "modelMappingTitle": "模型映射",
+    "modelMappingDesc": "当使用 /v1/messages 端点时，Claude 模型名会自动映射为 Codex 模型名。映射规则可在「系统设置」中自定义。",
+    "exampleTitle": "请求示例",
+    "responsesExample": "Responses API 示例",
+    "chatExample": "Chat Completions 示例",
+    "messagesExample": "Messages API 示例（Claude Code 格式）"
+  },
+  "settings2": {
+    "modelMapping": "模型映射",
+    "modelMappingDesc": "配置 Anthropic 模型名到 Codex 模型名的映射关系（用于 /v1/messages 端点）",
+    "anthropicModel": "Anthropic 模型",
+    "codexModel": "Codex 模型",
+    "addMapping": "添加映射",
+    "messagesEndpoint": "Anthropic Messages API 兼容端点（Claude Code）"
+  },
+  "apiRef": {
+    "title": "API 文档",
+    "description": "CodexProxy API 端点参考文档，包含请求格式和响应示例",
+    "authSection": "认证",
+    "authDesc": "所有 API 请求需要通过以下方式之一传递密钥：",
+    "responses": {
+      "title": "Create Response",
+      "desc": "创建一个 Codex Responses API 响应。支持流式和非流式模式，直接透传到上游 Codex API。"
+    },
+    "chat": {
+      "title": "Create Chat Completion",
+      "desc": "创建 OpenAI Chat Completions 格式的对话补全。请求自动翻译为 Codex 格式，响应翻译回 OpenAI 格式。"
+    },
+    "messages": {
+      "title": "Create Message",
+      "desc": "创建 Anthropic Messages API 格式的消息。请求自动翻译为 Codex 格式，响应翻译回 Anthropic 格式。模型名根据系统设置中的映射表自动转换。"
+    },
+    "models": {
+      "title": "List Models",
+      "desc": "列出当前可用的所有模型。"
+    },
+    "health": {
+      "title": "Health Check",
+      "desc": "检查服务状态和可用账号数量。此端点不需要认证。"
+    },
+    "accountSection": "账号管理接口",
+    "accountSectionDesc": "以下接口用于管理 Codex 账号，需要通过 X-Admin-Key 请求头传递管理密钥。",
+    "addAccount": {
+      "title": "Add Account (Refresh Token)",
+      "desc": "通过 Refresh Token 添加单个账号。添加后自动刷新 Access Token 并加入号池。name 为可选项，proxy_url 可留空。"
+    },
+    "addAccountBatch": {
+      "title": "Batch Add Accounts (Refresh Token)",
+      "desc": "批量添加账号：refresh_token 字段中用换行符 \\n 分隔多个 Token，单次最多 100 个。名称会自动追加序号后缀。"
+    },
+    "addATAccount": {
+      "title": "Add Account (Access Token)",
+      "desc": "通过 Access Token 直接添加账号（AT-only 模式，不需要 Refresh Token）。支持批量：access_token 中用换行符分隔多个 Token。"
+    },
+    "importAccounts": {
+      "title": "Import Accounts (File Upload)",
+      "desc": "通过文件上传批量导入账号。支持三种格式：txt（每行一个 RT）、json（兼容 CLIProxyAPI 凭证导出）、at_txt（每行一个 AT）。文件大小限制 2MB。"
+    },
+    "deleteAccount": {
+      "title": "Delete Account",
+      "desc": "删除指定 ID 的账号，同时从号池中移除。"
+    },
+    "listAccounts": {
+      "title": "List Accounts",
+      "desc": "列出所有账号及其状态、用量等信息。"
+    },
+    "tryIt": {
+      "button": "Try it",
+      "send": "发送请求",
+      "sending": "发送中…",
+      "placeholder": "点击 Send 发送请求",
+      "selectKey": "选择密钥："
+    }
   }
 }

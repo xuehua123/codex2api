@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -47,6 +48,11 @@ type Handler struct {
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
 	chartCacheData map[string]*chartCacheEntry
+
+	// 账号请求统计缓存（30秒 TTL）
+	reqCountMu        sync.RWMutex
+	reqCountCache     map[int64]*database.AccountRequestCount
+	reqCountExpiresAt time.Time
 }
 
 type chartCacheEntry struct {
@@ -93,6 +99,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
 	api.POST("/accounts/batch-assign-proxy", h.BatchAssignAccountsProxy)
+	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
 	api.POST("/accounts/batch-test", h.BatchTest)
@@ -271,6 +278,7 @@ type accountResponse struct {
 	LastRateLimitedAt  string                     `json:"last_rate_limited_at,omitempty"`
 	LastTimeoutAt      string                     `json:"last_timeout_at,omitempty"`
 	LastServerErrorAt  string                     `json:"last_server_error_at,omitempty"`
+	Locked             bool                       `json:"locked"`
 }
 
 type schedulerBreakdownResponse struct {
@@ -305,14 +313,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		accountMap[acc.DBID] = acc
 	}
 
-	// 获取每账号的请求统计（单独超时，避免被前面的查询挤占时间）
-	reqCountCtx, reqCountCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
-	defer reqCountCancel()
-	reqCounts, err := h.db.GetAccountRequestCounts(reqCountCtx)
-	if err != nil {
-		log.Printf("获取账号请求统计失败: %v", err)
-		reqCounts = make(map[int64]*database.AccountRequestCount)
-	}
+	// 获取每账号近 7 天请求统计（带 30 秒内存缓存）
+	reqCounts := h.getCachedRequestCounts()
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
@@ -324,6 +326,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Status:    row.Status,
 			ATOnly:    row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			ProxyURL:  row.ProxyURL,
+			Locked:    row.Locked,
 			CreatedAt: row.CreatedAt.Format(time.RFC3339),
 			UpdatedAt: row.UpdatedAt.Format(time.RFC3339),
 		}
@@ -383,6 +386,32 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, accountsResponse{Accounts: accounts})
+}
+
+// getCachedRequestCounts 返回带 30 秒 TTL 的账号请求统计缓存
+func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCount {
+	h.reqCountMu.RLock()
+	if h.reqCountCache != nil && time.Now().Before(h.reqCountExpiresAt) {
+		cached := h.reqCountCache
+		h.reqCountMu.RUnlock()
+		return cached
+	}
+	h.reqCountMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	counts, err := h.db.GetAccountRequestCounts(ctx)
+	if err != nil {
+		log.Printf("获取账号请求统计失败: %v", err)
+		return make(map[int64]*database.AccountRequestCount)
+	}
+
+	h.reqCountMu.Lock()
+	h.reqCountCache = counts
+	h.reqCountExpiresAt = time.Now().Add(30 * time.Second)
+	h.reqCountMu.Unlock()
+
+	return counts
 }
 
 type addAccountReq struct {
@@ -652,6 +681,106 @@ type jsonAccountEntry struct {
 	Email        string `json:"email"`
 }
 
+type sub2apiImportPayload struct {
+	Accounts []sub2apiAccountEntry `json:"accounts"`
+}
+
+type sub2apiAccountEntry struct {
+	Name        string                    `json:"name"`
+	Credentials sub2apiAccountCredentials `json:"credentials"`
+}
+
+type sub2apiAccountCredentials struct {
+	RefreshToken string `json:"refresh_token"`
+	AccessToken  string `json:"access_token"`
+	Email        string `json:"email"`
+}
+
+var utf8BOM = []byte{0xef, 0xbb, 0xbf}
+
+func trimUTF8BOM(data []byte) []byte {
+	return bytes.TrimPrefix(data, utf8BOM)
+}
+
+// parseImportJSONTokens 同时兼容现有扁平 JSON 和 Sub2Api 顶层对象。
+func parseImportJSONTokens(data []byte) ([]importToken, error) {
+	data = trimUTF8BOM(data)
+	if !json.Valid(data) {
+		return nil, fmt.Errorf("invalid import json")
+	}
+
+	if tokens := parseFlatJSONImportTokens(data); len(tokens) > 0 {
+		return tokens, nil
+	}
+
+	if tokens := parseSub2APIJSONImportTokens(data); len(tokens) > 0 {
+		return tokens, nil
+	}
+
+	return nil, nil
+}
+
+func parseFlatJSONImportTokens(data []byte) []importToken {
+	var entries []jsonAccountEntry
+	if err := json.Unmarshal(data, &entries); err == nil {
+		return jsonAccountEntriesToTokens(entries)
+	}
+
+	var single jsonAccountEntry
+	if err := json.Unmarshal(data, &single); err == nil {
+		return jsonAccountEntriesToTokens([]jsonAccountEntry{single})
+	}
+
+	return nil
+}
+
+func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
+	tokens := make([]importToken, 0, len(entries))
+	for _, entry := range entries {
+		rt := strings.TrimSpace(entry.RefreshToken)
+		at := strings.TrimSpace(entry.AccessToken)
+		email := strings.TrimSpace(entry.Email)
+
+		if rt != "" {
+			tokens = append(tokens, importToken{refreshToken: rt, name: email})
+			continue
+		}
+		if at != "" {
+			tokens = append(tokens, importToken{accessToken: at, name: email})
+		}
+	}
+	return tokens
+}
+
+func parseSub2APIJSONImportTokens(data []byte) []importToken {
+	var payload sub2apiImportPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil
+	}
+
+	tokens := make([]importToken, 0, len(payload.Accounts))
+	for _, account := range payload.Accounts {
+		rt := strings.TrimSpace(account.Credentials.RefreshToken)
+		at := strings.TrimSpace(account.Credentials.AccessToken)
+		name := strings.TrimSpace(account.Name)
+		email := strings.TrimSpace(account.Credentials.Email)
+
+		if name == "" {
+			name = email
+		}
+
+		if rt != "" {
+			tokens = append(tokens, importToken{refreshToken: rt, name: name})
+			continue
+		}
+		if at != "" {
+			tokens = append(tokens, importToken{accessToken: at, name: name})
+		}
+	}
+
+	return tokens
+}
+
 // ImportAccounts 批量导入账号（支持 TXT / JSON）
 func (h *Handler) ImportAccounts(c *gin.Context) {
 	format := c.DefaultPostForm("format", "txt")
@@ -730,32 +859,13 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 			return
 		}
 
-		// 去除 UTF-8 BOM
-		data = []byte(strings.TrimPrefix(string(data), "\xef\xbb\xbf"))
-
-		// 尝试解析为数组，失败则尝试单对象
-		var entries []jsonAccountEntry
-		if err := json.Unmarshal(data, &entries); err != nil {
-			var single jsonAccountEntry
-			if err := json.Unmarshal(data, &single); err != nil {
-				writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
-				return
-			}
-			entries = []jsonAccountEntry{single}
+		tokens, err := parseImportJSONTokens(data)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
+			return
 		}
 
-		for _, entry := range entries {
-			rt := strings.TrimSpace(entry.RefreshToken)
-			at := strings.TrimSpace(entry.AccessToken)
-			email := strings.TrimSpace(entry.Email)
-
-			if rt != "" {
-				allTokens = append(allTokens, importToken{refreshToken: rt, name: email})
-			} else if at != "" {
-				// 没有 RT 则走 AT 兼容路径
-				allTokens = append(allTokens, importToken{accessToken: at, name: email})
-			}
-		}
+		allTokens = append(allTokens, tokens...)
 	}
 
 	if len(allTokens) == 0 {
@@ -1281,6 +1391,47 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "账号刷新成功")
 }
 
+// ToggleAccountLock 切换账号的锁定状态
+func (h *Handler) ToggleAccountLock(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req struct {
+		Locked bool `json:"locked"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+
+	if err := h.db.SetAccountLocked(ctx, id, req.Locked); err != nil {
+		writeError(c, http.StatusInternalServerError, "更新锁定状态失败: "+err.Error())
+		return
+	}
+
+	// 同步更新内存中的状态
+	if acc := h.store.FindByID(id); acc != nil {
+		if req.Locked {
+			atomic.StoreInt32(&acc.Locked, 1)
+		} else {
+			atomic.StoreInt32(&acc.Locked, 0)
+		}
+	}
+
+	if req.Locked {
+		writeMessage(c, http.StatusOK, "账号已锁定")
+	} else {
+		writeMessage(c, http.StatusOK, "账号已解锁")
+	}
+}
+
 func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {
 	if h == nil || h.store == nil {
 		return fmt.Errorf("账号池未初始化")
@@ -1392,6 +1543,15 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 					pageSize = n
 				}
 			}
+			var apiKeyID *int64
+			if apiKeyIDStr := c.Query("api_key_id"); apiKeyIDStr != "" {
+				parsed, err := strconv.ParseInt(apiKeyIDStr, 10, 64)
+				if err != nil || parsed <= 0 {
+					writeError(c, http.StatusBadRequest, "api_key_id 参数无效，需要正整数")
+					return
+				}
+				apiKeyID = &parsed
+			}
 
 			filter := database.UsageLogFilter{
 				Start:    startTime,
@@ -1401,6 +1561,7 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 				Email:    c.Query("email"),
 				Model:    c.Query("model"),
 				Endpoint: c.Query("endpoint"),
+				APIKeyID: apiKeyID,
 			}
 			if fastStr := c.Query("fast"); fastStr != "" {
 				v := fastStr == "true"
@@ -1597,6 +1758,7 @@ type settingsResponse struct {
 	CacheDriver           string `json:"cache_driver"`
 	CacheLabel            string `json:"cache_label"`
 	ExpiredCleaned        int    `json:"expired_cleaned,omitempty"`
+	ModelMapping          string `json:"model_mapping"`
 }
 
 type updateSettingsReq struct {
@@ -1617,6 +1779,7 @@ type updateSettingsReq struct {
 	FastSchedulerEnabled  *bool   `json:"fast_scheduler_enabled"`
 	MaxRetries            *int    `json:"max_retries"`
 	AllowRemoteMigration  *bool   `json:"allow_remote_migration"`
+	ModelMapping          *string `json:"model_mapping"`
 }
 
 // GetSettings 获取当前系统设置
@@ -1652,6 +1815,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		DatabaseLabel:         h.databaseLabel,
 		CacheDriver:           h.cacheDriver,
 		CacheLabel:            h.cacheLabel,
+		ModelMapping:          h.store.GetModelMapping(),
 	})
 }
 
@@ -1812,6 +1976,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetAllowRemoteMigration(false)
 	}
 
+	if req.ModelMapping != nil {
+		h.store.SetModelMapping(*req.ModelMapping)
+		log.Printf("设置已更新: model_mapping")
+	}
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		MaxConcurrency:        h.store.GetMaxConcurrency(),
@@ -1831,6 +2000,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
 		MaxRetries:            h.store.GetMaxRetries(),
 		AllowRemoteMigration:  h.store.GetAllowRemoteMigration() && hasAdminSecret,
+		ModelMapping:          h.store.GetModelMapping(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -1873,6 +2043,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CacheDriver:           h.cacheDriver,
 		CacheLabel:            h.cacheLabel,
 		ExpiredCleaned:        expiredCleaned,
+		ModelMapping:          h.store.GetModelMapping(),
 	})
 }
 

@@ -2,6 +2,7 @@ import type { ChangeEvent, KeyboardEvent } from 'react'
 import { useCallback, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState, setAdminKey } from '../api'
+import { getTimezone, setTimezone } from '../utils/time'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import ToastNotice from '../components/ToastNotice'
@@ -24,6 +25,93 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+
+import { Trash2, Eye, EyeOff } from 'lucide-react'
+
+// 默认模型映射
+const DEFAULT_MODEL_MAPPING: Record<string, string> = {
+  'claude-opus-4-6': 'gpt-5.4',
+  'claude-opus-4-6-20250610': 'gpt-5.4',
+  'claude-haiku-4-5-20251001': 'gpt-5.4-mini',
+  'claude-haiku-4-5': 'gpt-5.4-mini',
+  'claude-sonnet-4-6': 'gpt-5.3-codex',
+  'claude-sonnet-4-5-20250929': 'gpt-5.2-codex',
+  'claude-opus-4-5-20251101': 'gpt-5.3-codex',
+}
+
+// 模型映射编辑器组件
+function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const { t } = useTranslation()
+
+  let mappings: [string, string][] = []
+  try {
+    const parsed = JSON.parse(value || '{}')
+    const entries = Object.entries(parsed) as [string, string][]
+    // 如果数据库中为空，用默认值填充
+    mappings = entries.length > 0 ? entries : Object.entries(DEFAULT_MODEL_MAPPING) as [string, string][]
+  } catch {
+    mappings = Object.entries(DEFAULT_MODEL_MAPPING) as [string, string][]
+  }
+
+  const updateMappings = (entries: [string, string][]) => {
+    const obj: Record<string, string> = {}
+    for (const [k, v] of entries) {
+      if (k.trim()) obj[k.trim()] = v.trim()
+    }
+    onChange(JSON.stringify(obj))
+  }
+
+  const handleChange = (index: number, field: 0 | 1, val: string) => {
+    const next = [...mappings]
+    next[index] = [...next[index]] as [string, string]
+    next[index][field] = val
+    updateMappings(next)
+  }
+
+  const handleRemove = (index: number) => {
+    const next = mappings.filter((_, i) => i !== index)
+    updateMappings(next)
+  }
+
+  const handleAdd = () => {
+    updateMappings([...mappings, ['', '']])
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-[1fr_1fr_40px] gap-2 text-xs font-semibold text-muted-foreground">
+        <span>{t('settings2.anthropicModel')}</span>
+        <span>{t('settings2.codexModel')}</span>
+        <span />
+      </div>
+      {mappings.map(([k, v], i) => (
+        <div key={i} className="grid grid-cols-[1fr_1fr_40px] gap-2 items-center">
+          <Input
+            className="font-mono text-[13px]"
+            placeholder="claude-opus-4-6"
+            value={k}
+            onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
+          />
+          <Input
+            className="font-mono text-[13px]"
+            placeholder="gpt-5.4"
+            value={v}
+            onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
+          />
+          <button
+            onClick={() => handleRemove(i)}
+            className="flex items-center justify-center size-9 rounded-lg text-muted-foreground hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+          >
+            <Trash2 className="size-4" />
+          </button>
+        </div>
+      ))}
+      <Button variant="outline" size="sm" onClick={handleAdd}>
+        + {t('settings2.addMapping')}
+      </Button>
+    </div>
+  )
+}
 
 function maskKey(key: string): string {
   if (!key || key.length < 12) return key
@@ -61,10 +149,12 @@ export default function Settings() {
     database_label: 'PostgreSQL',
     cache_driver: 'redis',
     cache_label: 'Redis',
+    model_mapping: '{}',
   })
   const [savingSettings, setSavingSettings] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
+  const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set())
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
 
@@ -262,7 +352,22 @@ export default function Settings() {
                       <TableRow key={keyRow.id}>
                         <TableCell className="text-[14px] font-medium">{keyRow.name}</TableCell>
                         <TableCell>
-                          <span className="font-mono text-[20px]">{maskKey(keyRow.key)}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-[14px]">
+                              {visibleKeys.has(keyRow.id) ? keyRow.raw_key : keyRow.key}
+                            </span>
+                            <button
+                              onClick={() => setVisibleKeys(prev => {
+                                const next = new Set(prev)
+                                if (next.has(keyRow.id)) next.delete(keyRow.id)
+                                else next.add(keyRow.id)
+                                return next
+                              })}
+                              className="flex items-center justify-center size-7 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors shrink-0"
+                            >
+                              {visibleKeys.has(keyRow.id) ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                            </button>
+                          </div>
                         </TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
                           {formatRelativeTime(keyRow.created_at, { variant: 'compact' })}
@@ -476,6 +581,45 @@ export default function Settings() {
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.fastSchedulerEnabledDesc')}</p>
               </div>
             </div>
+            <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.display')}</h3>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 mb-4">
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.timezone')}</label>
+                <Select
+                  value={getTimezone()}
+                  onValueChange={(value) => {
+                    setTimezone(value)
+                    window.location.reload()
+                  }}
+                  options={[
+                    { label: t('settings.timezoneAuto'), value: Intl.DateTimeFormat().resolvedOptions().timeZone },
+                    { label: '(UTC) UTC', value: 'UTC' },
+                    { label: '(GMT+08:00) Asia/Shanghai', value: 'Asia/Shanghai' },
+                    { label: '(GMT+09:00) Asia/Tokyo', value: 'Asia/Tokyo' },
+                    { label: '(GMT+09:00) Asia/Seoul', value: 'Asia/Seoul' },
+                    { label: '(GMT+08:00) Asia/Singapore', value: 'Asia/Singapore' },
+                    { label: '(GMT+08:00) Asia/Hong_Kong', value: 'Asia/Hong_Kong' },
+                    { label: '(GMT+08:00) Asia/Taipei', value: 'Asia/Taipei' },
+                    { label: '(GMT+07:00) Asia/Bangkok', value: 'Asia/Bangkok' },
+                    { label: '(GMT+04:00) Asia/Dubai', value: 'Asia/Dubai' },
+                    { label: '(GMT+05:30) Asia/Kolkata', value: 'Asia/Kolkata' },
+                    { label: '(GMT+01:00) Europe/London', value: 'Europe/London' },
+                    { label: '(GMT+02:00) Europe/Paris', value: 'Europe/Paris' },
+                    { label: '(GMT+02:00) Europe/Berlin', value: 'Europe/Berlin' },
+                    { label: '(GMT+03:00) Europe/Moscow', value: 'Europe/Moscow' },
+                    { label: '(GMT+02:00) Europe/Amsterdam', value: 'Europe/Amsterdam' },
+                    { label: '(GMT+02:00) Europe/Rome', value: 'Europe/Rome' },
+                    { label: '(GMT-04:00) America/New_York', value: 'America/New_York' },
+                    { label: '(GMT-07:00) America/Los_Angeles', value: 'America/Los_Angeles' },
+                    { label: '(GMT-05:00) America/Chicago', value: 'America/Chicago' },
+                    { label: '(GMT-03:00) America/Sao_Paulo', value: 'America/Sao_Paulo' },
+                    { label: '(GMT+10:00) Australia/Sydney', value: 'Australia/Sydney' },
+                    { label: '(GMT+12:00) Pacific/Auckland', value: 'Pacific/Auckland' },
+                  ]}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.timezoneDesc')}</p>
+              </div>
+            </div>
             <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.security')}</h3>
             <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 mb-4">
               <div>
@@ -519,6 +663,18 @@ export default function Settings() {
           </CardContent>
         </Card>
 
+        {/* Model Mapping */}
+        <Card className="mb-4">
+          <CardContent className="p-6">
+            <h3 className="text-base font-semibold text-foreground mb-2">{t('settings2.modelMapping')}</h3>
+            <p className="text-xs text-muted-foreground mb-4">{t('settings2.modelMappingDesc')}</p>
+            <ModelMappingEditor
+              value={settingsForm.model_mapping}
+              onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
+            />
+          </CardContent>
+        </Card>
+
         {/* API Endpoints */}
         <Card>
           <CardContent className="p-6">
@@ -542,6 +698,11 @@ export default function Settings() {
                     <TableCell><Badge variant="outline" className="text-[13px]">POST</Badge></TableCell>
                     <TableCell className="font-mono text-[20px]">/v1/responses</TableCell>
                     <TableCell className="text-[14px] text-muted-foreground">{t('settings.responsesApi')}</TableCell>
+                  </TableRow>
+                  <TableRow>
+                    <TableCell><Badge variant="outline" className="text-[13px]">POST</Badge></TableCell>
+                    <TableCell className="font-mono text-[20px]">/v1/messages</TableCell>
+                    <TableCell className="text-[14px] text-muted-foreground">{t('settings2.messagesEndpoint')}</TableCell>
                   </TableRow>
                   <TableRow>
                     <TableCell><Badge variant="secondary" className="text-[13px]">GET</Badge></TableCell>

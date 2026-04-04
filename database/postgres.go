@@ -26,6 +26,7 @@ type AccountRow struct {
 	CooldownReason string
 	CooldownUntil  sql.NullTime
 	ErrorMessage   string
+	Locked         bool
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
@@ -83,6 +84,9 @@ type usageLogEntry struct {
 	Stream           bool
 	CachedTokens     int
 	ServiceTier      string
+	APIKeyID         int64
+	APIKeyName       string
+	APIKeyMasked     string
 }
 
 // New 创建数据库连接并自动建表。
@@ -104,10 +108,10 @@ func New(driver string, dsn string) (*DB, error) {
 		conn.SetMaxIdleConns(1)
 	} else {
 		// 高并发场景：大量 RT 刷新 + 前端查询 + 使用日志写入 并行
-		conn.SetMaxOpenConns(100)                  // 增加最大打开连接数以处理更高并发
-		conn.SetMaxIdleConns(50)                   // 增加空闲连接数以保持热连接
-		conn.SetConnMaxLifetime(60 * time.Minute)  // 增加连接最大生存时间
-		conn.SetConnMaxIdleTime(30 * time.Minute)  // 增加空闲连接最大闲置时间
+		conn.SetMaxOpenConns(100)                 // 增加最大打开连接数以处理更高并发
+		conn.SetMaxIdleConns(50)                  // 增加空闲连接数以保持热连接
+		conn.SetConnMaxLifetime(60 * time.Minute) // 增加连接最大生存时间
+		conn.SetConnMaxIdleTime(30 * time.Minute) // 增加空闲连接最大闲置时间
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -126,6 +130,11 @@ func New(driver string, dsn string) (*DB, error) {
 	if db.isSQLite() {
 		if err := db.configureSQLite(ctx); err != nil {
 			return nil, fmt.Errorf("配置 SQLite 失败: %w", err)
+		}
+	} else {
+		// PostgreSQL: 统一会话时区为 UTC，确保 NOW() 和时间字面量一致
+		if _, err := conn.ExecContext(ctx, "SET timezone = 'UTC'"); err != nil {
+			return nil, fmt.Errorf("设置数据库时区失败: %w", err)
 		}
 	}
 	if err := db.migrate(ctx); err != nil {
@@ -190,12 +199,13 @@ func (db *DB) migrate(ctx context.Context) error {
 		proxy_url     VARCHAR(500) DEFAULT '',
 		status        VARCHAR(50) DEFAULT 'active',
 		error_message TEXT DEFAULT '',
-		created_at    TIMESTAMP DEFAULT NOW(),
-		updated_at    TIMESTAMP DEFAULT NOW()
+		created_at    TIMESTAMPTZ DEFAULT NOW(),
+		updated_at    TIMESTAMPTZ DEFAULT NOW()
 	);
 
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_reason VARCHAR(50) DEFAULT '';
-	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMP NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
 
 	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 	CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform);
@@ -212,10 +222,8 @@ func (db *DB) migrate(ctx context.Context) error {
 		total_tokens   INT DEFAULT 0,
 		status_code    INT DEFAULT 0,
 		duration_ms    INT DEFAULT 0,
-		created_at     TIMESTAMP DEFAULT NOW()
+		created_at     TIMESTAMPTZ DEFAULT NOW()
 	);
-
-	-- 复合索引
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_account_id ON usage_logs(account_id);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);
@@ -232,12 +240,17 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS stream BOOLEAN DEFAULT false;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS cached_tokens INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS service_tier VARCHAR(20) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_id INT DEFAULT 0;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_name VARCHAR(255) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_masked VARCHAR(64) DEFAULT '';
+
+	CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);
 
 	CREATE TABLE IF NOT EXISTS api_keys (
 		id         SERIAL PRIMARY KEY,
 		name       VARCHAR(255) DEFAULT '',
 		key        VARCHAR(255) NOT NULL UNIQUE,
-		created_at TIMESTAMP DEFAULT NOW()
+		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
 
 	CREATE TABLE IF NOT EXISTS system_settings (
@@ -264,13 +277,14 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_expired BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_mapping TEXT DEFAULT '{}';
 
 	CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
 		url        VARCHAR(500) NOT NULL UNIQUE,
 		label      VARCHAR(255) DEFAULT '',
 		enabled    BOOLEAN DEFAULT TRUE,
-		created_at TIMESTAMP DEFAULT NOW()
+		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_ip VARCHAR(100) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_location VARCHAR(255) DEFAULT '';
@@ -281,12 +295,41 @@ func (db *DB) migrate(ctx context.Context) error {
 		account_id INT NOT NULL DEFAULT 0,
 		event_type VARCHAR(20) NOT NULL,
 		source     VARCHAR(30) DEFAULT '',
-		created_at TIMESTAMP DEFAULT NOW()
+		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);
 	CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);
 	`
 	_, err := db.conn.ExecContext(ctx, query)
+	if err != nil {
+		return err
+	}
+
+	// 独立长超时：将已有 TIMESTAMP 列迁移为 TIMESTAMPTZ（大表 ALTER COLUMN TYPE 可能较慢）
+	migrateQuery := `
+	DO $$
+	DECLARE
+		_tbl  TEXT;
+		_col  TEXT;
+		_rec  RECORD;
+	BEGIN
+		FOR _rec IN
+			SELECT table_name, column_name
+			FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND data_type = 'timestamp without time zone'
+			  AND table_name IN ('accounts', 'usage_logs', 'api_keys', 'proxies', 'account_events')
+		LOOP
+			EXECUTE format(
+				'ALTER TABLE %I ALTER COLUMN %I TYPE TIMESTAMPTZ USING %I AT TIME ZONE current_setting(''TIMEZONE'')',
+				_rec.table_name, _rec.column_name, _rec.column_name
+			);
+		END LOOP;
+	END $$;
+	`
+	migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer migrateCancel()
+	_, err = db.conn.ExecContext(migrateCtx, migrateQuery)
 	return err
 }
 
@@ -354,6 +397,7 @@ type SystemSettings struct {
 	FastSchedulerEnabled  bool
 	MaxRetries            int
 	AllowRemoteMigration  bool
+	ModelMapping          string // JSON: {"anthropic_model": "codex_model", ...}
 }
 
 // GetSystemSettings 加载全局设置
@@ -367,13 +411,14 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(max_retries, 2),
 		       COALESCE(allow_remote_migration, false),
 		       COALESCE(auto_clean_error, false),
-		       COALESCE(auto_clean_expired, false)
+		       COALESCE(auto_clean_expired, false),
+		       COALESCE(model_mapping, '{}')
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
-		&s.AutoCleanError, &s.AutoCleanExpired,
+		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -387,9 +432,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		INSERT INTO system_settings (
 			id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
-			fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired
+			fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping
 		)
-		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		ON CONFLICT (id) DO UPDATE SET
 			max_concurrency         = EXCLUDED.max_concurrency,
 			global_rpm              = EXCLUDED.global_rpm,
@@ -407,10 +452,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			max_retries             = EXCLUDED.max_retries,
 			allow_remote_migration  = EXCLUDED.allow_remote_migration,
 			auto_clean_error        = EXCLUDED.auto_clean_error,
-			auto_clean_expired      = EXCLUDED.auto_clean_expired
+			auto_clean_expired      = EXCLUDED.auto_clean_expired,
+			model_mapping           = EXCLUDED.model_mapping
 	`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
-		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired)
+		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping)
 	return err
 }
 
@@ -654,6 +700,9 @@ type UsageLog struct {
 	Stream           bool      `json:"stream"`
 	CachedTokens     int       `json:"cached_tokens"`
 	ServiceTier      string    `json:"service_tier"`
+	APIKeyID         int64     `json:"api_key_id"`
+	APIKeyName       string    `json:"api_key_name"`
+	APIKeyMasked     string    `json:"api_key_masked"`
 	AccountEmail     string    `json:"account_email"`
 	CreatedAt        time.Time `json:"created_at"`
 }
@@ -680,6 +729,9 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 		Stream:           log.Stream,
 		CachedTokens:     log.CachedTokens,
 		ServiceTier:      log.ServiceTier,
+		APIKeyID:         log.APIKeyID,
+		APIKeyName:       log.APIKeyName,
+		APIKeyMasked:     log.APIKeyMasked,
 	})
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
@@ -711,6 +763,9 @@ type UsageLogInput struct {
 	Stream           bool
 	CachedTokens     int
 	ServiceTier      string
+	APIKeyID         int64
+	APIKeyName       string
+	APIKeyMasked     string
 }
 
 // startLogFlusher 启动后台定时 flush 协程（每 5 秒一次）
@@ -763,8 +818,9 @@ func (db *DB) flushLogs() {
 
 	stmt, err := tx.PrepareContext(ctx,
 		`INSERT INTO usage_logs (account_id, endpoint, model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
-		  input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`)
+		  input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier,
+		  api_key_id, api_key_name, api_key_masked)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("批量写入日志失败（准备语句）: %v", err)
@@ -774,7 +830,8 @@ func (db *DB) flushLogs() {
 
 	for _, e := range batch {
 		if _, err := stmt.ExecContext(ctx, e.AccountID, e.Endpoint, e.Model, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
-			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier); err != nil {
+			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier,
+			e.APIKeyID, e.APIKeyName, e.APIKeyMasked); err != nil {
 			tx.Rollback()
 			log.Printf("批量写入日志失败（执行）: %v", err)
 			return
@@ -792,13 +849,13 @@ func (db *DB) flushLogs() {
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化
-// 分批处理以避免 PostgreSQL 65535 参数限制（每行18个参数，每批最多3640行）
+// 分批处理以避免 PostgreSQL 65535 参数限制（每行 21 个参数，每批最多 3120 行）
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
 	}
 
-	const maxRowsPerBatch = 3000 // 安全阈值，低于3640行的理论上限
+	const maxRowsPerBatch = 3000 // 安全阈值，低于 3120 行的理论上限
 
 	// 分批处理
 	for start := 0; start < len(batch); start += maxRowsPerBatch {
@@ -823,20 +880,22 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) e
 
 	// 使用 COPY 或批量 VALUES 优化插入性能
 	valueStrings := make([]string, 0, len(batch))
-	valueArgs := make([]interface{}, 0, len(batch)*18)
+	valueArgs := make([]interface{}, 0, len(batch)*21)
 	argIdx := 1
 
 	for _, e := range batch {
-		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
 			argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+7, argIdx+8, argIdx+9,
-			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17))
+			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17, argIdx+18, argIdx+19, argIdx+20))
 		valueArgs = append(valueArgs, e.AccountID, e.Endpoint, e.Model, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
-			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier)
-		argIdx += 18
+			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier,
+			e.APIKeyID, e.APIKeyName, e.APIKeyMasked)
+		argIdx += 21
 	}
 
 	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, endpoint, model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
-		input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier)
+		input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier,
+		api_key_id, api_key_name, api_key_masked)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
 	_, err := db.conn.ExecContext(ctx, query, valueArgs...)
@@ -980,6 +1039,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
+	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -998,7 +1058,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.ServiceTier,
-			&credentialRaw, &createdAtRaw); err != nil {
+			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &credentialRaw, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -1202,6 +1262,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
+	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -1221,7 +1282,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.ServiceTier,
-			&credentialRaw, &createdAtRaw); err != nil {
+			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &credentialRaw, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -1249,6 +1310,7 @@ type UsageLogFilter struct {
 	Email      string // LIKE 模糊匹配
 	Model      string // 精确匹配
 	Endpoint   string // 精确匹配 inbound_endpoint
+	APIKeyID   *int64 // nil=全部
 	FastOnly   *bool  // nil=全部, true=仅fast, false=仅非fast
 	StreamOnly *bool  // nil=全部, true=仅stream, false=仅sync
 }
@@ -1282,6 +1344,11 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		args = append(args, f.Endpoint)
 		paramIdx++
 	}
+	if f.APIKeyID != nil {
+		where += fmt.Sprintf(` AND COALESCE(u.api_key_id, 0) = $%d`, paramIdx)
+		args = append(args, *f.APIKeyID)
+		paramIdx++
+	}
 	if f.FastOnly != nil {
 		if *f.FastOnly {
 			where += ` AND COALESCE(u.service_tier, '') = 'fast'`
@@ -1303,6 +1370,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
+	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
@@ -1322,7 +1390,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens,
-			&l.ServiceTier, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
+			&l.ServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -1383,15 +1451,18 @@ type AccountRequestCount struct {
 	ErrorCount   int64
 }
 
-// GetAccountRequestCounts 按 account_id 聚合成功/失败请求数
+// GetAccountRequestCounts 按 account_id 聚合近 7 天成功/失败请求数
 func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRequestCount, error) {
+	since := time.Now().AddDate(0, 0, -7)
 	query := `
 	SELECT account_id,
 		COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0) AS success_count,
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
-	FROM usage_logs GROUP BY account_id
+	FROM usage_logs
+	WHERE created_at >= $1
+	GROUP BY account_id
 	`
-	rows, err := db.conn.QueryContext(ctx, query)
+	rows, err := db.conn.QueryContext(ctx, query, since)
 	if err != nil {
 		return nil, err
 	}
@@ -1413,7 +1484,7 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 // ListAccounts 获取所有账号
 func (db *DB) ListAccounts(ctx context.Context) ([]*AccountRow, error) {
 	rows, err := db.conn.QueryContext(ctx, `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), created_at, updated_at
 		FROM accounts
 		ORDER BY id
 	`)
@@ -1440,6 +1511,7 @@ func (db *DB) ListAccounts(ctx context.Context) ([]*AccountRow, error) {
 			&a.CooldownReason,
 			&cooldownUntilRaw,
 			&a.ErrorMessage,
+			&a.Locked,
 			&createdAtRaw,
 			&updatedAtRaw,
 		); err != nil {
@@ -1476,6 +1548,12 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		}
 	}
 	return active, nil
+}
+
+// SetAccountLocked 设置账号的锁定状态
+func (db *DB) SetAccountLocked(ctx context.Context, id int64, locked bool) error {
+	_, err := db.conn.ExecContext(ctx, `UPDATE accounts SET locked = $1 WHERE id = $2`, locked, id)
+	return err
 }
 
 // UpdateCredentials 原子合并更新账号的 credentials（JSONB || 运算符，不覆盖已有字段）

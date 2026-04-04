@@ -150,10 +150,12 @@
     "importTxt": "TXT File",
     "importTxtDesc": "Supports plain RT lines or the CPA original format, with RT auto-extracted",
     "importJson": "JSON File",
-    "importJsonDesc": "Compatible with CLIProxyAPI credential JSON",
+    "importJsonDesc": "Compatible with CLIProxyAPI and Sub2Api JSON",
     "export": "Export",
     "exporting": "Exporting…",
     "exportTitle": "Select Export Method",
+    "exportScopeHealthy": "All Healthy Accounts",
+    "exportScopeSelected": "Selected Accounts ({{count}})",
     "exportHealthyJson": "CPA JSON (Healthy)",
     "exportHealthyJsonDesc": "Export all healthy accounts",
     "exportHealthyTxt": "TXT (Healthy)",
@@ -187,7 +189,7 @@
     "email": "Email",
     "plan": "Plan",
     "status": "Status",
-    "requests": "Requests",
+    "requests": "Requests(7d)",
     "usage": "Usage",
     "updatedAt": "Updated",
     "importTime": "Import Time",
@@ -321,15 +323,31 @@
     "accessTokenPlaceholder": "One access token per line. Bulk paste is supported.",
     "importAtTxt": "AT TXT File",
     "importAtTxtDesc": "One access token per line",
+    "importFolder": "Select Folder",
+    "importFolderDesc": "Recursively scan .txt and .json files",
+    "folderNoValidFiles": "No valid .txt or .json files found in the folder",
+    "dropToImport": "Drop files here to import",
+    "dropHint": "Supports .txt, .json files and folders",
+    "unsupportedFileType": "Unsupported file type: {{name}}. Only .txt and .json are supported",
     "atWarning": "AT-only accounts cannot auto-refresh. You will need to manually update the token after it expires.",
-    "atRefreshDisabled": "AT accounts cannot be refreshed"
+    "atRefreshDisabled": "AT accounts cannot be refreshed",
+    "lock": "Lock",
+    "unlock": "Unlock",
+    "lockSuccess": "Locked",
+    "unlockSuccess": "Unlocked",
+    "lockFailed": "Operation failed: {{error}}",
+    "lockHint": "Locked accounts are skipped by auto-cleanup",
+    "unlockHint": "Unlocked accounts will be subject to auto-cleanup",
+    "filterLocked": "Locked",
+    "batchLockDone": "Batch lock complete: {{success}} succeeded, {{fail}} failed",
+    "batchUnlockDone": "Batch unlock complete: {{success}} succeeded, {{fail}} failed"
   },
   "status": {
     "active": "Available",
     "ready": "Ready",
     "cooldown": "Cooling Down",
     "rate_limited": "Rate Limited",
-    "usage_exhausted": "Usage Exhausted",
+    "usage_exhausted": "Rate Limited",
     "unauthorized": "Banned",
     "error": "Error",
     "paused": "Paused",
@@ -448,16 +466,25 @@
     "clearLogs": "Clear Logs",
     "emptyTitle": "No request logs yet",
     "emptyDesc": "Once requests pass through the proxy, recent logs and status codes will appear here.",
+    "emptyFilteredDesc": "No request logs match the current filters. Clear filters and try again.",
     "tableStatus": "Status",
     "tableModel": "Model",
     "tableAccount": "Account",
+    "tableApiKey": "API Key",
     "tableEndpoint": "Endpoint",
     "tableType": "Type",
     "tableToken": "Tokens",
     "tableCached": "Cached",
     "tableFirstToken": "First Token",
     "tableDuration": "Duration",
-    "tableTime": "Time"
+    "tableTime": "Time",
+    "searchEmail": "Search account email…",
+    "allApiKeys": "All API Keys",
+    "allModels": "All Models",
+    "allEndpoints": "All Endpoints",
+    "allTypes": "All Types",
+    "unknownApiKey": "Not Recorded",
+    "clearFilters": "Clear Filters"
   },
   "settings": {
     "title": "Settings",
@@ -495,6 +522,10 @@
     "autoCleanExpired": "Auto clean expired accounts",
     "autoCleanExpiredDesc": "Every 15 minutes, removes accounts older than 30 minutes regardless of usage. Runs immediately when toggled on.",
     "scheduler": "Scheduling",
+    "display": "Display",
+    "timezone": "System Timezone",
+    "timezoneDesc": "Controls date/time display in the frontend. The page will reload automatically after changing.",
+    "timezoneAuto": "Auto (Browser Timezone)",
     "fastSchedulerEnabled": "Fast Scheduler",
     "fastSchedulerEnabledDesc": "Uses an in-memory fast scheduling algorithm, significantly reducing dispatch latency under high concurrency. Recommended for large account pools (100+).",
     "allowRemoteMigration": "Allow Remote Migration",
@@ -581,5 +612,111 @@
     "testProxy": "Test Proxy",
     "pagination": "{{total}} proxies, page {{page}}/{{totalPages}}",
     "unlabeled": "Unlabeled"
+  },
+  "nav2": {
+    "docs": "Docs",
+    "apiRef": "API Reference"
+  },
+  "guide": {
+    "title": "Usage Guide",
+    "description": "Learn how to configure and call CodexProxy API endpoints",
+    "copy": "Copy",
+    "copied": "Copied",
+    "endpoints": "API Endpoints",
+    "endpointsDesc": "CodexProxy provides three API endpoints compatible with different client formats.",
+    "responsesTitle": "POST /v1/responses",
+    "responsesDesc": "Native Codex Responses API endpoint. Directly proxies requests to upstream. For Codex CLI, OpenAI SDK and other native clients.",
+    "chatTitle": "POST /v1/chat/completions",
+    "chatDesc": "OpenAI Chat Completions compatible endpoint. Accepts OpenAI format, translates to Codex format, and translates responses back. For ChatGPT compatible clients.",
+    "messagesTitle": "POST /v1/messages",
+    "messagesDesc": "Anthropic Messages API compatible endpoint. Accepts Claude format, translates to Codex format, and translates responses back. For Claude Code and other Anthropic clients.",
+    "codexTitle": "Using with Codex CLI",
+    "codexDesc": "Add the following configuration files to the Codex CLI config directory to use Codex models through this proxy.",
+    "codexConfigHint": "Make sure the following content is at the beginning of config.toml",
+    "codexNoteUnix": "Make sure the config directory exists. Run mkdir -p ~/.codex to create it.",
+    "codexNoteWindows": "Press Win+R, type %userprofile%\\.codex to open the config directory. Create it manually if it doesn't exist.",
+    "claudeCodeTitle": "Using with Claude Code",
+    "claudeCodeDesc": "Set environment variables or edit settings.json to let Claude Code use Codex models through this proxy.",
+    "claudeCodeNote": "Replace YOUR_API_KEY with the API Key created in Settings. Model mapping can be configured in Settings.",
+    "claudeEnvNote": "These environment variables only apply to the current terminal session. For permanent configuration, add them to ~/.bashrc or ~/.zshrc.",
+    "claudeSettingsNote": "Or directly edit the Claude Code settings.json config file (choose one method).",
+    "authTitle": "Authentication",
+    "authDesc": "All endpoints support the following authentication methods (in priority order):",
+    "authBearer": "Authorization: Bearer <key> (standard)",
+    "authXApiKey": "x-api-key: <key> (Anthropic SDK default)",
+    "authAnthropicToken": "anthropic-auth-token: <key> (fallback)",
+    "modelMappingTitle": "Model Mapping",
+    "modelMappingDesc": "When using the /v1/messages endpoint, Claude model names are automatically mapped to Codex model names. Mapping rules can be customized in Settings.",
+    "exampleTitle": "Request Examples",
+    "responsesExample": "Responses API Example",
+    "chatExample": "Chat Completions Example",
+    "messagesExample": "Messages API Example (Claude Code format)"
+  },
+  "settings2": {
+    "modelMapping": "Model Mapping",
+    "modelMappingDesc": "Configure Anthropic model name to Codex model name mapping (for /v1/messages endpoint)",
+    "anthropicModel": "Anthropic Model",
+    "codexModel": "Codex Model",
+    "addMapping": "Add Mapping",
+    "messagesEndpoint": "Anthropic Messages API endpoint (Claude Code)"
+  },
+  "apiRef": {
+    "title": "API Reference",
+    "description": "CodexProxy API endpoint reference documentation with request formats and response examples",
+    "authSection": "Authentication",
+    "authDesc": "All API requests require a key passed via one of the following methods:",
+    "responses": {
+      "title": "Create Response",
+      "desc": "Create a Codex Responses API response. Supports streaming and non-streaming modes, directly proxied to upstream Codex API."
+    },
+    "chat": {
+      "title": "Create Chat Completion",
+      "desc": "Create an OpenAI Chat Completions format conversation completion. Requests are automatically translated to Codex format, responses translated back to OpenAI format."
+    },
+    "messages": {
+      "title": "Create Message",
+      "desc": "Create an Anthropic Messages API format message. Requests are automatically translated to Codex format, responses translated back to Anthropic format. Model names are mapped according to the mapping table in system settings."
+    },
+    "models": {
+      "title": "List Models",
+      "desc": "List all currently available models."
+    },
+    "health": {
+      "title": "Health Check",
+      "desc": "Check service status and available account count. This endpoint does not require authentication."
+    },
+    "accountSection": "Account Management",
+    "accountSectionDesc": "The following endpoints are for managing Codex accounts. Requires X-Admin-Key header with admin secret.",
+    "addAccount": {
+      "title": "Add Account (Refresh Token)",
+      "desc": "Add a single account via Refresh Token. Automatically refreshes Access Token and joins the account pool. name is optional, proxy_url can be empty."
+    },
+    "addAccountBatch": {
+      "title": "Batch Add Accounts (Refresh Token)",
+      "desc": "Batch add accounts: separate multiple tokens with newline \\n in the refresh_token field. Maximum 100 per request. Names are auto-suffixed with sequence numbers."
+    },
+    "addATAccount": {
+      "title": "Add Account (Access Token)",
+      "desc": "Add account directly via Access Token (AT-only mode, no Refresh Token needed). Supports batch: separate multiple tokens with newline in access_token."
+    },
+    "importAccounts": {
+      "title": "Import Accounts (File Upload)",
+      "desc": "Batch import accounts via file upload. Supports three formats: txt (one RT per line), json (CLIProxyAPI credential export compatible), at_txt (one AT per line). Max file size 2MB."
+    },
+    "deleteAccount": {
+      "title": "Delete Account",
+      "desc": "Delete account by ID and remove from the pool."
+    },
+    "listAccounts": {
+      "title": "List Accounts",
+      "desc": "List all accounts with their status, usage and other details."
+    },
+    "tryIt": {
+      "button": "Try it",
+      "send": "Send",
+      "sending": "Sending…",
+      "placeholder": "Click Send to make a request",
+      "selectKey": "Select key:"
+    }
   }
 }

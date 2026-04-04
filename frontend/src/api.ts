@@ -114,6 +114,8 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
+  toggleAccountLock: (id: number, locked: boolean) =>
+    request<MessageResponse>(`/accounts/${id}/lock`, { method: 'POST', body: JSON.stringify({ locked }) }),
   getAccountUsage: (id: number) =>
     request<AccountUsageDetail>(`/accounts/${id}/usage`),
   getHealth: () => request<HealthResponse>('/health'),
@@ -129,7 +131,7 @@ export const api = {
     }
     return request<UsageLogsResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; fast?: string; stream?: string }) => {
+  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; fast?: string; stream?: string }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
@@ -138,6 +140,7 @@ export const api = {
     if (params.email) searchParams.set('email', params.email)
     if (params.model) searchParams.set('model', params.model)
     if (params.endpoint) searchParams.set('endpoint', params.endpoint)
+    if (params.apiKeyId) searchParams.set('api_key_id', params.apiKeyId)
     if (params.fast) searchParams.set('fast', params.fast)
     if (params.stream) searchParams.set('stream', params.stream)
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)
