@@ -25,7 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 import { buildAccountProxyOptions } from './accountProxyOptions'
@@ -732,6 +732,31 @@ export default function Accounts() {
     void reload()
   }
 
+  const handleResetStatus = async (account: AccountRow) => {
+    try {
+      await api.resetAccountStatus(account.id)
+      showToast(t('accounts.resetStatusSuccess'))
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.resetStatusFailed', { error: getErrorMessage(error) }), 'error')
+    }
+  }
+
+  const handleBatchResetStatus = async () => {
+    if (selected.size === 0) return
+    setBatchLoading(true)
+    try {
+      const result = await api.batchResetStatus(Array.from(selected))
+      showToast(t('accounts.batchResetStatusDone', { success: result.success, fail: result.failed }))
+      setSelected(new Set())
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.resetStatusFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setBatchLoading(false)
+    }
+  }
+
   const handleBatchTest = async () => {
     setBatchTesting(true)
     try {
@@ -983,6 +1008,9 @@ export default function Accounts() {
               <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchLock(false)}>
                 <Unlock className="size-3 mr-1" />{t('accounts.unlock')}
               </Button>
+              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchResetStatus()}>
+                <RotateCcw className="size-3 mr-1" />{t('accounts.batchResetStatus')}
+              </Button>
               <Button variant="destructive" size="sm" disabled={batchLoading} onClick={() => void handleBatchDelete()}>
                 {t('accounts.batchDelete')}
               </Button>
@@ -1152,6 +1180,15 @@ export default function Accounts() {
                               title={account.locked ? t('accounts.unlockHint') : t('accounts.lockHint')}
                             >
                               {account.locked ? <Lock className="size-3.5" /> : <Unlock className="size-3.5" />}
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              className="h-7 w-8 px-0"
+                              onClick={() => void handleResetStatus(account)}
+                              title={t('accounts.resetStatusHint')}
+                            >
+                              <RotateCcw className="size-3.5" />
                             </Button>
                             <Button
                               variant="destructive"
@@ -2010,6 +2047,13 @@ function TestConnectionModal({
             >
               {formattedErrorMsg}
             </pre>
+          </div>
+        )}
+
+        {status === 'success' && (
+          <div className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-700 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-400">
+            <RotateCcw className="size-4 shrink-0" />
+            {t('accounts.testAutoReset')}
           </div>
         )}
       </div>
