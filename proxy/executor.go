@@ -75,9 +75,43 @@ func shouldRecyclePooledClient(err error) bool {
 	}
 
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "connection is shutting down") ||
-		strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "broken pipe")
+	if containsAny(msg,
+		"connection is shutting down",
+		"connection reset",
+		"broken pipe",
+		"use of closed network connection",
+		"client conn not usable",
+		"client connection force closed",
+		"clientconn.close",
+		"goaway",
+		"enhance_your_calm",
+	) {
+		return true
+	}
+
+	if containsAny(msg,
+		"protocol_error",
+		"stream error: stream id",
+		"unexpected eof",
+	) && !containsAny(msg,
+		"proxyconnect tcp",
+		"no such host",
+		"timeout",
+		"deadline exceeded",
+	) {
+		return true
+	}
+
+	return false
+}
+
+func containsAny(msg string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func recyclePooledClient(account *auth.Account, proxyURL string) {

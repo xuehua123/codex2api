@@ -107,6 +107,46 @@ func TestShouldRecyclePooledClient(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "client conn not usable",
+			err:  errors.New("http2: client conn not usable"),
+			want: true,
+		},
+		{
+			name: "client connection force closed",
+			err:  errors.New("http2: client connection force closed via ClientConn.Close"),
+			want: true,
+		},
+		{
+			name: "protocol error",
+			err:  errors.New("stream error: stream ID 13; PROTOCOL_ERROR; received from peer"),
+			want: true,
+		},
+		{
+			name: "goaway",
+			err:  errors.New("http2: server sent GOAWAY and closed the connection"),
+			want: true,
+		},
+		{
+			name: "enhance your calm",
+			err:  errors.New("http2: server sent GOAWAY and closed the connection; ErrCode=ENHANCE_YOUR_CALM"),
+			want: true,
+		},
+		{
+			name: "unexpected eof",
+			err:  errors.New("unexpected EOF"),
+			want: true,
+		},
+		{
+			name: "closed network connection",
+			err:  errors.New("read tcp 10.0.0.1:12345->10.0.0.2:443: use of closed network connection"),
+			want: true,
+		},
+		{
+			name: "proxy connect unexpected eof",
+			err:  errors.New("proxyconnect tcp: unexpected EOF"),
+			want: false,
+		},
+		{
 			name: "plain timeout",
 			err:  errors.New("read timeout"),
 			want: false,
