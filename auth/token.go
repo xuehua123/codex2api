@@ -51,7 +51,7 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 	data := url.Values{
 		"grant_type":    {"refresh_token"},
 		"client_id":     {ClientID},
-		"refresh_token": {tokenStr},
+		"refresh_token": {refreshToken},
 		"scope":         {RefreshScopes},
 	}
 
@@ -119,7 +119,7 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 
 	// 保留新 RT，如果返回空则保留旧的
 	if strings.TrimSpace(td.RefreshToken) == "" {
-		td.RefreshToken = tokenStr
+		td.RefreshToken = refreshToken
 	}
 
 	// 解析 id_token 获取账号信息
