@@ -75,6 +75,36 @@ func TestValidateResponsesAPIRequestAllowsCompactionInputType(t *testing.T) {
 	}
 }
 
+func TestValidateChatCompletionsRequestAllowsLargeMaxTokens(t *testing.T) {
+	result := ValidateChatCompletionsRequest(
+		[]byte(`{
+			"model":"gpt-5.4",
+			"messages":[{"role":"user","content":"hello"}],
+			"max_tokens":1000000
+		}`),
+		[]string{"gpt-5.4"},
+	)
+
+	if !result.Valid {
+		t.Fatalf("expected large max_tokens to be valid, got %#v", result.Errors)
+	}
+}
+
+func TestValidateResponsesAPIRequestAllowsLargeMaxOutputTokens(t *testing.T) {
+	result := ValidateResponsesAPIRequest(
+		[]byte(`{
+			"model":"gpt-5.4",
+			"input":"hello",
+			"max_output_tokens":1000000
+		}`),
+		[]string{"gpt-5.4"},
+	)
+
+	if !result.Valid {
+		t.Fatalf("expected large max_output_tokens to be valid, got %#v", result.Errors)
+	}
+}
+
 func TestValidateResponsesAPIRequestRejectsUnknownInputType(t *testing.T) {
 	result := ValidateResponsesAPIRequest(
 		[]byte(`{"model":"gpt-5.4","input":[{"type":"unknown_call","call_id":"call_1"}]}`),

@@ -402,7 +402,7 @@ func ChatCompletionValidationRules() map[string][]ValidationRule {
 	return map[string][]ValidationRule{
 		"model":       {Required(), TypeString(), MaxLength(64)},
 		"messages":    {Required(), TypeArray(), MinItems(1), MaxItems(4096), ValidateMessages()},
-		"max_tokens":  {TypeNumber(), MinValue(1), MaxValue(65536)},
+		"max_tokens":  {TypeNumber(), MinValue(1)},
 		"temperature": {TypeNumber(), Range(0, 2)},
 		"top_p":       {TypeNumber(), Range(0, 1)},
 		"n":           {TypeNumber(), MinValue(1), MaxValue(1)},
@@ -425,7 +425,7 @@ func ResponsesAPIValidationRules() map[string][]ValidationRule {
 	return map[string][]ValidationRule{
 		"model": {Required(), TypeString(), MaxLength(64)},
 		// input validation is handled separately to support both string and array formats
-		"max_output_tokens": {TypeNumber(), MinValue(1), MaxValue(65536)},
+		"max_output_tokens": {TypeNumber(), MinValue(1)},
 		"temperature":       {TypeNumber(), Range(0, 2)},
 		"top_p":             {TypeNumber(), Range(0, 1)},
 		"stream":            {TypeBoolean()},
