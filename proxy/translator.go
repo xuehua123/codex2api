@@ -741,23 +741,24 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	promptText := extractResponsesPromptText(body)
 
 	// 3. reasoning_effort → reasoning.effort 自动转换 + 钳位
-	if re, ok := body["reasoning_effort"].(string); ok && re != "" {
-		reasoning, _ := body["reasoning"].(map[string]any)
-		if reasoning == nil {
-			reasoning = map[string]any{}
-		}
-		if _, hasEffort := reasoning["effort"]; !hasEffort {
-			reasoning["effort"] = re
-			body["reasoning"] = reasoning
+	if re, ok := body["reasoning_effort"].(string); ok {
+		if normalized := normalizeReasoningEffort(re); normalized != "" {
+			reasoning, _ := body["reasoning"].(map[string]any)
+			if reasoning == nil {
+				reasoning = map[string]any{}
+			}
+			if _, hasEffort := reasoning["effort"]; !hasEffort {
+				reasoning["effort"] = normalized
+				body["reasoning"] = reasoning
+			}
 		}
 	}
 	if reasoning, ok := body["reasoning"].(map[string]any); ok {
-		if effort, ok := reasoning["effort"].(string); ok && effort != "" {
-			switch strings.ToLower(effort) {
-			case "low", "medium", "high", "xhigh":
-				// 合法值，保留
-			default:
-				reasoning["effort"] = "high"
+		if effort, ok := reasoning["effort"].(string); ok {
+			if normalized := normalizeReasoningEffort(effort); normalized != "" {
+				reasoning["effort"] = normalized
+			} else {
+				delete(reasoning, "effort")
 			}
 		}
 	}
@@ -864,12 +865,15 @@ func PrepareCompactResponsesBody(rawBody []byte) ([]byte, string) {
 
 // normalizeReasoningEffort 将 reasoning_effort 钳位到上游支持的值
 func normalizeReasoningEffort(effort string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
 	if effort == "" {
 		return ""
 	}
-	switch strings.ToLower(effort) {
+	switch effort {
 	case "low", "medium", "high", "xhigh":
 		return effort
+	case "max":
+		return "xhigh"
 	default:
 		return "high"
 	}
@@ -1231,15 +1235,15 @@ type TokenDetails struct {
 }
 
 type UsageInfo struct {
-	PromptTokens            int           `json:"prompt_tokens"`
-	CompletionTokens        int           `json:"completion_tokens"`
-	TotalTokens             int           `json:"total_tokens"`
-	InputTokens             int           `json:"input_tokens,omitempty"`
-	OutputTokens            int           `json:"output_tokens,omitempty"`
-	ReasoningTokens         int           `json:"reasoning_tokens,omitempty"`
-	CachedTokens            int           `json:"cached_tokens,omitempty"`
-	PromptTokensDetails     *TokenDetails `json:"prompt_tokens_details,omitempty"`
-	InputTokensDetails      *TokenDetails `json:"input_tokens_details,omitempty"`
+	PromptTokens        int           `json:"prompt_tokens"`
+	CompletionTokens    int           `json:"completion_tokens"`
+	TotalTokens         int           `json:"total_tokens"`
+	InputTokens         int           `json:"input_tokens,omitempty"`
+	OutputTokens        int           `json:"output_tokens,omitempty"`
+	ReasoningTokens     int           `json:"reasoning_tokens,omitempty"`
+	CachedTokens        int           `json:"cached_tokens,omitempty"`
+	PromptTokensDetails *TokenDetails `json:"prompt_tokens_details,omitempty"`
+	InputTokensDetails  *TokenDetails `json:"input_tokens_details,omitempty"`
 }
 
 func newUsageInfo(inputTokens, outputTokens, reasoningTokens, cachedTokens int) *UsageInfo {

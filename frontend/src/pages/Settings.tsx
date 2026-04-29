@@ -1,5 +1,5 @@
 import type { ChangeEvent, ReactNode } from 'react'
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState, setAdminKey } from '../api'
 import { formatBeijingTime, getTimezone, setTimezone } from '../utils/time'
@@ -10,6 +10,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import type { HealthResponse, ModelInfo, SystemSettings } from '../types'
 import { getErrorMessage } from '../utils/error'
+import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -27,42 +28,61 @@ import { cn } from '@/lib/utils'
 
 import { ExternalLink, RefreshCw, Save, Trash2 } from 'lucide-react'
 
-// 默认模型映射
-const DEFAULT_MODEL_MAPPING: Record<string, string> = {
-  'claude-opus-4-6': 'gpt-5.4',
-  'claude-opus-4-6-20250610': 'gpt-5.4',
-  'claude-haiku-4-5-20251001': 'gpt-5.4-mini',
-  'claude-haiku-4-5': 'gpt-5.4-mini',
-  'claude-sonnet-4-6': 'gpt-5.3-codex',
-  'claude-sonnet-4-5-20250929': 'gpt-5.2',
-  'claude-opus-4-5-20251101': 'gpt-5.3-codex',
+type ModelMappingEntry = [string, string]
+
+const getDefaultModelMappingEntries = (): ModelMappingEntry[] =>
+  Object.entries(DEFAULT_CLAUDE_MODEL_MAP) as ModelMappingEntry[]
+
+const parseModelMappingEntries = (value: string): ModelMappingEntry[] => {
+  try {
+    const parsed = JSON.parse(value || '{}')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return getDefaultModelMappingEntries()
+    }
+
+    const entries = Object.entries(parsed).map(([key, model]) => [
+      key,
+      typeof model === 'string' ? model : String(model ?? ''),
+    ]) as ModelMappingEntry[]
+
+    // 如果数据库中为空，用默认值填充
+    return entries.length > 0 ? entries : getDefaultModelMappingEntries()
+  } catch {
+    return getDefaultModelMappingEntries()
+  }
+}
+
+const serializeModelMappingEntries = (entries: ModelMappingEntry[]) => {
+  const obj: Record<string, string> = {}
+  for (const [key, model] of entries) {
+    const trimmedKey = key.trim()
+    const trimmedModel = model.trim()
+    if (trimmedKey && trimmedModel) obj[trimmedKey] = trimmedModel
+  }
+  return JSON.stringify(obj)
 }
 
 // 模型映射编辑器组件
 function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const { t } = useTranslation()
+  const [mappings, setMappings] = useState<ModelMappingEntry[]>(() => parseModelMappingEntries(value))
+  const lastEmittedValueRef = useRef<string | null>(null)
 
-  let mappings: [string, string][] = []
-  try {
-    const parsed = JSON.parse(value || '{}')
-    const entries = Object.entries(parsed) as [string, string][]
-    // 如果数据库中为空，用默认值填充
-    mappings = entries.length > 0 ? entries : Object.entries(DEFAULT_MODEL_MAPPING) as [string, string][]
-  } catch {
-    mappings = Object.entries(DEFAULT_MODEL_MAPPING) as [string, string][]
-  }
+  useEffect(() => {
+    if (value === lastEmittedValueRef.current) return
+    setMappings(parseModelMappingEntries(value))
+  }, [value])
 
-  const updateMappings = (entries: [string, string][]) => {
-    const obj: Record<string, string> = {}
-    for (const [k, v] of entries) {
-      if (k.trim()) obj[k.trim()] = v.trim()
-    }
-    onChange(JSON.stringify(obj))
+  const updateMappings = (entries: ModelMappingEntry[]) => {
+    setMappings(entries)
+    const serialized = serializeModelMappingEntries(entries)
+    lastEmittedValueRef.current = serialized
+    onChange(serialized)
   }
 
   const handleChange = (index: number, field: 0 | 1, val: string) => {
     const next = [...mappings]
-    next[index] = [...next[index]] as [string, string]
+    next[index] = [...next[index]] as ModelMappingEntry
     next[index][field] = val
     updateMappings(next)
   }
@@ -77,35 +97,38 @@ function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: 
   }
 
   return (
-    <div className="space-y-2">
-      <div className="grid grid-cols-[1fr_1fr_40px] gap-2 text-xs font-semibold text-muted-foreground">
+    <div className="space-y-3">
+      <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] gap-1.5 px-1 text-xs font-semibold text-muted-foreground">
         <span>{t('settings2.anthropicModel')}</span>
         <span>{t('settings2.codexModel')}</span>
         <span />
       </div>
-      {mappings.map(([k, v], i) => (
-        <div key={i} className="grid grid-cols-[1fr_1fr_40px] gap-2 items-center">
-          <Input
-            className="font-mono text-[13px]"
-            placeholder="claude-opus-4-6"
-            value={k}
-            onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
-          />
-          <Input
-            className="font-mono text-[13px]"
-            placeholder="gpt-5.4"
-            value={v}
-            onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
-          />
-          <button
-            onClick={() => handleRemove(i)}
-            className="flex items-center justify-center size-9 rounded-lg text-muted-foreground hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
-          >
-            <Trash2 className="size-4" />
-          </button>
-        </div>
-      ))}
-      <Button variant="outline" size="sm" onClick={handleAdd}>
+      <div className="max-h-[260px] space-y-1.5 overflow-y-auto pr-1">
+        {mappings.map(([k, v], i) => (
+          <div key={i} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] items-center gap-1.5">
+            <Input
+              className="h-8 px-2 font-mono text-xs"
+              placeholder="claude-opus-4-6"
+              value={k}
+              onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
+            />
+            <Input
+              className="h-8 px-2 font-mono text-xs"
+              placeholder="gpt-5.4"
+              value={v}
+              onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
+            />
+            <button
+              type="button"
+              onClick={() => handleRemove(i)}
+              className="flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-500/10"
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </div>
+        ))}
+      </div>
+      <Button type="button" variant="outline" size="sm" onClick={handleAdd}>
         + {t('settings2.addMapping')}
       </Button>
     </div>
@@ -624,59 +647,59 @@ export default function Settings() {
             </div>
           </SettingsCard>
 
-	          <div className="grid gap-4 xl:grid-cols-2">
-	            <SettingsCard title={t('settings.modelRegistry')} description={t('settings.modelRegistryDesc')}>
-	              <div className="space-y-4">
-	                <div className="grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-3">
-	                  <StatusTile label={t('settings.modelsEnabled')}>
-	                    {enabledModelCount}
-	                  </StatusTile>
-	                  <StatusTile label={t('settings.modelsLastSynced')}>
-	                    <span className="text-xs font-semibold">{modelsLastSyncedLabel}</span>
-	                  </StatusTile>
-	                </div>
-	                <div className="flex flex-wrap items-center justify-between gap-2">
-	                  <a
-	                    href={modelsSourceLabel}
-	                    target="_blank"
-	                    rel="noreferrer"
-	                    className="inline-flex min-w-0 items-center gap-1.5 text-xs font-medium text-primary hover:underline"
-	                  >
-	                    <ExternalLink className="size-3.5 shrink-0" />
-	                    <span className="truncate">{modelsSourceLabel}</span>
-	                  </a>
-	                  <Button size="sm" variant="outline" onClick={() => void handleSyncModels()} disabled={syncingModels}>
-	                    <RefreshCw className={cn('size-4', syncingModels && 'animate-spin')} />
-	                    {syncingModels ? t('settings.modelsSyncing') : t('settings.syncUpstreamModels')}
-	                  </Button>
-	                </div>
-	                <div className="flex max-h-[170px] flex-wrap gap-2 overflow-auto rounded-lg border border-border bg-muted/20 p-3">
-	                  {visibleModelItems.map((model) => (
-	                    <div key={model.id} className="flex flex-wrap items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1.5">
-	                      <span className="font-mono text-xs font-semibold text-foreground">{model.id}</span>
-	                      <Badge variant={model.source === 'official_codex_docs' ? 'default' : 'secondary'} className="text-[11px]">
-	                        {model.source === 'official_codex_docs' ? t('settings.modelSourceOfficial') : t('settings.modelSourceBuiltin')}
-	                      </Badge>
-	                      {model.pro_only ? <Badge variant="outline" className="text-[11px]">{t('settings.modelProOnly')}</Badge> : null}
-	                      {model.category === 'image' ? <Badge variant="outline" className="text-[11px]">{t('settings.modelImage')}</Badge> : null}
-	                    </div>
-	                  ))}
-	                </div>
-	              </div>
-	            </SettingsCard>
+          <div className="grid items-start gap-4 xl:grid-cols-2">
+            <SettingsCard title={t('settings.modelRegistry')} description={t('settings.modelRegistryDesc')}>
+              <div className="space-y-4">
+                <div className="grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-3">
+                  <StatusTile label={t('settings.modelsEnabled')}>
+                    {enabledModelCount}
+                  </StatusTile>
+                  <StatusTile label={t('settings.modelsLastSynced')}>
+                    <span className="text-xs font-semibold">{modelsLastSyncedLabel}</span>
+                  </StatusTile>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <a
+                    href={modelsSourceLabel}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex min-w-0 items-center gap-1.5 text-xs font-medium text-primary hover:underline"
+                  >
+                    <ExternalLink className="size-3.5 shrink-0" />
+                    <span className="truncate">{modelsSourceLabel}</span>
+                  </a>
+                  <Button size="sm" variant="outline" onClick={() => void handleSyncModels()} disabled={syncingModels}>
+                    <RefreshCw className={cn('size-4', syncingModels && 'animate-spin')} />
+                    {syncingModels ? t('settings.modelsSyncing') : t('settings.syncUpstreamModels')}
+                  </Button>
+                </div>
+                <div className="flex max-h-[170px] flex-wrap gap-2 overflow-auto rounded-lg border border-border bg-muted/20 p-3">
+                  {visibleModelItems.map((model) => (
+                    <div key={model.id} className="flex flex-wrap items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1.5">
+                      <span className="font-mono text-xs font-semibold text-foreground">{model.id}</span>
+                      <Badge variant={model.source === 'official_codex_docs' ? 'default' : 'secondary'} className="text-[11px]">
+                        {model.source === 'official_codex_docs' ? t('settings.modelSourceOfficial') : t('settings.modelSourceBuiltin')}
+                      </Badge>
+                      {model.pro_only ? <Badge variant="outline" className="text-[11px]">{t('settings.modelProOnly')}</Badge> : null}
+                      {model.category === 'image' ? <Badge variant="outline" className="text-[11px]">{t('settings.modelImage')}</Badge> : null}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </SettingsCard>
 
-	            <SettingsCard title={t('settings2.modelMapping')} description={t('settings2.modelMappingDesc')}>
-	              <ModelMappingEditor
-	                value={settingsForm.model_mapping}
-	                onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
-	              />
-	            </SettingsCard>
-	          </div>
+            <SettingsCard title={t('settings2.modelMapping')} description={t('settings2.modelMappingDesc')}>
+              <ModelMappingEditor
+                value={settingsForm.model_mapping}
+                onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
+              />
+            </SettingsCard>
+          </div>
 
-	          <div className="grid gap-4">
-	            <SettingsCard title={t('settings.apiEndpoints')}>
-	              <div className="data-table-shell">
-	                <Table>
+          <div className="grid gap-4">
+            <SettingsCard title={t('settings.apiEndpoints')}>
+              <div className="data-table-shell">
+                <Table>
                   <TableHeader>
                     <TableRow>
                       <TableHead className="text-[12px] font-semibold">{t('settings.method')}</TableHead>
