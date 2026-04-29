@@ -119,6 +119,28 @@ func TestValidateResponsesAPIRequestRejectsUnknownInputType(t *testing.T) {
 	}
 }
 
+func TestValidateResponsesAPIRequestAllowsToolRoleInputWithoutCallID(t *testing.T) {
+	result := ValidateResponsesAPIRequest(
+		[]byte(`{"model":"gpt-5.4","input":[{"role":"tool","content":"ok"}]}`),
+		[]string{"gpt-5.4"},
+	)
+
+	if !result.Valid {
+		t.Fatalf("expected tool role without call id to be normalized later, got %#v", result.Errors)
+	}
+}
+
+func TestValidateResponsesAPIRequestAllowsSpacedToolRoleInputWithoutCallID(t *testing.T) {
+	result := ValidateResponsesAPIRequest(
+		[]byte(`{"model":"gpt-5.4","input":[{"role":" tool ","content":"ok"}]}`),
+		[]string{"gpt-5.4"},
+	)
+
+	if !result.Valid {
+		t.Fatalf("expected spaced tool role without call id to be normalized later, got %#v", result.Errors)
+	}
+}
+
 func TestSendListIncludesOptionalHasMore(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()

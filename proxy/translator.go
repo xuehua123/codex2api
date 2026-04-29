@@ -584,6 +584,125 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 	return modified
 }
 
+func normalizeResponsesCompatMessageRoles(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	out := make([]any, 0, len(inputItems))
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			out = append(out, raw)
+			continue
+		}
+
+		switch strings.TrimSpace(firstNonEmptyAnyString(itemMap["role"])) {
+		case "system":
+			normalized := cloneAnyMap(itemMap)
+			normalized["type"] = "message"
+			normalized["role"] = "developer"
+			out = append(out, normalized)
+			modified = true
+		case "tool":
+			callID := strings.TrimSpace(firstNonEmptyAnyString(itemMap["call_id"]))
+			if callID == "" {
+				callID = strings.TrimSpace(firstNonEmptyAnyString(itemMap["tool_call_id"]))
+			}
+			if callID == "" {
+				callID = strings.TrimSpace(firstNonEmptyAnyString(itemMap["id"]))
+			}
+			if callID == "" {
+				out = append(out, responsesToolFallbackMessage(itemMap))
+				modified = true
+				continue
+			}
+			out = append(out, map[string]any{
+				"type":    "function_call_output",
+				"call_id": callID,
+				"output":  responsesToolOutputText(itemMap),
+			})
+			modified = true
+		default:
+			out = append(out, raw)
+		}
+	}
+
+	if modified {
+		body["input"] = out
+	}
+	return modified
+}
+
+func responsesToolFallbackMessage(item map[string]any) map[string]any {
+	message := map[string]any{
+		"type":    "message",
+		"role":    "user",
+		"content": "",
+	}
+	if content, ok := item["content"]; ok {
+		message["content"] = content
+		return message
+	}
+	if output := responsesToolOutputText(item); output != "" {
+		message["content"] = output
+	}
+	return message
+}
+
+func cloneAnyMap(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func responsesToolOutputText(item map[string]any) string {
+	if output := firstNonEmptyAnyString(item["output"]); output != "" {
+		return output
+	}
+	if content, ok := item["content"]; ok {
+		return responsesContentText(content)
+	}
+	return ""
+}
+
+func responsesContentText(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, part := range v {
+			partMap, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch strings.TrimSpace(firstNonEmptyAnyString(partMap["type"])) {
+			case "text", "input_text", "output_text":
+				if text := firstNonEmptyAnyString(partMap["text"]); text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "")
+		}
+	}
+	if raw != nil {
+		if b, err := json.Marshal(raw); err == nil {
+			return strings.TrimSpace(string(b))
+		}
+	}
+	return ""
+}
+
 // compactionSummaryText extracts a usable summary string from a compaction
 // item's summary field. Strings pass through trimmed; non-string values are
 // JSON-serialized so the model still receives the original payload as text.
@@ -825,6 +944,8 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	}
 	// 6b. 把 input[] 中的 compaction 项翻译为 developer message（上游不识别 compaction）
 	normalizeResponsesCompactionItems(body)
+	// 6c. 兼容 chat-style Responses input：system/tool role 不是上游合法 message role。
+	normalizeResponsesCompatMessageRoles(body)
 
 	// 保存展开后的 input 原始 JSON（用于响应缓存链路）
 	var expandedInputRaw string
@@ -902,11 +1023,20 @@ func convertMessagesToInputSlice(messages []openAIMessage) []any {
 	input := make([]any, 0, len(messages))
 
 	for _, m := range messages {
-		switch m.Role {
+		switch strings.TrimSpace(m.Role) {
 		case "tool":
+			callID := strings.TrimSpace(m.ToolCallID)
+			if callID == "" {
+				input = append(input, map[string]any{
+					"type":    "message",
+					"role":    "user",
+					"content": buildContentPartsSlice("user", m.Content),
+				})
+				continue
+			}
 			input = append(input, map[string]any{
 				"type":    "function_call_output",
-				"call_id": m.ToolCallID,
+				"call_id": callID,
 				"output":  rawMessageToString(m.Content),
 			})
 

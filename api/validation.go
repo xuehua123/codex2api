@@ -590,7 +590,7 @@ func ValidateMessages() ValidationRule {
 
 		for i := 0; i < int(value.Get("#").Int()); i++ {
 			msgPath := fmt.Sprintf("%s.%d", path, i)
-			role := value.Get(fmt.Sprintf("%d.role", i)).String()
+			role := strings.TrimSpace(value.Get(fmt.Sprintf("%d.role", i)).String())
 			if role == "" {
 				return &ValidationError{
 					Field:   msgPath + ".role",

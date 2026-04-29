@@ -88,6 +88,52 @@ func TestTranslateRequest_NormalizesReasoningEffortAliases(t *testing.T) {
 	}
 }
 
+func TestTranslateRequest_TrimsMessageRoleBeforeConversion(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[
+			{"role":" system ","content":"You are precise."},
+			{"role":" user ","content":"hi"}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+	input := gjson.GetBytes(got, "input")
+	if role := input.Get("0.role").String(); role != "developer" {
+		t.Fatalf("first input role = %q, want developer; body=%s", role, got)
+	}
+	if role := input.Get("1.role").String(); role != "user" {
+		t.Fatalf("second input role = %q, want user; body=%s", role, got)
+	}
+}
+
+func TestTranslateRequest_ConvertsToolMessageWithoutCallIDToUserMessage(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[
+			{"role":"tool","content":"orphan tool output"}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+	item := gjson.GetBytes(got, "input.0")
+	if typ := item.Get("type").String(); typ != "message" {
+		t.Fatalf("input type = %q, want message; body=%s", typ, got)
+	}
+	if role := item.Get("role").String(); role != "user" {
+		t.Fatalf("input role = %q, want user; body=%s", role, got)
+	}
+	if text := item.Get("content.0.text").String(); text != "orphan tool output" {
+		t.Fatalf("input text = %q, want orphan tool output; body=%s", text, got)
+	}
+}
+
 func TestTranslateRequest_FillsMissingArrayItemsInToolSchema(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -560,6 +606,73 @@ func TestPrepareResponsesBody_ConvertsPlaintextCompactionToDeveloperMessage(t *t
 	}
 	if gotRole := expanded.Get("1.role").String(); gotRole != "developer" {
 		t.Fatalf("expanded compaction role = %q, want developer; input=%s", gotRole, expanded.Raw)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesSystemRoleInputToDeveloperMessage(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"role":"system","content":"You are precise."},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	input := gjson.GetBytes(got, "input")
+	if role := input.Get("0.role").String(); role != "developer" {
+		t.Fatalf("first input role = %q, want developer; body=%s", role, got)
+	}
+	if typ := input.Get("0.type").String(); typ != "message" {
+		t.Fatalf("first input type = %q, want message; body=%s", typ, got)
+	}
+	if role := input.Get("1.role").String(); role != "user" {
+		t.Fatalf("second input role = %q, want user; body=%s", role, got)
+	}
+}
+
+func TestPrepareResponsesBody_ConvertsToolRoleInputToFunctionCallOutput(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"role":"tool","tool_call_id":"call_abc","content":"{\"ok\":true}"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	item := gjson.GetBytes(got, "input.0")
+	if typ := item.Get("type").String(); typ != "function_call_output" {
+		t.Fatalf("input type = %q, want function_call_output; body=%s", typ, got)
+	}
+	if callID := item.Get("call_id").String(); callID != "call_abc" {
+		t.Fatalf("call_id = %q, want call_abc; body=%s", callID, got)
+	}
+	if output := item.Get("output").String(); output != `{"ok":true}` {
+		t.Fatalf("output = %q, want JSON string; body=%s", output, got)
+	}
+}
+
+func TestPrepareResponsesBody_ConvertsToolRoleInputWithoutCallIDToUserMessage(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"role":"tool","content":"orphan tool output"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	item := gjson.GetBytes(got, "input.0")
+	if typ := item.Get("type").String(); typ != "message" {
+		t.Fatalf("input type = %q, want message; body=%s", typ, got)
+	}
+	if role := item.Get("role").String(); role != "user" {
+		t.Fatalf("input role = %q, want user; body=%s", role, got)
+	}
+	if content := item.Get("content").String(); content != "orphan tool output" {
+		t.Fatalf("input content = %q, want orphan tool output; body=%s", content, got)
+	}
+	if item.Get("call_id").Exists() || item.Get("tool_call_id").Exists() || item.Get("id").Exists() {
+		t.Fatalf("fallback user message should not keep call id fields; body=%s", got)
 	}
 }
 
