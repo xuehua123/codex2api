@@ -676,6 +676,45 @@ func TestPrepareResponsesBody_ConvertsToolRoleInputWithoutCallIDToUserMessage(t 
 	}
 }
 
+func TestPrepareResponsesBody_StringifiesCachedToolCallArgumentObjects(t *testing.T) {
+	resetResponseCacheForTest()
+	t.Cleanup(resetResponseCacheForTest)
+
+	setResponseCache("resp_bad_args", []json.RawMessage{
+		json.RawMessage(`{"type":"mcp_tool_call","call_id":"call_mcp","name":"read","arguments":{"":"kept","path":"file.txt"}}`),
+	})
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"previous_response_id":"resp_bad_args",
+		"input":[
+			{"type":"mcp_tool_call_output","call_id":"call_mcp","output":"ok"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	var body struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatalf("unmarshal prepared body: %v; body=%s", err, got)
+	}
+	if len(body.Input) < 1 {
+		t.Fatalf("expected cached input item, body=%s", got)
+	}
+	args, ok := body.Input[0]["arguments"].(string)
+	if !ok {
+		t.Fatalf("cached tool arguments should be JSON string, got %T; body=%s", body.Input[0]["arguments"], got)
+	}
+	var argsObj map[string]any
+	if err := json.Unmarshal([]byte(args), &argsObj); err != nil {
+		t.Fatalf("arguments should contain JSON object text, got %q: %v", args, err)
+	}
+	if argsObj[""] != "kept" || argsObj["path"] != "file.txt" {
+		t.Fatalf("arguments content changed unexpectedly: %v", argsObj)
+	}
+}
+
 func TestPrepareCompactResponsesBody_ConvertsPlaintextCompactionToDeveloperMessage(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

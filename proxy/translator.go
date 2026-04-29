@@ -639,6 +639,74 @@ func normalizeResponsesCompatMessageRoles(body map[string]any) bool {
 	return modified
 }
 
+func normalizeResponsesToolCallArguments(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		args, exists := itemMap["arguments"]
+		if !exists || args == nil {
+			continue
+		}
+		if _, ok := args.(string); ok {
+			continue
+		}
+		itemType := strings.TrimSpace(firstNonEmptyAnyString(itemMap["type"]))
+		if !responsesArgumentsShouldBeString(itemType) && !containsEmptyJSONPropertyName(args) {
+			continue
+		}
+		encoded, err := json.Marshal(args)
+		if err != nil {
+			continue
+		}
+		itemMap["arguments"] = string(encoded)
+		modified = true
+	}
+	return modified
+}
+
+func responsesArgumentsShouldBeString(itemType string) bool {
+	switch itemType {
+	case "function_call",
+		"tool_call",
+		"mcp_tool_call",
+		"mcp_call",
+		"mcp_approval_request",
+		"custom_tool_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func containsEmptyJSONPropertyName(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if key == "" || containsEmptyJSONPropertyName(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsEmptyJSONPropertyName(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func responsesToolFallbackMessage(item map[string]any) map[string]any {
 	message := map[string]any{
 		"type":    "message",
@@ -946,6 +1014,8 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	normalizeResponsesCompactionItems(body)
 	// 6c. 兼容 chat-style Responses input：system/tool role 不是上游合法 message role。
 	normalizeResponsesCompatMessageRoles(body)
+	// 6d. 上游要求 function/MCP tool call arguments 为 JSON 字符串。
+	normalizeResponsesToolCallArguments(body)
 
 	// 保存展开后的 input 原始 JSON（用于响应缓存链路）
 	var expandedInputRaw string
