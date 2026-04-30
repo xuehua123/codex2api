@@ -10,7 +10,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { APIKeyRow, UsageLog, UsageStats } from '../types'
+import type { UsageLog, UsageStats } from '../types'
 import { formatCompactEmail } from '../lib/utils'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -25,7 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -55,28 +55,6 @@ function getStatusBadgeClassName(statusCode: number): string {
 
 const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
 
-function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
-  return apiKey.name ? `${apiKey.name} · ${apiKey.key}` : apiKey.key
-}
-
-function formatUsageAPIKeyLabel(name?: string, maskedKey?: string): string {
-  const trimmedName = name?.trim() ?? ''
-  if (trimmedName) {
-    return trimmedName
-  }
-
-  const trimmedKey = maskedKey?.trim() ?? ''
-  if (!trimmedKey) {
-    return ''
-  }
-
-  if (trimmedKey.length <= 8) {
-    return trimmedKey
-  }
-
-  return `${trimmedKey.slice(0, 4)}...${trimmedKey.slice(-4)}`
-}
-
 function isImageUsageLog(log: UsageLog): boolean {
   const endpoint = log.inbound_endpoint || log.endpoint || ''
   return endpoint.includes('/images/') || log.model?.startsWith('gpt-image-') || (log.image_count ?? 0) > 0
@@ -94,100 +72,6 @@ function imageResolution(log: UsageLog): string {
     return `${log.image_width}×${log.image_height}`
   }
   return log.image_size || ''
-}
-
-function safeNumber(value?: number | null): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
-}
-
-function formatUSD(value?: number | null, digits = 6): string {
-  return `$${safeNumber(value).toFixed(digits)}`
-}
-
-function formatCostCardValue(value?: number | null): string {
-  const amount = safeNumber(value)
-  if (amount >= 100) {
-    return `$${amount.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
-  }
-  if (amount >= 1) {
-    return `$${amount.toFixed(2)}`
-  }
-  if (amount >= 0.01) {
-    return `$${amount.toFixed(4)}`
-  }
-  return `$${amount.toFixed(6)}`
-}
-
-function formatTokenPricePerMillion(value?: number | null): string {
-  return `$${safeNumber(value).toFixed(4)} / 1M Token`
-}
-
-function UsageCostCell({ log }: { log: UsageLog }) {
-  const { t } = useTranslation()
-  const accountBilled = safeNumber(log.account_billed)
-  const userBilled = safeNumber(log.user_billed)
-  const totalCost = safeNumber(log.total_cost)
-  const displayCost = userBilled > 0 ? userBilled : accountBilled
-  const hasCostContext = log.status_code < 400 && (
-    accountBilled > 0 ||
-    userBilled > 0 ||
-    totalCost > 0 ||
-    log.input_tokens > 0 ||
-    log.output_tokens > 0 ||
-    log.cached_tokens > 0
-  )
-
-  if (!hasCostContext) {
-    return <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
-  }
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          className="group inline-flex cursor-help items-center gap-1.5 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <span className="text-[13px] font-semibold leading-none tabular-nums text-emerald-600 antialiased dark:text-emerald-400">
-            {formatUSD(displayCost)}
-          </span>
-          <Info className="size-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-blue-500" />
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="right" sideOffset={8} className="w-72 max-w-none whitespace-nowrap rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-50 shadow-xl">
-        <div className="space-y-1.5">
-          <div className="mb-1 text-xs font-semibold text-slate-300">{t('usage.costDetails')}</div>
-          {log.input_cost > 0 && (
-            <CostTooltipRow label={t('usage.inputCost')} value={formatUSD(log.input_cost)} />
-          )}
-          {log.output_cost > 0 && (
-            <CostTooltipRow label={t('usage.outputCost')} value={formatUSD(log.output_cost)} />
-          )}
-          {log.cached_tokens > 0 && (
-            <CostTooltipRow label={t('usage.cacheReadCost')} value={formatUSD(log.cache_read_cost)} />
-          )}
-          {log.input_tokens > 0 && (
-            <CostTooltipRow label={t('usage.inputUnitPrice')} value={formatTokenPricePerMillion(log.input_price_per_mtoken)} valueClassName="text-sky-300" />
-          )}
-          {log.output_tokens > 0 && (
-            <CostTooltipRow label={t('usage.outputUnitPrice')} value={formatTokenPricePerMillion(log.output_price_per_mtoken)} valueClassName="text-violet-300" />
-          )}
-          {log.cached_tokens > 0 && log.cache_read_price_per_mtoken > 0 && (
-            <CostTooltipRow label={t('usage.cacheReadUnitPrice')} value={formatTokenPricePerMillion(log.cache_read_price_per_mtoken)} valueClassName="text-cyan-300" />
-          )}
-        </div>
-      </TooltipContent>
-    </Tooltip>
-  )
-}
-
-function CostTooltipRow({ label, value, valueClassName = 'font-medium text-white' }: { label: string; value: string; valueClassName?: string }) {
-  return (
-    <div className="flex items-center justify-between gap-6">
-      <span className="text-slate-400">{label}</span>
-      <span className={`font-geist-mono tabular-nums ${valueClassName}`}>{value}</span>
-    </div>
-  )
 }
 
 function ImageUsageBadge({ log }: { log: UsageLog }) {
@@ -252,12 +136,9 @@ export default function Usage() {
   const [searchEmail, setSearchEmail] = useState('')
   const [filterModel, setFilterModel] = useState('')
   const [filterEndpoint, setFilterEndpoint] = useState('')
-  const [filterApiKeyId, setFilterApiKeyId] = useState('')
   const [filterFast, setFilterFast] = useState('')
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
-  const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
-  const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = false
   const pageSizeOptions = [10, 20, 50, 100]
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
@@ -285,17 +166,6 @@ export default function Usage() {
     load: loadStats,
   })
 
-  const loadAPIKeys = useCallback(async () => {
-    try {
-      const response = await api.getAPIKeys()
-      setAPIKeys(response.keys ?? [])
-      setAPIKeyLoadFailed(false)
-    } catch {
-      setAPIKeys([])
-      setAPIKeyLoadFailed(true)
-    }
-  }, [])
-
   // 服务端分页加载日志
   const loadLogs = useCallback(async () => {
     setLogsLoading(true)
@@ -306,7 +176,6 @@ export default function Usage() {
         email: searchEmail || undefined,
         model: filterModel || undefined,
         endpoint: filterEndpoint || undefined,
-        apiKeyId: filterApiKeyId || undefined,
         fast: filterFast || undefined,
         stream: filterStream || undefined,
       })
@@ -317,16 +186,12 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [timeRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
     void loadLogs()
   }, [loadLogs])
-
-  useEffect(() => {
-    void loadAPIKeys()
-  }, [loadAPIKeys])
 
   useEffect(() => {
     let active = true
@@ -369,28 +234,20 @@ export default function Usage() {
   const totalTokens = stats?.total_tokens ?? 0
   const totalPromptTokens = stats?.total_prompt_tokens ?? 0
   const totalCompletionTokens = stats?.total_completion_tokens ?? 0
-  const totalAccountBilled = stats?.total_account_billed ?? 0
-  const totalUserBilled = stats?.total_user_billed ?? 0
   const todayRequests = stats?.today_requests ?? 0
-  const todayUserBilled = stats?.today_user_billed ?? 0
   const rpm = stats?.rpm ?? 0
   const tpm = stats?.tpm ?? 0
   const errorRate = stats?.error_rate ?? 0
   const avgDurationMs = stats?.avg_duration_ms ?? 0
   const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
-  const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
-  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
-  const apiKeyOptions = [
-    { label: t('usage.allApiKeys'), value: '' },
-    ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
-  ]
+  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterStream || filterFast)
 
   return (
     <StateShell
       variant="page"
       loading={loading}
       error={error}
-      onRetry={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
+      onRetry={() => { void reload(); void loadLogs() }}
       loadingTitle={t('usage.loadingTitle')}
       loadingDescription={t('usage.loadingDesc')}
       errorTitle={t('usage.errorTitle')}
@@ -399,11 +256,11 @@ export default function Usage() {
         <PageHeader
           title={t('usage.title')}
           description={t('usage.description')}
-          onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
+          onRefresh={() => { void reload(); void loadLogs() }}
         />
 
-        {/* Top stats: 3 columns */}
-        <div className="grid grid-cols-3 gap-3 mb-3 max-lg:grid-cols-2 max-sm:grid-cols-1">
+        {/* Top stats */}
+        <div className="grid grid-cols-2 gap-3 mb-3 max-sm:grid-cols-1">
           <Card className="py-0">
             <CardContent className="flex flex-col gap-2 p-4">
               <div className="flex items-center justify-between gap-3">
@@ -440,23 +297,6 @@ export default function Usage() {
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-2 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalCostCard')}</span>
-                <div className="size-10 flex items-center justify-center rounded-xl bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300">
-                  <CircleDollarSign className="size-[18px]" />
-                </div>
-              </div>
-              <div className="text-[26px] font-bold leading-none tabular-nums text-emerald-600 dark:text-emerald-400">
-                {formatCostCardValue(totalUserBilled)}
-              </div>
-              <div className="text-[12px] text-muted-foreground leading-relaxed">
-                <span>{t('usage.todayCost')}: {formatCostCardValue(todayUserBilled)}</span>
-                <span className="ml-2">{t('usage.accountCost')}: {formatCostCardValue(totalAccountBilled)}</span>
-              </div>
-            </CardContent>
-          </Card>
         </div>
 
         {/* Bottom stats: 3 columns */}
@@ -607,17 +447,6 @@ export default function Usage() {
                 ]}
               />
 
-              {showAPIKeyFilter && (
-                <Select
-                  className="w-60"
-                  compact
-                  value={filterApiKeyId}
-                  onValueChange={(v) => { setFilterApiKeyId(v); setPage(1) }}
-                  placeholder={t('usage.allApiKeys')}
-                  options={apiKeyOptions}
-                />
-              )}
-
               {/* 类型下拉 */}
               <Select
                 className="w-32"
@@ -654,7 +483,6 @@ export default function Usage() {
                   onClick={() => {
                     setSearchInput(''); setSearchEmail('')
                     setFilterModel(''); setFilterEndpoint('')
-                    setFilterApiKeyId('')
                     setFilterStream(''); setFilterFast('')
                     setPage(1)
                   }}
@@ -680,11 +508,9 @@ export default function Usage() {
                       <TableHead className={usageTableHeadClass}>{t('usage.tableStatus')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableModel')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableAccount')}</TableHead>
-                      <TableHead className={usageTableHeadClass}>{t('usage.tableApiKey')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableEndpoint')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableToken')}</TableHead>
-                      <TableHead className={usageTableHeadClass}>{t('usage.tableCost')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableCached')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableFirstToken')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableDuration')}</TableHead>
@@ -744,11 +570,6 @@ export default function Usage() {
                         <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
                           {formatCompactEmail(log.account_email)}
                         </TableCell>
-                        <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
-                          <span className="block max-w-[180px] truncate whitespace-nowrap" title={formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}>
-                            {formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}
-                          </span>
-                        </TableCell>
                         <TableCell>
                           <div className={`${usageTableMonoClass} leading-relaxed`}>
                             <span className="text-muted-foreground">
@@ -788,9 +609,6 @@ export default function Usage() {
                           ) : (
                             <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}
-                        </TableCell>
-                        <TableCell>
-                          <UsageCostCell log={log} />
                         </TableCell>
                         <TableCell>
                           {log.cached_tokens > 0 ? (
