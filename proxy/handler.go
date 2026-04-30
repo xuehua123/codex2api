@@ -49,6 +49,30 @@ func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int
 	return h.store.NextForSessionWithFilter(sessionID, apiKeyID, exclude, filter)
 }
 
+func (h *Handler) shouldUseWebsocketForHTTP() bool {
+	if h == nil || h.cfg == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(h.cfg.CodexUpstreamTransport)) {
+	case "ws":
+		return true
+	case "http", "auto":
+		return false
+	default:
+		return h.cfg.UseWebsocket
+	}
+}
+
+func (h *Handler) resolveProxyForAttempt(account *auth.Account, stickyProxyURL string) string {
+	if proxyURL := strings.TrimSpace(stickyProxyURL); proxyURL != "" {
+		return proxyURL
+	}
+	if h == nil || h.store == nil {
+		return ""
+	}
+	return h.store.ResolveProxyForAccount(account)
+}
+
 type usageLimitDetails struct {
 	message         string
 	planType        string
@@ -527,11 +551,28 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 }
 
 // authMiddleware API Key 鉴权中间件（增强版，带安全日志）
+//
+// 安全策略（fail-closed）：
+//   - 默认情况下，未配置任何 API Key 时直接拒绝请求（503），避免裸奔账号池。
+//   - 仅当显式设置 CODEX_ALLOW_ANONYMOUS=true 时才在无密钥情况下放行（兼容内网/测试）。
 func (h *Handler) authMiddleware() gin.HandlerFunc {
+	allowAnonymous := h.cfg != nil && h.cfg.AllowAnonymousV1
 	return func(c *gin.Context) {
-		// 如果没有配置任何密钥，跳过鉴权
+		// 如果没有配置任何密钥
 		if !h.hasAnyKeys() {
-			c.Next()
+			if allowAnonymous {
+				// 显式允许匿名访问（旧行为，仅在 CODEX_ALLOW_ANONYMOUS=true 时启用）
+				c.Next()
+				return
+			}
+			// fail-closed：未配置 API Key 即拒绝，避免账号池被未授权调用
+			security.SecurityAuditLog("V1_BLOCKED_NO_KEYS", fmt.Sprintf("path=%s ip=%s", c.Request.URL.Path, c.ClientIP()))
+			api.SendError(c, api.NewAPIError(
+				api.ErrCodeServiceUnavailable,
+				"Service is not configured: no API key has been created yet. Please add at least one API key in the admin dashboard, or set CODEX_ALLOW_ANONYMOUS=true to disable this check.",
+				api.ErrorTypeServer,
+			))
+			c.Abort()
 			return
 		}
 
@@ -651,6 +692,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendMissingFieldError(c, "model")
 		return
 	}
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses", model) {
+		return
+	}
 
 	rawBody = normalizeServiceTierField(rawBody)
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
@@ -697,11 +741,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
-		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		useWebsocket := h.shouldUseWebsocketForHTTP()
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -718,7 +760,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -753,6 +796,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses",
@@ -906,11 +950,12 @@ func (h *Handler) Responses(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			lastErr = readErr
 			if lastErr == nil {
 				lastErr = errors.New(outcome.failureMessage)
@@ -975,8 +1020,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		resp.Body.Close()
 		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
@@ -1035,6 +1081,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		sendImageOnlyModelError(c, model)
 		return
 	}
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses/compact", model) {
+		return
+	}
 
 	rawBody = normalizeServiceTierField(rawBody)
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
@@ -1082,10 +1131,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		apiKey = strings.TrimSpace(apiKey)
@@ -1095,7 +1142,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -1128,6 +1176,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			excludeAccounts[account.ID()] = true
 
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, model, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", model, errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses/compact",
@@ -1244,6 +1293,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		})
 		return
 	}
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/chat/completions", model) {
+		return
+	}
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -1290,11 +1342,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
-		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		useWebsocket := h.shouldUseWebsocketForHTTP()
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -1311,7 +1361,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -1346,6 +1397,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", model, errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/chat/completions",
@@ -1493,11 +1545,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			lastErr = readErr
 			if lastErr == nil {
 				lastErr = errors.New(outcome.failureMessage)
@@ -1561,8 +1614,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		resp.Body.Close()
 		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}

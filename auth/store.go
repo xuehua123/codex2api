@@ -17,6 +17,7 @@ import (
 
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/codex2api/security/promptfilter"
 )
 
 // AccountStatus 账号状态
@@ -96,6 +97,7 @@ type Account struct {
 	Disabled       int32 // 原子标志，1 = 立即不可调度（401 时瞬间置位，无需等锁）
 	AddedAt        int64 // 加入号池的时间（UnixNano），用于过期清理
 	Locked         int32 // 原子标志，1 = 锁定，自动清理跳过此账号
+	DispatchPaused int32 // 原子标志，1 = 禁用调度选择，不影响刷新/探针/清理
 
 	// per-account 调度配置（nil = 跟随默认）
 	ScoreBiasOverride       *int64
@@ -558,6 +560,9 @@ func (a *Account) schedulerSnapshot(baseLimit int64) (AccountHealthTier, float64
 func (a *Account) IsAvailable() bool {
 	// 原子标志优先：401 时瞬间置位，无需等锁即可拦截并发请求
 	if atomic.LoadInt32(&a.Disabled) != 0 {
+		return false
+	}
+	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
 		return false
 	}
 
@@ -1024,6 +1029,7 @@ type Store struct {
 	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
 	backgroundRefreshWakeCh   chan struct{}
 	stopCh                    chan struct{}
+	stopOnce                  sync.Once
 	wg                        sync.WaitGroup
 
 	// 代理池
@@ -1040,6 +1046,7 @@ type Store struct {
 
 	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping         atomic.Value // 模型映射 JSON 字符串
+	promptFilterConfig   atomic.Value // promptfilter.Config
 	sessionMu            sync.RWMutex
 	sessionBindings      map[string]sessionAffinity
 }
@@ -1050,7 +1057,21 @@ type sessionAffinity struct {
 	expiresAt time.Time
 }
 
-const sessionAffinityTTL = 30 * time.Minute
+const defaultSessionAffinityTTL = time.Hour
+
+func sessionAffinityTTL() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CODEX_SESSION_AFFINITY_TTL"))
+	if raw == "" {
+		return defaultSessionAffinityTTL
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultSessionAffinityTTL
+}
 
 func fastSchedulerEnabledFromEnv() bool {
 	for _, key := range []string{"FAST_SCHEDULER_ENABLED", "CODEX_FAST_SCHEDULER"} {
@@ -1112,6 +1133,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
 	}
+	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
@@ -1483,6 +1505,9 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		if row.Locked {
 			atomic.StoreInt32(&account.Locked, 1)
 		}
+		if !row.Enabled {
+			atomic.StoreInt32(&account.DispatchPaused, 1)
+		}
 		if row.Status == "error" {
 			account.Status = StatusError
 			account.ErrorMsg = row.ErrorMessage
@@ -1632,7 +1657,9 @@ func (s *Store) StartBackgroundRefresh() {
 
 // Stop 停止后台刷新
 func (s *Store) Stop() {
-	close(s.stopCh)
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 	s.wg.Wait()
 }
 
@@ -1760,7 +1787,7 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 	s.sessionBindings[key] = sessionAffinity{
 		accountID: account.DBID,
 		proxyURL:  strings.TrimSpace(proxyURL),
-		expiresAt: time.Now().Add(sessionAffinityTTL),
+		expiresAt: time.Now().Add(sessionAffinityTTL()),
 	}
 	s.sessionMu.Unlock()
 }
@@ -2001,6 +2028,38 @@ func (s *Store) GetModelMapping() string {
 	return "{}"
 }
 
+func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfilter.Config {
+	cfg := promptfilter.DefaultConfig()
+	if settings == nil {
+		return cfg
+	}
+	cfg.Enabled = settings.PromptFilterEnabled
+	cfg.Mode = settings.PromptFilterMode
+	cfg.Threshold = settings.PromptFilterThreshold
+	cfg.StrictThreshold = settings.PromptFilterStrictThreshold
+	cfg.LogMatches = settings.PromptFilterLogMatches
+	cfg.MaxTextLength = settings.PromptFilterMaxTextLength
+	cfg.SensitiveWords = settings.PromptFilterSensitiveWords
+	if patterns, err := promptfilter.ParseCustomPatterns(settings.PromptFilterCustomPatterns); err == nil {
+		cfg.CustomPatterns = patterns
+	}
+	if disabled, err := promptfilter.ParseDisabledPatterns(settings.PromptFilterDisabledPatterns); err == nil {
+		cfg.DisabledPatterns = disabled
+	}
+	return promptfilter.NormalizeConfig(cfg)
+}
+
+func (s *Store) SetPromptFilterConfig(cfg promptfilter.Config) {
+	s.promptFilterConfig.Store(promptfilter.NormalizeConfig(cfg))
+}
+
+func (s *Store) GetPromptFilterConfig() promptfilter.Config {
+	if v, ok := s.promptFilterConfig.Load().(promptfilter.Config); ok {
+		return promptfilter.NormalizeConfig(v)
+	}
+	return promptfilter.DefaultConfig()
+}
+
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）
 func (s *Store) AddAccount(acc *Account) {
 	if acc == nil {
@@ -2074,6 +2133,20 @@ func (s *Store) ApplyAccountAllowedAPIKeys(dbID int64, allowedAPIKeyIDs []int64)
 	acc.mu.Lock()
 	acc.setAllowedAPIKeyIDsLocked(allowedAPIKeyIDs)
 	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
+func (s *Store) ApplyAccountEnabled(dbID int64, enabled bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	if enabled {
+		atomic.StoreInt32(&acc.DispatchPaused, 0)
+	} else {
+		atomic.StoreInt32(&acc.DispatchPaused, 1)
+	}
 	s.fastSchedulerUpdate(acc)
 	return true
 }

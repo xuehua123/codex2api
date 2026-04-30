@@ -605,6 +605,9 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/generations", imageModel) {
+		return
+	}
 	tool := []byte(`{"type":"image_generation","action":"generate","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -701,6 +704,9 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 
 	style := strings.TrimSpace(c.PostForm("style"))
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+		return
+	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
@@ -788,6 +794,9 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+		return
+	}
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -878,17 +887,14 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
 		deviceCfg := h.deviceCfg
 		if deviceCfg == nil {
 			deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 		}
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), h.cfg != nil && h.cfg.UseWebsocket)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), h.shouldUseWebsocketForHTTP())
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
@@ -915,6 +921,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			resp.Body.Close()
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
+			logUpstreamError(inboundEndpoint, resp.StatusCode, requestModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, inboundEndpoint, requestModel, errBody)
 			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode

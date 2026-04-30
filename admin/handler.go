@@ -26,6 +26,7 @@ import (
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -99,6 +100,11 @@ func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/p/img/:id", h.GetSignedImageAssetFile)
 
+	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
+	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
+	r.GET("/api/admin/bootstrap-status", h.GetBootstrapStatus)
+	r.POST("/api/admin/bootstrap", h.PostBootstrap)
+
 	api := r.Group("/api/admin")
 	api.Use(h.adminAuthMiddleware())
 	api.GET("/stats", h.GetStats)
@@ -109,6 +115,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
+	api.POST("/accounts/:id/enable", h.ToggleAccountEnabled)
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
 	api.POST("/accounts/:id/reset-status", h.ResetAccountStatus)
 	api.GET("/accounts/:id/test", h.TestConnection)
@@ -133,6 +140,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
+	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
+	api.POST("/prompt-filter/test", h.TestPromptFilter)
+	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)
 	api.GET("/image-prompts", h.ListImagePromptTemplates)
@@ -162,12 +173,22 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 }
 
 // adminAuthMiddleware 管理接口鉴权中间件（增强版，增加安全审计日志）
+//
+// 安全策略（fail-closed）：
+//   - 未配置 ADMIN_SECRET 时一律拒绝（503），防止 /api/admin/* 裸奔。
+//   - 用户应通过前端「首次初始化」页面（无鉴权的 /api/admin/bootstrap 端点）
+//     设置初始密钥，或者在 .env 中显式设置 ADMIN_SECRET 后重启。
 func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		adminSecret, source := h.resolveAdminSecret(c.Request.Context())
 		if adminSecret == "" {
-			// 未配置管理密钥，跳过鉴权
-			c.Next()
+			// fail-closed：拒绝并提示用户配置 ADMIN_SECRET
+			security.SecurityAuditLog("ADMIN_BLOCKED_NO_SECRET", fmt.Sprintf("path=%s ip=%s", c.Request.URL.Path, c.ClientIP()))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "管理接口未初始化：ADMIN_SECRET 尚未配置。请在浏览器访问 /admin/ 完成首次初始化，或在 .env 中设置 ADMIN_SECRET 后重启。",
+				"code":  "bootstrap_required",
+			})
+			c.Abort()
 			return
 		}
 
@@ -294,13 +315,21 @@ type accountResponse struct {
 	LastRateLimitedAt        string                     `json:"last_rate_limited_at,omitempty"`
 	LastTimeoutAt            string                     `json:"last_timeout_at,omitempty"`
 	LastServerErrorAt        string                     `json:"last_server_error_at,omitempty"`
+	Enabled                  bool                       `json:"enabled"`
 	Locked                   bool                       `json:"locked"`
 	AllowedAPIKeyIDs         []int64                    `json:"allowed_api_key_ids"`
+	// 图片配额信息
+	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
+	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
+	TodayUsedCount      *int   `json:"today_used_count,omitempty"`
+	ImageQuotaResetAt   string `json:"image_quota_reset_at,omitempty"`
 }
 
 type accountUsageWindow struct {
-	Requests int64 `json:"requests"`
-	Tokens   int64 `json:"tokens"`
+	Requests      int64   `json:"requests"`
+	Tokens        int64   `json:"tokens"`
+	AccountBilled float64 `json:"account_billed"`
+	UserBilled    float64 `json:"user_billed"`
 }
 
 type schedulerBreakdownResponse struct {
@@ -349,6 +378,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Status:                   row.Status,
 			ATOnly:                   row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			ProxyURL:                 row.ProxyURL,
+			Enabled:                  row.Enabled,
 			Locked:                   row.Locked,
 			AllowedAPIKeyIDs:         row.GetCredentialInt64Slice("allowed_api_key_ids"),
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),
@@ -423,10 +453,20 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			resp.ErrorRequests = rc.ErrorCount
 		}
 		if usage, ok := usage5h[row.ID]; ok {
-			resp.Usage5hDetail = &accountUsageWindow{Requests: usage.Requests, Tokens: usage.Tokens}
+			resp.Usage5hDetail = &accountUsageWindow{
+				Requests:      usage.Requests,
+				Tokens:        usage.Tokens,
+				AccountBilled: usage.AccountBilled,
+				UserBilled:    usage.UserBilled,
+			}
 		}
 		if usage, ok := usage7d[row.ID]; ok {
-			resp.Usage7dDetail = &accountUsageWindow{Requests: usage.Requests, Tokens: usage.Tokens}
+			resp.Usage7dDetail = &accountUsageWindow{
+				Requests:      usage.Requests,
+				Tokens:        usage.Tokens,
+				AccountBilled: usage.AccountBilled,
+				UserBilled:    usage.UserBilled,
+			}
 		}
 		accounts = append(accounts, resp)
 	}
@@ -1651,6 +1691,44 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "账号刷新成功")
 }
 
+// ToggleAccountEnabled 切换账号是否参与调度选择
+func (h *Handler) ToggleAccountEnabled(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req struct {
+		Enabled *bool `json:"enabled" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Enabled == nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+
+	if err := h.db.SetAccountEnabled(ctx, id, *req.Enabled); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "更新启用状态失败: "+err.Error())
+		return
+	}
+
+	h.store.ApplyAccountEnabled(id, *req.Enabled)
+
+	if *req.Enabled {
+		writeMessage(c, http.StatusOK, "账号已启用")
+	} else {
+		writeMessage(c, http.StatusOK, "账号已禁用")
+	}
+}
+
 // ToggleAccountLock 切换账号的锁定状态
 func (h *Handler) ToggleAccountLock(c *gin.Context) {
 	idStr := c.Param("id")
@@ -2073,6 +2151,15 @@ type settingsResponse struct {
 	ModelMapping                     string `json:"model_mapping"`
 	ResinURL                         string `json:"resin_url"`
 	ResinPlatformName                string `json:"resin_platform_name"`
+	PromptFilterEnabled              bool   `json:"prompt_filter_enabled"`
+	PromptFilterMode                 string `json:"prompt_filter_mode"`
+	PromptFilterThreshold            int    `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold      int    `json:"prompt_filter_strict_threshold"`
+	PromptFilterLogMatches           bool   `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength        int    `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords       string `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns       string `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns     string `json:"prompt_filter_disabled_patterns"`
 }
 
 type updateSettingsReq struct {
@@ -2099,6 +2186,15 @@ type updateSettingsReq struct {
 	ModelMapping                     *string `json:"model_mapping"`
 	ResinURL                         *string `json:"resin_url"`
 	ResinPlatformName                *string `json:"resin_platform_name"`
+	PromptFilterEnabled              *bool   `json:"prompt_filter_enabled"`
+	PromptFilterMode                 *string `json:"prompt_filter_mode"`
+	PromptFilterThreshold            *int    `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold      *int    `json:"prompt_filter_strict_threshold"`
+	PromptFilterLogMatches           *bool   `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength        *int    `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords       *string `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns       *string `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns     *string `json:"prompt_filter_disabled_patterns"`
 }
 
 // GetSettings 获取当前系统设置
@@ -2116,6 +2212,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
 	}
+	promptFilterCfg := h.store.GetPromptFilterConfig()
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
@@ -2145,6 +2242,15 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ModelMapping:                     h.store.GetModelMapping(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
+		PromptFilterEnabled:              promptFilterCfg.Enabled,
+		PromptFilterMode:                 promptFilterCfg.Mode,
+		PromptFilterThreshold:            promptFilterCfg.Threshold,
+		PromptFilterStrictThreshold:      promptFilterCfg.StrictThreshold,
+		PromptFilterLogMatches:           promptFilterCfg.LogMatches,
+		PromptFilterMaxTextLength:        promptFilterCfg.MaxTextLength,
+		PromptFilterSensitiveWords:       promptFilterCfg.SensitiveWords,
+		PromptFilterCustomPatterns:       promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
+		PromptFilterDisabledPatterns:     promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 	})
 }
 
@@ -2346,6 +2452,64 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: model_mapping")
 	}
 
+	promptFilterCfg := h.store.GetPromptFilterConfig()
+	promptFilterChanged := false
+	if req.PromptFilterEnabled != nil {
+		promptFilterCfg.Enabled = *req.PromptFilterEnabled
+		promptFilterChanged = true
+	}
+	if req.PromptFilterMode != nil {
+		promptFilterCfg.Mode = *req.PromptFilterMode
+		promptFilterChanged = true
+	}
+	if req.PromptFilterThreshold != nil {
+		promptFilterCfg.Threshold = *req.PromptFilterThreshold
+		promptFilterChanged = true
+	}
+	if req.PromptFilterStrictThreshold != nil {
+		promptFilterCfg.StrictThreshold = *req.PromptFilterStrictThreshold
+		promptFilterChanged = true
+	}
+	if req.PromptFilterLogMatches != nil {
+		promptFilterCfg.LogMatches = *req.PromptFilterLogMatches
+		promptFilterChanged = true
+	}
+	if req.PromptFilterMaxTextLength != nil {
+		promptFilterCfg.MaxTextLength = *req.PromptFilterMaxTextLength
+		promptFilterChanged = true
+	}
+	if req.PromptFilterSensitiveWords != nil {
+		promptFilterCfg.SensitiveWords = *req.PromptFilterSensitiveWords
+		promptFilterChanged = true
+	}
+	if req.PromptFilterCustomPatterns != nil {
+		patterns, err := promptfilter.ParseCustomPatterns(*req.PromptFilterCustomPatterns)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "Prompt 检查自定义规则 JSON 无效: "+err.Error())
+			return
+		}
+		promptFilterCfg.CustomPatterns = patterns
+		promptFilterChanged = true
+	}
+	if req.PromptFilterDisabledPatterns != nil {
+		disabled, err := promptfilter.ParseDisabledPatterns(*req.PromptFilterDisabledPatterns)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "Prompt 检查禁用规则 JSON 无效: "+err.Error())
+			return
+		}
+		promptFilterCfg.DisabledPatterns = disabled
+		promptFilterChanged = true
+	}
+	if promptFilterChanged {
+		promptFilterCfg = promptfilter.NormalizeConfig(promptFilterCfg)
+		if _, err := promptfilter.NewEngine(promptFilterCfg); err != nil {
+			writeError(c, http.StatusBadRequest, "Prompt 检查规则无效: "+err.Error())
+			return
+		}
+		h.store.SetPromptFilterConfig(promptFilterCfg)
+		log.Printf("设置已更新: prompt_filter enabled=%t mode=%s threshold=%d", promptFilterCfg.Enabled, promptFilterCfg.Mode, promptFilterCfg.Threshold)
+	}
+
 	// Resin 粘性代理池配置
 	resinURL := ""
 	resinPlatformName := ""
@@ -2400,6 +2564,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ModelMapping:                     h.store.GetModelMapping(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
+		PromptFilterEnabled:              promptFilterCfg.Enabled,
+		PromptFilterMode:                 promptFilterCfg.Mode,
+		PromptFilterThreshold:            promptFilterCfg.Threshold,
+		PromptFilterStrictThreshold:      promptFilterCfg.StrictThreshold,
+		PromptFilterLogMatches:           promptFilterCfg.LogMatches,
+		PromptFilterMaxTextLength:        promptFilterCfg.MaxTextLength,
+		PromptFilterSensitiveWords:       promptFilterCfg.SensitiveWords,
+		PromptFilterCustomPatterns:       promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
+		PromptFilterDisabledPatterns:     promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -2448,6 +2621,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ModelMapping:                     h.store.GetModelMapping(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
+		PromptFilterEnabled:              promptFilterCfg.Enabled,
+		PromptFilterMode:                 promptFilterCfg.Mode,
+		PromptFilterThreshold:            promptFilterCfg.Threshold,
+		PromptFilterStrictThreshold:      promptFilterCfg.StrictThreshold,
+		PromptFilterLogMatches:           promptFilterCfg.LogMatches,
+		PromptFilterMaxTextLength:        promptFilterCfg.MaxTextLength,
+		PromptFilterSensitiveWords:       promptFilterCfg.SensitiveWords,
+		PromptFilterCustomPatterns:       promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
+		PromptFilterDisabledPatterns:     promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 	})
 }
 

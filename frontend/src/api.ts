@@ -23,6 +23,9 @@ import type {
   OAuthExchangeResponse,
   OAuthURLResponse,
   OpsOverviewResponse,
+  PromptFilterLogsResponse,
+  PromptFilterRulesResponse,
+  PromptFilterTestResponse,
   StatsResponse,
   CPAExportEntry,
   SystemSettings,
@@ -140,6 +143,8 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
+  toggleAccountEnabled: (id: number, enabled: boolean) =>
+    request<MessageResponse>(`/accounts/${id}/enable`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   toggleAccountLock: (id: number, locked: boolean) =>
     request<MessageResponse>(`/accounts/${id}/lock`, { method: 'POST', body: JSON.stringify({ locked }) }),
   resetAccountStatus: (id: number) =>
@@ -244,6 +249,29 @@ export const api = {
   getSettings: () => request<SystemSettings>('/settings'),
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
+  getPromptFilterLogs: (params: number | { page?: number; pageSize?: number; limit?: number; source?: string; action?: string; endpoint?: string; model?: string; apiKeyId?: string; q?: string } = 100) => {
+    const search = new URLSearchParams()
+    if (typeof params === 'number') {
+      search.set('limit', String(params))
+    } else {
+      if (params.page) search.set('page', String(params.page))
+      if (params.pageSize) search.set('page_size', String(params.pageSize))
+      if (params.limit) search.set('limit', String(params.limit))
+      if (params.source) search.set('source', params.source)
+      if (params.action) search.set('action', params.action)
+      if (params.endpoint) search.set('endpoint', params.endpoint)
+      if (params.model) search.set('model', params.model)
+      if (params.apiKeyId) search.set('api_key_id', params.apiKeyId)
+      if (params.q) search.set('q', params.q)
+    }
+    return request<PromptFilterLogsResponse>(`/prompt-filter/logs?${search.toString()}`)
+  },
+  clearPromptFilterLogs: () =>
+    request<MessageResponse>('/prompt-filter/logs', { method: 'DELETE' }),
+  testPromptFilter: (data: { text: string; endpoint?: string; model?: string }) =>
+    request<PromptFilterTestResponse>('/prompt-filter/test', { method: 'POST', body: JSON.stringify(data) }),
+  getPromptFilterRules: () =>
+    request<PromptFilterRulesResponse>('/prompt-filter/rules'),
   getModels: () => request<ModelsResponse>('/models'),
   syncModels: () => request<ModelSyncResponse>('/models/sync', { method: 'POST' }),
   batchTestAccounts: () =>
