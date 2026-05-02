@@ -75,33 +75,36 @@ func TestValidateResponsesAPIRequestAllowsCompactionInputType(t *testing.T) {
 	}
 }
 
-func TestValidateChatCompletionsRequestAllowsLargeMaxTokens(t *testing.T) {
-	result := ValidateChatCompletionsRequest(
-		[]byte(`{
-			"model":"gpt-5.4",
-			"messages":[{"role":"user","content":"hello"}],
-			"max_tokens":1000000
-		}`),
-		[]string{"gpt-5.4"},
-	)
-
-	if !result.Valid {
-		t.Fatalf("expected large max_tokens to be valid, got %#v", result.Errors)
+func TestValidateResponsesAPIRequestUsesModelAwareMaxOutputTokens(t *testing.T) {
+	tests := []struct {
+		name  string
+		body  []byte
+		valid bool
+	}{
+		{
+			name:  "gpt-5.5 allows 128k output tokens",
+			body:  []byte(`{"model":"gpt-5.5","input":"hello","max_output_tokens":128000}`),
+			valid: true,
+		},
+		{
+			name:  "gpt-5.5 rejects above 128k output tokens",
+			body:  []byte(`{"model":"gpt-5.5","input":"hello","max_output_tokens":128001}`),
+			valid: false,
+		},
+		{
+			name:  "other models keep 64k output cap",
+			body:  []byte(`{"model":"gpt-5.4","input":"hello","max_output_tokens":65537}`),
+			valid: false,
+		},
 	}
-}
 
-func TestValidateResponsesAPIRequestAllowsLargeMaxOutputTokens(t *testing.T) {
-	result := ValidateResponsesAPIRequest(
-		[]byte(`{
-			"model":"gpt-5.4",
-			"input":"hello",
-			"max_output_tokens":1000000
-		}`),
-		[]string{"gpt-5.4"},
-	)
-
-	if !result.Valid {
-		t.Fatalf("expected large max_output_tokens to be valid, got %#v", result.Errors)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := ValidateResponsesAPIRequest(test.body, []string{"gpt-5.5", "gpt-5.4"})
+			if result.Valid != test.valid {
+				t.Fatalf("Valid = %v, want %v; errors=%#v", result.Valid, test.valid, result.Errors)
+			}
+		})
 	}
 }
 
