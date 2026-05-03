@@ -26,7 +26,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy, Power, PowerOff } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy, Power, PowerOff, Hourglass } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
@@ -38,7 +38,7 @@ export default function Accounts() {
   const [pageSize, setPageSize] = useState(20)
   const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'error' | 'disabled' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
-  const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'plus' | 'team' | 'free'>('all')
+  const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'prolite' | 'plus' | 'team' | 'free'>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
   const [addForm, setAddForm] = useState<AddAccountRequest>({
@@ -119,7 +119,7 @@ export default function Accounts() {
         return false
       }
 
-      const plan = (account.plan_type || '').toLowerCase()
+      const plan = normalizePlanType(account.plan_type)
       const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
       const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
 
@@ -189,9 +189,9 @@ export default function Accounts() {
         if (!account.locked) return false
         break
     }
-    // 套餐过滤
+    // 套餐过滤：按原始 plan_type 匹配，使 pro 与 prolite 成为独立过滤项
     if (planFilter !== 'all') {
-      const plan = (account.plan_type || '').toLowerCase()
+      const plan = (account.plan_type || '').toLowerCase().trim()
       if (plan !== planFilter) return false
     }
     // 搜索过滤
@@ -1133,7 +1133,7 @@ export default function Accounts() {
             />
           </div>
           <div className="flex items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5">
-            {(['all', 'pro', 'plus', 'team', 'free'] as const).map((key) => (
+            {(['all', 'pro', 'prolite', 'plus', 'team', 'free'] as const).map((key) => (
               <button
                 key={key}
                 onClick={() => { setPlanFilter(key); setPage(1) }}
@@ -1143,7 +1143,11 @@ export default function Accounts() {
                     : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
-                {key === 'all' ? t('accounts.filterAll') : key.charAt(0).toUpperCase() + key.slice(1)}
+                {key === 'all'
+                  ? t('accounts.filterAll')
+                  : key === 'prolite'
+                    ? 'ProLite'
+                    : key.charAt(0).toUpperCase() + key.slice(1)}
               </button>
             ))}
           </div>
@@ -1263,14 +1267,14 @@ export default function Accounts() {
                         <TableCell
                           className="text-[13px] font-medium"
                         >
-                          {account.plan_type || '-'}
+                          {formatPlanLabel(account.plan_type)}
                         </TableCell>
                         <TableCell>
-                          <div className="space-y-1">
-                            <StatusBadge status={account.status} />
-                            {account.cooldown_until && (account.status === 'rate_limited' || account.status === 'error') && (
-                              <CooldownTimer until={account.cooldown_until} />
-                            )}
+                          <div className="space-y-1.5">
+                            <div className="flex min-h-6 items-center gap-2 whitespace-nowrap">
+                              <StatusBadge status={account.status} />
+                              <AccountStatusCountdown account={account} />
+                            </div>
                             {account.status === 'error' && account.error_message && (
                               <div className="max-w-[180px] truncate text-[11px] leading-tight text-red-500" title={account.error_message}>
                                 {account.error_message}
@@ -2243,8 +2247,25 @@ function getDispatchScore(account: AccountRow): number {
   return account.dispatch_score ?? account.scheduler_score ?? 0
 }
 
+// OpenAI reports the $100 Pro tier as "prolite" — functionally a Pro plan with
+// a smaller usage cap. Keep behavioral comparisons (usage windows, plan filter,
+// scheduler bias) aligned with the Go side by folding it into "pro".
+function normalizePlanType(planType?: string): string {
+  const raw = (planType || '').toLowerCase().trim()
+  if (raw === 'prolite' || raw === 'pro_lite' || raw === 'pro-lite') return 'pro'
+  return raw
+}
+
+function formatPlanLabel(planType?: string): string {
+  const raw = (planType || '').trim()
+  if (!raw) return '-'
+  const lower = raw.toLowerCase()
+  if (lower === 'prolite' || lower === 'pro_lite' || lower === 'pro-lite') return 'ProLite'
+  return raw
+}
+
 function getDefaultScoreBias(planType?: string): number {
-  switch ((planType || '').toLowerCase()) {
+  switch (normalizePlanType(planType)) {
     case 'pro':
     case 'plus':
     case 'team':
@@ -2817,7 +2838,7 @@ function UsageWindowStat({ label, detail }: { label: string; detail?: AccountRow
 
 // 用量列组件
 function UsageCell({ account }: { account: AccountRow }) {
-  const plan = (account.plan_type || '').toLowerCase()
+  const plan = normalizePlanType(account.plan_type)
   const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
   const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail)
@@ -2868,6 +2889,23 @@ function UsageCell({ account }: { account: AccountRow }) {
   return <span className="text-[13px] text-muted-foreground">-</span>
 }
 
+function getAccountStatusCountdownUntil(account: AccountRow): string | undefined {
+  const status = account.status
+  if (account.cooldown_until && (status === 'rate_limited' || status === 'error' || status === 'cooldown')) {
+    return account.cooldown_until
+  }
+  if (status === 'usage_exhausted') {
+    return account.reset_7d_at
+  }
+  return undefined
+}
+
+function AccountStatusCountdown({ account }: { account: AccountRow }) {
+  const until = getAccountStatusCountdownUntil(account)
+  if (!until) return null
+  return <CooldownTimer until={until} />
+}
+
 // 冷却倒计时组件
 function CooldownTimer({ until }: { until: string }) {
   const [remaining, setRemaining] = useState('')
@@ -2899,5 +2937,10 @@ function CooldownTimer({ until }: { until: string }) {
   }, [until])
 
   if (!remaining) return null
-  return <span className="text-[11px] font-mono text-amber-600">⏳ {remaining}</span>
+  return (
+    <span className="inline-flex h-6 min-w-[112px] shrink-0 items-center justify-center gap-1.5 rounded-full bg-amber-50 px-2 text-[11px] font-mono leading-none tabular-nums text-amber-700 ring-1 ring-inset ring-amber-200/70 dark:bg-amber-950/40 dark:text-amber-300 dark:ring-amber-400/20">
+      <Hourglass className="size-3 shrink-0" aria-hidden="true" />
+      {remaining}
+    </span>
+  )
 }
