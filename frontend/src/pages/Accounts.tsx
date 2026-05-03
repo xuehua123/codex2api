@@ -39,7 +39,7 @@ export default function Accounts() {
   const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'error' | 'disabled' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'prolite' | 'plus' | 'team' | 'free'>('all')
-  const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
+  const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | 'cooldown' | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: '',
@@ -209,6 +209,15 @@ export default function Accounts() {
 
   const sortedAccounts = [...filteredAccounts].sort((a, b) => {
     if (!sortKey) return 0
+    if (sortKey === 'cooldown') {
+      const left = getAccountCooldownSortValue(a)
+      const right = getAccountCooldownSortValue(b)
+      if (left === null && right === null) return 0
+      if (left === null) return 1
+      if (right === null) return -1
+      const diff = left - right
+      return sortDir === 'asc' ? diff : -diff
+    }
     let diff = 0
     if (sortKey === 'requests') {
       diff = ((a.success_requests ?? 0) + (a.error_requests ?? 0)) - ((b.success_requests ?? 0) + (b.error_requests ?? 0))
@@ -1303,7 +1312,12 @@ export default function Accounts() {
                       <TableHead className="text-[13px] font-semibold">{t('accounts.sequence')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.email')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.plan')}</TableHead>
-                      <TableHead className="text-[13px] font-semibold">{t('accounts.status')}</TableHead>
+                      <TableHead
+                        className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
+                        onClick={() => { if (sortKey === 'cooldown') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('cooldown'); setSortDir('asc') }; setPage(1) }}
+                      >
+                        {t('accounts.status')} {sortKey === 'cooldown' ? (sortDir === 'desc' ? '↓' : '↑') : ''}
+                      </TableHead>
                       <TableHead
                         className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
                         onClick={() => { if (sortKey === 'requests') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('requests'); setSortDir('desc') }; setPage(1) }}
@@ -3093,6 +3107,33 @@ function getAccountStatusCountdownUntil(account: AccountRow): string | undefined
     return account.reset_7d_at
   }
   return undefined
+}
+
+function parseFutureTimestampMs(value?: string | null): number | null {
+  if (!value) return null
+  const timestamp = new Date(value).getTime()
+  if (!Number.isFinite(timestamp) || timestamp <= Date.now()) {
+    return null
+  }
+  return timestamp
+}
+
+function getAccountCooldownSortValue(account: AccountRow): number | null {
+  const accountCooldown = parseFutureTimestampMs(getAccountStatusCountdownUntil(account))
+  if (accountCooldown !== null) {
+    return accountCooldown
+  }
+
+  const modelCooldowns = account.model_cooldowns ?? []
+  let earliest: number | null = null
+  for (const cooldown of modelCooldowns) {
+    const timestamp = parseFutureTimestampMs(cooldown.reset_at)
+    if (timestamp === null) continue
+    if (earliest === null || timestamp < earliest) {
+      earliest = timestamp
+    }
+  }
+  return earliest
 }
 
 function AccountStatusCountdown({ account }: { account: AccountRow }) {
