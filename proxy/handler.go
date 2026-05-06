@@ -119,6 +119,80 @@ const (
 	contextAPIKeyMasked = "apiKeyMasked"
 )
 
+const slowTTFTLogThresholdMs = 10_000
+
+type responseTTFTTrace struct {
+	upstreamHeadersMs   int
+	firstSSEEventMs     int
+	firstNonPreambleMs  int
+	firstTextDeltaMs    int
+	firstToolDeltaMs    int
+	eventsBeforeText    int
+	lastEventBeforeText string
+	sawSSEEvent         bool
+	sawNonPreamble      bool
+	sawTextDelta        bool
+	sawToolDelta        bool
+}
+
+func (t *responseTTFTTrace) observe(start time.Time, eventType string) {
+	elapsedMs := int(time.Since(start).Milliseconds())
+	eventType = strings.TrimSpace(eventType)
+
+	if !t.sawSSEEvent {
+		t.firstSSEEventMs = elapsedMs
+		t.sawSSEEvent = true
+	}
+	if !t.sawNonPreamble && !isResponsesPreambleEvent(eventType) {
+		t.firstNonPreambleMs = elapsedMs
+		t.sawNonPreamble = true
+	}
+	if eventType == "response.function_call_arguments.delta" && !t.sawToolDelta {
+		t.firstToolDeltaMs = elapsedMs
+		t.sawToolDelta = true
+	}
+	if eventType == "response.output_text.delta" {
+		if !t.sawTextDelta {
+			t.firstTextDeltaMs = elapsedMs
+			t.sawTextDelta = true
+		}
+		return
+	}
+	if !t.sawTextDelta {
+		t.eventsBeforeText++
+		t.lastEventBeforeText = eventType
+	}
+}
+
+func (t responseTTFTTrace) shouldLog(totalDurationMs int) bool {
+	return (t.sawTextDelta && t.firstTextDeltaMs > slowTTFTLogThresholdMs) ||
+		(!t.sawTextDelta && totalDurationMs > slowTTFTLogThresholdMs)
+}
+
+func isResponsesPreambleEvent(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case "response.created", "response.in_progress":
+		return true
+	default:
+		return false
+	}
+}
+
+func logSlowResponseTTFT(endpoint, model, reasoningEffort string, accountID int64, stream bool, totalDurationMs int, trace responseTTFTTrace, usage *UsageInfo) {
+	if !trace.shouldLog(totalDurationMs) {
+		return
+	}
+	inputTokens, cachedTokens, reasoningTokens, outputTokens := 0, 0, 0, 0
+	if usage != nil {
+		inputTokens = usage.InputTokens
+		cachedTokens = usage.CachedTokens
+		reasoningTokens = usage.ReasoningTokens
+		outputTokens = usage.OutputTokens
+	}
+	log.Printf("[slow_ttft] endpoint=%s model=%s effort=%s account=%d stream=%t duration_ms=%d headers_ms=%d saw_sse=%t first_sse_ms=%d saw_non_preamble=%t first_non_preamble_ms=%d saw_text=%t first_text_ms=%d saw_tool=%t first_tool_ms=%d events_before_text=%d last_event_before_text=%s input_tokens=%d cached_tokens=%d reasoning_tokens=%d output_tokens=%d",
+		endpoint, model, reasoningEffort, accountID, stream, totalDurationMs, trace.upstreamHeadersMs, trace.sawSSEEvent, trace.firstSSEEventMs, trace.sawNonPreamble, trace.firstNonPreambleMs, trace.sawTextDelta, trace.firstTextDeltaMs, trace.sawToolDelta, trace.firstToolDeltaMs, trace.eventsBeforeText, trace.lastEventBeforeText, inputTokens, cachedTokens, reasoningTokens, outputTokens)
+}
+
 func requestAPIKeyID(c *gin.Context) int64 {
 	if c == nil {
 		return 0
@@ -1014,6 +1088,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		c.Set("x-model", model)
 		c.Set("x-reasoning-effort", reasoningEffort)
 		var firstTokenMs int
+		ttftTrace := responseTTFTTrace{upstreamHeadersMs: durationMs}
 		var usage *UsageInfo
 		var actualServiceTier string
 		ttftRecorded := false
@@ -1045,6 +1120,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				ttftTrace.observe(start, eventType)
 
 				// TTFT: 记录第一个 output_text.delta 事件的时间
 				if !ttftRecorded && eventType == "response.output_text.delta" {
@@ -1090,6 +1166,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				ttftTrace.observe(start, eventType)
 				if imageOutput, ok := extractResponseImageGenerationOutput(data, seenImageOutputs); ok {
 					imageOutputs = append(imageOutputs, imageOutput)
 				}
@@ -1199,6 +1276,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logInput.CachedTokens = usage.CachedTokens
 		}
 		applyImageUsageLogInfo(logInput, imageLogInfo)
+		logSlowResponseTTFT("/v1/responses", model, reasoningEffort, account.ID(), isStream, totalDuration, ttftTrace, usage)
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
