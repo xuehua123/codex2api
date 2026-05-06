@@ -17,6 +17,15 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	BodyReadDurationMsContextKey = "body_read_ms"
+	BodyReadBytesContextKey      = "body_read_bytes"
+	BodyContentLengthContextKey  = "body_content_length"
+	BodyDecompressMsContextKey   = "body_decompress_ms"
+	BodyCompressedBytesKey       = "body_compressed_bytes"
+	BodyDecompressedBytesKey     = "body_decompressed_bytes"
+)
+
 // Version represents an API version
 type Version struct {
 	Major int
@@ -122,12 +131,12 @@ func IsVersionSupported(version Version) bool {
 
 // RequestContext holds request-scoped information
 type RequestContext struct {
-	RequestID   string
-	Version     Version
-	StartTime   time.Time
-	APIKey      string
-	Model       string
-	Stream      bool
+	RequestID string
+	Version   Version
+	StartTime time.Time
+	APIKey    string
+	Model     string
+	Stream    bool
 }
 
 // GetRequestContext retrieves the request context from gin context
@@ -182,16 +191,25 @@ func randInt() int {
 // BodyCacheMiddleware caches the request body for multiple reads
 func BodyCacheMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		contentLength := c.Request.ContentLength
+		c.Set(BodyContentLengthContextKey, contentLength)
+		c.Set(BodyReadBytesContextKey, int64(0))
+
 		if c.Request.Body != nil && c.Request.Body != http.NoBody {
+			readStart := time.Now()
 			body, err := io.ReadAll(c.Request.Body)
+			c.Set(BodyReadDurationMsContextKey, time.Since(readStart).Milliseconds())
 			if err != nil {
 				log.Printf("Failed to read request body: %v", err)
 				c.Next()
 				return
 			}
+			c.Set(BodyReadBytesContextKey, int64(len(body)))
 			c.Set("raw_body", body)
 			// Restore body for later use using bytes.Reader to avoid unnecessary conversion
 			c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		} else {
+			c.Set(BodyReadDurationMsContextKey, int64(0))
 		}
 		c.Next()
 	}
@@ -234,14 +252,14 @@ func LoggingMiddleware() gin.HandlerFunc {
 
 		// Build log entry
 		logEntry := map[string]interface{}{
-			"timestamp":    start.Format(time.RFC3339),
-			"method":       c.Request.Method,
-			"path":         path,
-			"status":       status,
-			"latency_ms":   float64(latency.Nanoseconds()) / 1e6,
-			"client_ip":    c.ClientIP(),
-			"request_id":   requestID,
-			"api_version":  extractVersionFromPath(c.Request.URL.Path).String(),
+			"timestamp":   start.Format(time.RFC3339),
+			"method":      c.Request.Method,
+			"path":        path,
+			"status":      status,
+			"latency_ms":  float64(latency.Nanoseconds()) / 1e6,
+			"client_ip":   c.ClientIP(),
+			"request_id":  requestID,
+			"api_version": extractVersionFromPath(c.Request.URL.Path).String(),
 		}
 
 		// Add error if present

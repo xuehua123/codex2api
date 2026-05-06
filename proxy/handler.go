@@ -178,7 +178,7 @@ func isResponsesPreambleEvent(eventType string) bool {
 	}
 }
 
-func logSlowResponseTTFT(endpoint, model, reasoningEffort string, accountID int64, stream bool, totalDurationMs int, trace responseTTFTTrace, usage *UsageInfo) {
+func logSlowResponseTTFT(c *gin.Context, endpoint, model, reasoningEffort string, accountID int64, stream bool, totalDurationMs int, trace responseTTFTTrace, usage *UsageInfo) {
 	if !trace.shouldLog(totalDurationMs) {
 		return
 	}
@@ -189,8 +189,49 @@ func logSlowResponseTTFT(endpoint, model, reasoningEffort string, accountID int6
 		reasoningTokens = usage.ReasoningTokens
 		outputTokens = usage.OutputTokens
 	}
-	log.Printf("[slow_ttft] endpoint=%s model=%s effort=%s account=%d stream=%t duration_ms=%d headers_ms=%d saw_sse=%t first_sse_ms=%d saw_non_preamble=%t first_non_preamble_ms=%d saw_text=%t first_text_ms=%d saw_tool=%t first_tool_ms=%d events_before_text=%d last_event_before_text=%s input_tokens=%d cached_tokens=%d reasoning_tokens=%d output_tokens=%d",
-		endpoint, model, reasoningEffort, accountID, stream, totalDurationMs, trace.upstreamHeadersMs, trace.sawSSEEvent, trace.firstSSEEventMs, trace.sawNonPreamble, trace.firstNonPreambleMs, trace.sawTextDelta, trace.firstTextDeltaMs, trace.sawToolDelta, trace.firstToolDeltaMs, trace.eventsBeforeText, trace.lastEventBeforeText, inputTokens, cachedTokens, reasoningTokens, outputTokens)
+	requestID, clientRequestID, clientRequestHash := "", "", ""
+	var arrivalUnixMs, totalSinceArrivalMs, bodyReadMs, bodyBytes, contentLength int64
+	var decompressMs, compressedBytes, decompressedBytes int64
+	if c != nil {
+		rawClientRequestID := strings.TrimSpace(c.GetHeader("X-Client-Request-Id"))
+		clientRequestID = security.SanitizeLog(rawClientRequestID)
+		clientRequestHash = ClientRequestHashForLog(rawClientRequestID)
+		if reqCtx := api.GetRequestContext(c); reqCtx != nil {
+			requestID = security.SanitizeLog(strings.TrimSpace(reqCtx.RequestID))
+			if !reqCtx.StartTime.IsZero() {
+				arrivalUnixMs = reqCtx.StartTime.UnixMilli()
+				totalSinceArrivalMs = time.Since(reqCtx.StartTime).Milliseconds()
+			}
+		}
+		bodyReadMs, _ = ginContextInt64(c, api.BodyReadDurationMsContextKey)
+		bodyBytes, _ = ginContextInt64(c, api.BodyReadBytesContextKey)
+		contentLength, _ = ginContextInt64(c, api.BodyContentLengthContextKey)
+		decompressMs, _ = ginContextInt64(c, api.BodyDecompressMsContextKey)
+		compressedBytes, _ = ginContextInt64(c, api.BodyCompressedBytesKey)
+		decompressedBytes, _ = ginContextInt64(c, api.BodyDecompressedBytesKey)
+	}
+	log.Printf("[slow_ttft] endpoint=%s request_id=%s client_request_id=%s client_request_hash=%s model=%s effort=%s account=%d stream=%t duration_ms=%d total_since_arrival_ms=%d arrival_unix_ms=%d body_read_ms=%d body_bytes=%d content_length=%d decompress_ms=%d compressed_bytes=%d decompressed_bytes=%d headers_ms=%d saw_sse=%t first_sse_ms=%d saw_non_preamble=%t first_non_preamble_ms=%d saw_text=%t first_text_ms=%d saw_tool=%t first_tool_ms=%d events_before_text=%d last_event_before_text=%s input_tokens=%d cached_tokens=%d reasoning_tokens=%d output_tokens=%d",
+		endpoint, requestID, clientRequestID, clientRequestHash, model, reasoningEffort, accountID, stream, totalDurationMs, totalSinceArrivalMs, arrivalUnixMs, bodyReadMs, bodyBytes, contentLength, decompressMs, compressedBytes, decompressedBytes, trace.upstreamHeadersMs, trace.sawSSEEvent, trace.firstSSEEventMs, trace.sawNonPreamble, trace.firstNonPreambleMs, trace.sawTextDelta, trace.firstTextDeltaMs, trace.sawToolDelta, trace.firstToolDeltaMs, trace.eventsBeforeText, trace.lastEventBeforeText, inputTokens, cachedTokens, reasoningTokens, outputTokens)
+}
+
+func ginContextInt64(c *gin.Context, key string) (int64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	v, ok := c.Get(key)
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	case int32:
+		return int64(n), true
+	default:
+		return 0, false
+	}
 }
 
 func requestAPIKeyID(c *gin.Context) int64 {
@@ -1276,7 +1317,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logInput.CachedTokens = usage.CachedTokens
 		}
 		applyImageUsageLogInfo(logInput, imageLogInfo)
-		logSlowResponseTTFT("/v1/responses", model, reasoningEffort, account.ID(), isStream, totalDuration, ttftTrace, usage)
+		logSlowResponseTTFT(c, "/v1/responses", model, reasoningEffort, account.ID(), isStream, totalDuration, ttftTrace, usage)
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()

@@ -190,12 +190,13 @@ func main() {
 	r.Use(api.RecoveryMiddleware())
 	r.Use(api.RequestContextMiddleware())
 	r.Use(api.VersionMiddleware())
+	r.Use(loggerMiddleware())
 	security.MaxRequestBodySize = cfg.MaxRequestBodySize
+	r.Use(api.AutoDecompressMiddleware(int64(security.MaxRequestBodySize)))
 	r.Use(security.RequestSizeLimiter(int64(security.MaxRequestBodySize)))
 	r.Use(api.BodyCacheMiddleware())
 	r.Use(api.CORSMiddleware())
 	r.Use(api.SecurityHeadersMiddleware())
-	r.Use(loggerMiddleware())
 	r.Use(security.SecurityHeadersMiddleware())
 
 	// handler 不再接收 cfg.APIKeys
@@ -339,6 +340,7 @@ func loggerMiddleware() gin.HandlerFunc {
 		if t, ok := tierVal.(string); ok && t == "fast" {
 			tags = append(tags, "fast")
 		}
+		tags = appendAccessTimingTags(c, tags)
 		tagStr := ""
 		if len(tags) > 0 {
 			tagStr = " " + strings.Join(tags, " ")
@@ -349,6 +351,70 @@ func loggerMiddleware() gin.HandlerFunc {
 		} else {
 			log.Printf("%s %s %d %v%s", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), latency, tagStr)
 		}
+	}
+}
+
+func appendAccessTimingTags(c *gin.Context, tags []string) []string {
+	if c == nil || c.Request == nil || !shouldLogDetailedRequestTiming(c.Request.Method, c.Request.URL.Path) {
+		return tags
+	}
+	if reqCtx := api.GetRequestContext(c); reqCtx != nil {
+		if requestID := strings.TrimSpace(reqCtx.RequestID); requestID != "" {
+			tags = append(tags, "request_id="+security.SanitizeLog(requestID))
+		}
+		if !reqCtx.StartTime.IsZero() {
+			tags = append(tags, fmt.Sprintf("arrival_unix_ms=%d", reqCtx.StartTime.UnixMilli()))
+			tags = append(tags, fmt.Sprintf("total_since_arrival_ms=%d", time.Since(reqCtx.StartTime).Milliseconds()))
+		}
+	}
+	if clientRequestID := strings.TrimSpace(c.GetHeader("X-Client-Request-Id")); clientRequestID != "" {
+		tags = append(tags, "client_request_id="+security.SanitizeLog(clientRequestID))
+		if hash := proxy.ClientRequestHashForLog(clientRequestID); hash != "" {
+			tags = append(tags, "client_request_hash="+hash)
+		}
+	}
+	if ms, ok := getGinContextInt64(c, api.BodyReadDurationMsContextKey); ok {
+		tags = append(tags, fmt.Sprintf("body_read_ms=%d", ms))
+	}
+	if bytesRead, ok := getGinContextInt64(c, api.BodyReadBytesContextKey); ok {
+		tags = append(tags, fmt.Sprintf("body_bytes=%d", bytesRead))
+	}
+	if contentLength, ok := getGinContextInt64(c, api.BodyContentLengthContextKey); ok {
+		tags = append(tags, fmt.Sprintf("content_length=%d", contentLength))
+	}
+	if ms, ok := getGinContextInt64(c, api.BodyDecompressMsContextKey); ok {
+		tags = append(tags, fmt.Sprintf("decompress_ms=%d", ms))
+	}
+	if compressedBytes, ok := getGinContextInt64(c, api.BodyCompressedBytesKey); ok {
+		tags = append(tags, fmt.Sprintf("compressed_bytes=%d", compressedBytes))
+	}
+	if decompressedBytes, ok := getGinContextInt64(c, api.BodyDecompressedBytesKey); ok {
+		tags = append(tags, fmt.Sprintf("decompressed_bytes=%d", decompressedBytes))
+	}
+	return tags
+}
+
+func shouldLogDetailedRequestTiming(method, path string) bool {
+	return strings.EqualFold(method, http.MethodPost) && strings.Contains(path, "/responses")
+}
+
+func getGinContextInt64(c *gin.Context, key string) (int64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	v, ok := c.Get(key)
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	case int32:
+		return int64(n), true
+	default:
+		return 0, false
 	}
 }
 

@@ -160,6 +160,15 @@ func shortHashForLog(raw string) string {
 	return hex.EncodeToString(sum[:6])
 }
 
+func ClientRequestHashForLog(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:8])
+}
+
 func logCodexFingerprintDebug(kind string, account *auth.Account, proxyURL string, headers http.Header) {
 	if !codexFingerprintDebugEnabled() {
 		return
