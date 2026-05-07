@@ -26,11 +26,12 @@ import (
 
 // Handler API 路由处理器
 type Handler struct {
-	store      *auth.Store
-	configKeys map[string]bool // 配置文件中的静态 key
-	db         *database.DB
-	cfg        *config.Config       // 全局配置
-	deviceCfg  *DeviceProfileConfig // 设备指纹配置
+	store          *auth.Store
+	configKeys     map[string]bool // 配置文件中的静态 key
+	db             *database.DB
+	cfg            *config.Config       // 全局配置
+	deviceCfg      *DeviceProfileConfig // 设备指纹配置
+	slowTTFTUnbind *slowTTFTUnbindController
 
 	// 动态 key 缓存
 	dbKeysMu    sync.RWMutex
@@ -380,11 +381,12 @@ func noAvailableAnthropicAccountMessage(model string) string {
 // NewHandler 创建处理器
 func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCfg *DeviceProfileConfig) *Handler {
 	return &Handler{
-		store:      store,
-		configKeys: make(map[string]bool), // 不再使用硬编码，但保留结构以向后兼容逻辑
-		db:         db,
-		cfg:        cfg,
-		deviceCfg:  deviceCfg,
+		store:          store,
+		configKeys:     make(map[string]bool), // 不再使用硬编码，但保留结构以向后兼容逻辑
+		db:             db,
+		cfg:            cfg,
+		deviceCfg:      deviceCfg,
+		slowTTFTUnbind: newSlowTTFTUnbindControllerFromEnv(),
 	}
 }
 
@@ -1329,6 +1331,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, effectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+			h.maybeUnbindSlowTTFT("/v1/responses", model, reasoningEffort, isStream, affinityKey, account.ID(), firstTokenMs)
 		}
 		h.store.Release(account)
 		return
@@ -1922,6 +1925,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, effectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+			h.maybeUnbindSlowTTFT("/v1/chat/completions", model, reasoningEffort, isStream, affinityKey, account.ID(), firstTokenMs)
 		}
 		h.store.Release(account)
 		return
