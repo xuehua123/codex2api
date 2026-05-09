@@ -160,7 +160,11 @@ export default function Accounts() {
 
   const totalAccounts = accounts.length
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
-  const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited' || account.status === 'usage_exhausted').length
+  const rateLimitedAccountRows = accounts.filter(isRateLimitedAccount)
+  const rateLimitedWindowStats = getRateLimitedWindowStats(rateLimitedAccountRows)
+  const rateLimitedAccounts = rateLimitedAccountRows.length
+  const rateLimited5hAccounts = rateLimitedWindowStats.fiveHour
+  const rateLimited7dAccounts = rateLimitedWindowStats.sevenDay
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
   const errorAccounts = accounts.filter((account) => account.status === 'error').length
   const disabledAccounts = accounts.filter((account) => account.enabled === false).length
@@ -177,7 +181,7 @@ export default function Accounts() {
         if (account.status !== 'active' && account.status !== 'ready') return false
         break
       case 'rate_limited':
-        if (account.status !== 'rate_limited' && account.status !== 'usage_exhausted') return false
+        if (!isRateLimitedAccount(account)) return false
         break
       case 'banned':
         if (account.status !== 'unauthorized') return false
@@ -1192,7 +1196,16 @@ export default function Accounts() {
         <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-5">
           <CompactStat label={t('accounts.totalAccounts')} chipLabel={t('accounts.filterAll')} value={totalAccounts} tone="neutral" />
           <CompactStat label={t('accounts.normalAccounts')} chipLabel={t('accounts.filterNormal')} value={normalAccounts} tone="success" />
-          <CompactStat label={t('accounts.rateLimited')} chipLabel={t('accounts.filterRateLimited')} value={rateLimitedAccounts} tone="warning" />
+          <CompactStat
+            label={t('accounts.rateLimited')}
+            chipLabel={t('accounts.filterRateLimited')}
+            value={rateLimitedAccounts}
+            tone="warning"
+            details={[
+              { label: '5h', value: rateLimited5hAccounts },
+              { label: '7d', value: rateLimited7dAccounts },
+            ]}
+          />
           <CompactStat label={t('accounts.bannedAccounts')} chipLabel={t('accounts.filterBanned')} value={bannedAccounts} tone="danger" />
           <CompactStat label={t('accounts.errorAccounts')} chipLabel={t('accounts.filterError')} value={errorAccounts} tone="danger" />
         </div>
@@ -2364,6 +2377,71 @@ function normalizePlanType(planType?: string): string {
   return raw
 }
 
+function isFutureTime(value?: string): boolean {
+  if (!value) return false
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) && timestamp > Date.now()
+}
+
+function isUsageWindowExhausted(value?: number | null): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 100
+}
+
+function isPremiumUsagePlan(planType?: string): boolean {
+  return ['plus', 'pro', 'team', 'teamplus'].includes(normalizePlanType(planType))
+}
+
+function isRateLimitedAccount(account: AccountRow): boolean {
+  const status = (account.status || '').toLowerCase()
+  const reason = (account.cooldown_reason || '').toLowerCase()
+
+  return status === 'rate_limited' ||
+    status === 'usage_exhausted' ||
+    status === 'rate_limited_5h' ||
+    status === 'rate_limited_7d' ||
+    reason === 'rate_limited_5h' ||
+    reason === 'rate_limited_7d'
+}
+
+function getAccountRateLimitWindow(account: AccountRow): '5h' | '7d' {
+  const status = (account.status || '').toLowerCase()
+  const reason = (account.cooldown_reason || '').toLowerCase()
+
+  if (
+    status === 'usage_exhausted' ||
+    status === 'rate_limited_7d' ||
+    reason === 'rate_limited_7d' ||
+    (isUsageWindowExhausted(account.usage_percent_7d) && (!account.reset_7d_at || isFutureTime(account.reset_7d_at)))
+  ) {
+    return '7d'
+  }
+
+  if (
+    status === 'rate_limited_5h' ||
+    reason === 'rate_limited_5h' ||
+    (
+      isPremiumUsagePlan(account.plan_type) &&
+      isUsageWindowExhausted(account.usage_percent_5h) &&
+      (!account.reset_5h_at || isFutureTime(account.reset_5h_at))
+    )
+  ) {
+    return '5h'
+  }
+
+  return '5h'
+}
+
+function getRateLimitedWindowStats(accounts: AccountRow[]): { fiveHour: number; sevenDay: number } {
+  return accounts.reduce((stats, account) => {
+    if (getAccountRateLimitWindow(account) === '7d') {
+      stats.sevenDay += 1
+    } else {
+      stats.fiveHour += 1
+    }
+    return stats
+  }, { fiveHour: 0, sevenDay: 0 })
+}
+
 function isSubscriptionPlan(planType?: string): boolean {
   const normalized = normalizePlanType(planType)
   if (!normalized || normalized === 'free') return false
@@ -2542,11 +2620,13 @@ function CompactStat({
   chipLabel,
   value,
   tone,
+  details,
 }: {
   label: string
   chipLabel?: string
   value: number
   tone: 'neutral' | 'success' | 'warning' | 'danger'
+  details?: Array<{ label: string; value: number }>
 }) {
   const toneStyle = {
     neutral: {
@@ -2568,14 +2648,27 @@ function CompactStat({
   }[tone]
 
   return (
-    <div className="flex items-center justify-between rounded-lg border border-border bg-card/85 px-3 py-2.5 shadow-sm">
+    <div className="flex min-h-[88px] items-center justify-between gap-3 rounded-lg border border-border bg-card/85 px-3 py-2.5 shadow-sm">
       <div className="min-w-0">
         <div className="text-[12px] font-semibold text-muted-foreground">{label}</div>
         <div className="mt-1 text-[24px] font-bold leading-none text-foreground">{value}</div>
       </div>
-      <div className={`inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] font-semibold ${toneStyle.chip}`}>
-        <span className={`size-2 rounded-full ${toneStyle.dot}`} />
-        {chipLabel ?? label}
+      <div className="flex min-h-[58px] shrink-0 flex-col items-end gap-1.5">
+        <div className={`inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] font-semibold ${toneStyle.chip}`}>
+          <span className={`size-2 rounded-full ${toneStyle.dot}`} />
+          {chipLabel ?? label}
+        </div>
+        {details && details.length > 0 && (
+          <div className="flex flex-col items-end gap-0.5 text-[11px] font-semibold leading-4 text-muted-foreground">
+            {details.map((item) => (
+              <div key={item.label} className="tabular-nums">
+                <span>{item.label}</span>
+                <span className="mx-0.5">：</span>
+                <span className="text-foreground">{item.value}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   )
