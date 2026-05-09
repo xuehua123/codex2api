@@ -707,6 +707,172 @@ func containsEmptyJSONPropertyName(value any) bool {
 	return false
 }
 
+func normalizeResponsesInputMessageContent(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok || !isResponsesMessageInputItem(itemMap) {
+			continue
+		}
+		if content, exists := itemMap["content"]; !exists || content == nil {
+			itemMap["content"] = ""
+			modified = true
+		}
+	}
+	return modified
+}
+
+func isResponsesMessageInputItem(item map[string]any) bool {
+	itemType := strings.TrimSpace(firstNonEmptyAnyString(item["type"]))
+	if itemType == "message" {
+		return true
+	}
+	if itemType != "" {
+		return false
+	}
+
+	switch strings.TrimSpace(firstNonEmptyAnyString(item["role"])) {
+	case "user", "assistant", "developer", "system":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeResponsesInputItemIDs(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, exists := itemMap["id"]; exists {
+			delete(itemMap, "id")
+			modified = true
+		}
+	}
+	return modified
+}
+
+func normalizeResponsesContentPartTypes(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role := strings.TrimSpace(firstNonEmptyAnyString(itemMap["role"]))
+		if normalizeResponsesContentItemType(itemMap, role) {
+			modified = true
+		}
+		contentItems, ok := itemMap["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawContent := range contentItems {
+			contentMap, ok := rawContent.(map[string]any)
+			if !ok {
+				continue
+			}
+			if normalizeResponsesContentItemType(contentMap, role) {
+				modified = true
+			}
+		}
+	}
+	return modified
+}
+
+func normalizeResponsesContentItemType(item map[string]any, role string) bool {
+	itemType := strings.TrimSpace(firstNonEmptyAnyString(item["type"]))
+	modified := false
+
+	switch itemType {
+	case "file":
+		item["type"] = "input_file"
+		itemType = "input_file"
+		modified = true
+	case "image", "image_url":
+		item["type"] = "input_image"
+		itemType = "input_image"
+		modified = true
+	case "text":
+		if strings.TrimSpace(role) == "assistant" {
+			item["type"] = "output_text"
+		} else {
+			item["type"] = "input_text"
+		}
+		itemType = firstNonEmptyAnyString(item["type"])
+		modified = true
+	}
+
+	if itemType == "input_file" {
+		if normalizeResponsesInputFileFields(item) {
+			modified = true
+		}
+	}
+	if itemType == "input_image" || itemType == "computer_screenshot" {
+		if normalizeResponsesImageURLField(item) {
+			modified = true
+		}
+	}
+	return modified
+}
+
+func normalizeResponsesInputFileFields(item map[string]any) bool {
+	rawFile, hasFile := item["file"]
+	if !hasFile {
+		return false
+	}
+
+	if fileMap, ok := rawFile.(map[string]any); ok {
+		for _, key := range []string{"file_id", "file_data", "file_url", "filename"} {
+			if _, exists := item[key]; exists {
+				continue
+			}
+			if value, exists := fileMap[key]; exists && value != nil {
+				item[key] = value
+			}
+		}
+	} else if fileID := strings.TrimSpace(firstNonEmptyAnyString(rawFile)); fileID != "" {
+		if _, exists := item["file_id"]; !exists {
+			item["file_id"] = fileID
+		}
+	}
+	delete(item, "file")
+	return true
+}
+
+func normalizeResponsesImageURLField(item map[string]any) bool {
+	rawImageURL, ok := item["image_url"]
+	if !ok {
+		return false
+	}
+	imageURLMap, ok := rawImageURL.(map[string]any)
+	if !ok {
+		return false
+	}
+	if url := strings.TrimSpace(firstNonEmptyAnyString(imageURLMap["url"])); url != "" {
+		item["image_url"] = url
+		return true
+	}
+	return false
+}
+
 func responsesToolFallbackMessage(item map[string]any) map[string]any {
 	message := map[string]any{
 		"type":    "message",
@@ -874,6 +1040,9 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 
 	// 1. messages → input
 	out["input"] = convertMessagesToInputSlice(req.Messages)
+	normalizeResponsesContentPartTypes(out)
+	normalizeResponsesInputMessageContent(out)
+	normalizeResponsesInputItemIDs(out)
 
 	// 2. reasoning effort
 	if effort := normalizeReasoningEffort(req.ReasoningEffort); effort != "" {
@@ -985,7 +1154,9 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 				}
 			}
 			// 递归清理不支持的 JSON Schema 关键字，并修正上游要求的结构
-			if params, ok := toolMap["parameters"].(map[string]any); ok {
+			if isFunctionTool(toolMap) {
+				normalizeFunctionToolParameters(toolMap)
+			} else if params, ok := toolMap["parameters"].(map[string]any); ok {
 				sanitizeSchemaForUpstream(params)
 			}
 		}
@@ -1016,6 +1187,9 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	normalizeResponsesCompatMessageRoles(body)
 	// 6d. 上游要求 function/MCP tool call arguments 为 JSON 字符串。
 	normalizeResponsesToolCallArguments(body)
+	normalizeResponsesContentPartTypes(body)
+	normalizeResponsesInputMessageContent(body)
+	normalizeResponsesInputItemIDs(body)
 
 	// 保存展开后的 input 原始 JSON（用于响应缓存链路）
 	var expandedInputRaw string
@@ -1094,7 +1268,8 @@ func convertMessagesToInputSlice(messages []openAIMessage) []any {
 	input := make([]any, 0, len(messages))
 
 	for _, m := range messages {
-		switch strings.TrimSpace(m.Role) {
+		role := strings.TrimSpace(m.Role)
+		switch role {
 		case "tool":
 			callID := strings.TrimSpace(m.ToolCallID)
 			if callID == "" {
@@ -1254,11 +1429,11 @@ func convertToolsToCodexFormat(rawTools []json.RawMessage) []any {
 		}
 		if len(parsed.Function.Parameters) > 0 {
 			var params map[string]any
-			if json.Unmarshal(parsed.Function.Parameters, &params) == nil {
-				sanitizeSchemaForUpstream(params)
+			if json.Unmarshal(parsed.Function.Parameters, &params) == nil && params != nil {
 				item["parameters"] = params
 			}
 		}
+		normalizeFunctionToolParameters(item)
 		if parsed.Function.Strict != nil {
 			item["strict"] = *parsed.Function.Strict
 		}
@@ -1386,6 +1561,37 @@ func stripUnsupportedSchemaKeys(schema map[string]interface{}) {
 func sanitizeSchemaForUpstream(schema map[string]interface{}) {
 	stripUnsupportedSchemaKeys(schema)
 	ensureArrayItems(schema)
+}
+
+func isFunctionTool(tool map[string]any) bool {
+	toolType, _ := tool["type"].(string)
+	return strings.TrimSpace(toolType) == "function"
+}
+
+func normalizeFunctionToolParameters(tool map[string]any) {
+	params, ok := tool["parameters"].(map[string]any)
+	if !ok || params == nil {
+		tool["parameters"] = defaultFunctionParametersSchema()
+		return
+	}
+	sanitizeSchemaForUpstream(params)
+	ensureFunctionParametersRootObject(params)
+}
+
+func defaultFunctionParametersSchema() map[string]any {
+	return map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+}
+
+func ensureFunctionParametersRootObject(schema map[string]any) {
+	if schemaType, ok := schema["type"].(string); !ok || strings.TrimSpace(schemaType) != "object" {
+		schema["type"] = "object"
+	}
+	if props, ok := schema["properties"].(map[string]any); !ok || props == nil {
+		schema["properties"] = map[string]any{}
+	}
 }
 
 // ensureArrayItems 递归为缺失 items 的数组 schema 补上空 schema，
