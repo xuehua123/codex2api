@@ -75,7 +75,7 @@ func TestRenderDiagnosticTestMarkdownIncludesCausesAndRecommendations(t *testing
 		Recommendations: []string{"等待 5h 窗口重置。"},
 	}, testNow())
 
-	for _, want := range []string{"new-stable", "主要原因", "5h 限流：80", "健康层级", "建议动作", "等待 5h 窗口重置"} {
+	for _, want := range []string{"new-stable", "测试通知", "可用：<font color=\"info\">42 / 200</font>（21%）", "不可用：158（79%）", "阈值：低于 50 个 或 20% 触发", "主要原因", "5h 限流：80（40%）", "健康层级", "risky：90（45%）", "建议动作", "1. 等待 5h 窗口重置"} {
 		if !contains(content, want) {
 			t.Fatalf("content missing %q:\n%s", want, content)
 		}

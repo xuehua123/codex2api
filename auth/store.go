@@ -3220,43 +3220,34 @@ func (s *Store) AccountPoolDiagnostics() alerting.AccountPoolDiagnostics {
 		status := acc.Status
 		cooldownReason := strings.TrimSpace(acc.CooldownReason)
 		cooling := status == StatusCooldown && now.Before(acc.CooldownUtil)
-		availableNow := !atomicDisabled &&
-			!dispatchPaused &&
-			status != StatusError &&
-			acc.healthTierLocked() != HealthTierBanned &&
-			!usageExhausted &&
-			!premium5hLimited &&
-			!(status == StatusCooldown && now.Before(acc.CooldownUtil)) &&
-			hasAccessToken
+		availableNow := accountPoolAvailableLocked(
+			dispatchPaused,
+			atomicDisabled,
+			tier,
+			status,
+			usageExhausted,
+			premium5hLimited,
+			cooling,
+			hasAccessToken,
+		)
+		issueKey := accountPoolIssueKey(
+			dispatchPaused,
+			atomicDisabled,
+			tier,
+			status,
+			usageExhausted,
+			premium5hLimited,
+			cooling,
+			cooldownReason,
+			hasAccessToken,
+		)
 		acc.mu.RUnlock()
 
 		if availableNow {
 			available++
 			continue
 		}
-
-		switch {
-		case dispatchPaused:
-			issues["dispatch_paused"]++
-		case tier == string(HealthTierBanned) || cooldownReason == "unauthorized":
-			issues["unauthorized"]++
-		case status == StatusError:
-			issues["error"]++
-		case usageExhausted:
-			issues["usage_7d_exhausted"]++
-		case premium5hLimited:
-			issues["rate_limited_5h"]++
-		case cooling && cooldownReason == "rate_limited":
-			issues["rate_limited_7d_or_generic"]++
-		case cooling:
-			issues["cooldown"]++
-		case !hasAccessToken:
-			issues["no_access_token"]++
-		case atomicDisabled:
-			issues["temporarily_disabled"]++
-		default:
-			issues["other_unavailable"]++
-		}
+		issues[issueKey]++
 	}
 
 	snapshot := alerting.AccountPoolSnapshot{
@@ -3271,6 +3262,42 @@ func (s *Store) AccountPoolDiagnostics() alerting.AccountPoolDiagnostics {
 		HealthTiers:     orderedDiagnosticItems(healthTiers, []string{"healthy", "warm", "risky", "banned"}, accountPoolHealthTierLabel),
 		Plans:           diagnosticMapToItems(plans, accountPoolPlanLabel),
 		Recommendations: accountPoolRecommendations(issueItems),
+	}
+}
+
+func accountPoolAvailableLocked(dispatchPaused, atomicDisabled bool, tier string, status AccountStatus, usageExhausted, premium5hLimited, cooling, hasAccessToken bool) bool {
+	return !atomicDisabled &&
+		!dispatchPaused &&
+		status != StatusError &&
+		tier != string(HealthTierBanned) &&
+		!usageExhausted &&
+		!premium5hLimited &&
+		!cooling &&
+		hasAccessToken
+}
+
+func accountPoolIssueKey(dispatchPaused, atomicDisabled bool, tier string, status AccountStatus, usageExhausted, premium5hLimited, cooling bool, cooldownReason string, hasAccessToken bool) string {
+	switch {
+	case dispatchPaused:
+		return "dispatch_paused"
+	case tier == string(HealthTierBanned) || cooldownReason == "unauthorized":
+		return "unauthorized"
+	case status == StatusError:
+		return "error"
+	case usageExhausted:
+		return "usage_7d_exhausted"
+	case premium5hLimited:
+		return "rate_limited_5h"
+	case cooling && cooldownReason == "rate_limited":
+		return "rate_limited_generic"
+	case cooling:
+		return "cooldown"
+	case !hasAccessToken:
+		return "no_access_token"
+	case atomicDisabled:
+		return "temporarily_disabled"
+	default:
+		return "other_unavailable"
 	}
 }
 
@@ -3330,8 +3357,8 @@ func accountPoolIssueLabel(key string) string {
 		return "7d 用量耗尽"
 	case "rate_limited_5h":
 		return "5h 限流"
-	case "rate_limited_7d_or_generic":
-		return "7d/通用限流"
+	case "rate_limited_generic":
+		return "通用限流/429"
 	case "cooldown":
 		return "冷却中"
 	case "no_access_token":
@@ -3387,8 +3414,10 @@ func accountPoolRecommendations(issues []alerting.DiagnosticItem) []string {
 		switch issue.Key {
 		case "rate_limited_5h":
 			add("等待 5h 窗口重置，或临时提高其它健康账号权重。")
-		case "rate_limited_7d_or_generic", "usage_7d_exhausted":
+		case "usage_7d_exhausted":
 			add("检查 7d 用量耗尽账号，补充账号或等待 7d 窗口恢复。")
+		case "rate_limited_generic":
+			add("检查通用 429 限流账号，等待冷却结束或降低该账号调度权重。")
 		case "unauthorized", "temporarily_disabled":
 			add("优先刷新或重新导入授权失效账号，确认 Refresh Token 是否可用。")
 		case "error", "no_access_token":

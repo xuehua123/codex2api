@@ -399,55 +399,83 @@ func percent(available, total int) int {
 }
 
 func renderAccountPoolAlertMarkdown(cfg AccountPoolConfig, diagnostics AccountPoolDiagnostics, now time.Time) string {
-	s := diagnostics.Snapshot
 	var b strings.Builder
-	fmt.Fprintf(&b, "## codex2api 账号池告警\n")
-	fmt.Fprintf(&b, "> 实例：%s\n", displayInstanceName(cfg))
-	fmt.Fprintf(&b, "> 状态：可用账号不足\n")
-	fmt.Fprintf(&b, "> 可用：<font color=\"warning\">%d / %d</font>（%d%%）\n", s.Available, s.Total, s.Ratio)
-	fmt.Fprintf(&b, "> 阈值：%d 个或 %d%%\n", cfg.MinAvailable, cfg.MinAvailableRatio)
-	fmt.Fprintf(&b, "> 时间：%s\n", now.Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, "## codex2api 账号池告警\n\n")
+	appendStatusCardMarkdown(&b, "可用账号不足", "warning", cfg, diagnostics, now, true)
 	appendDiagnosticsMarkdown(&b, diagnostics)
 	return b.String()
 }
 
 func renderAccountPoolRecoveryMarkdown(cfg AccountPoolConfig, diagnostics AccountPoolDiagnostics, now time.Time) string {
-	s := diagnostics.Snapshot
 	var b strings.Builder
-	fmt.Fprintf(&b, "## codex2api 账号池恢复\n")
-	fmt.Fprintf(&b, "> 实例：%s\n", displayInstanceName(cfg))
-	fmt.Fprintf(&b, "> 状态：可用账号已恢复\n")
-	fmt.Fprintf(&b, "> 可用：<font color=\"info\">%d / %d</font>（%d%%）\n", s.Available, s.Total, s.Ratio)
-	fmt.Fprintf(&b, "> 时间：%s\n", now.Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, "## codex2api 账号池恢复\n\n")
+	appendStatusCardMarkdown(&b, "可用账号已恢复", "info", cfg, diagnostics, now, false)
 	appendDiagnosticsMarkdown(&b, diagnostics)
 	return b.String()
 }
 
+func appendStatusCardMarkdown(b *strings.Builder, status, color string, cfg AccountPoolConfig, diagnostics AccountPoolDiagnostics, now time.Time, includeThreshold bool) {
+	s := diagnostics.Snapshot
+	unavailable := s.Total - s.Available
+	if unavailable < 0 {
+		unavailable = 0
+	}
+	fmt.Fprintf(b, "> 实例：%s\n", displayInstanceName(cfg))
+	fmt.Fprintf(b, "> 状态：<font color=\"%s\">%s</font>\n", color, status)
+	fmt.Fprintf(b, "> 可用：<font color=\"%s\">%d / %d</font>（%d%%）\n", color, s.Available, s.Total, s.Ratio)
+	if s.Total > 0 {
+		fmt.Fprintf(b, "> 不可用：%d（%d%%）\n", unavailable, percent(unavailable, s.Total))
+	}
+	if includeThreshold {
+		fmt.Fprintf(b, "> 阈值：低于 %s 触发\n", thresholdText(cfg))
+	}
+	fmt.Fprintf(b, "> 时间：%s\n", now.Format("2006-01-02 15:04:05"))
+}
+
 func appendDiagnosticsMarkdown(b *strings.Builder, diagnostics AccountPoolDiagnostics) {
 	if len(diagnostics.Issues) > 0 {
-		fmt.Fprintf(b, "\n**主要原因**\n")
-		for _, item := range topDiagnosticItems(diagnostics.Issues, 5) {
-			fmt.Fprintf(b, "> - %s：%d\n", item.Label, item.Count)
-		}
+		appendDiagnosticSectionMarkdown(b, "主要原因", diagnostics.Issues, diagnostics.Snapshot.Total, 5)
 	}
 	if len(diagnostics.HealthTiers) > 0 {
-		fmt.Fprintf(b, "\n**健康层级**\n")
-		for _, item := range diagnostics.HealthTiers {
-			fmt.Fprintf(b, "> - %s：%d\n", item.Label, item.Count)
-		}
+		appendDiagnosticSectionMarkdown(b, "健康层级", diagnostics.HealthTiers, diagnostics.Snapshot.Total, 0)
 	}
 	if len(diagnostics.Plans) > 0 {
-		fmt.Fprintf(b, "\n**套餐分布**\n")
-		for _, item := range topDiagnosticItems(diagnostics.Plans, 5) {
-			fmt.Fprintf(b, "> - %s：%d\n", item.Label, item.Count)
-		}
+		appendDiagnosticSectionMarkdown(b, "套餐分布", diagnostics.Plans, diagnostics.Snapshot.Total, 5)
 	}
 	if len(diagnostics.Recommendations) > 0 {
 		fmt.Fprintf(b, "\n**建议动作**\n")
-		for _, item := range diagnostics.Recommendations {
-			fmt.Fprintf(b, "> - %s\n", item)
+		for i, item := range diagnostics.Recommendations {
+			fmt.Fprintf(b, "> %d. %s\n", i+1, item)
 		}
 	}
+}
+
+func appendDiagnosticSectionMarkdown(b *strings.Builder, title string, items []DiagnosticItem, total, limit int) {
+	fmt.Fprintf(b, "\n**%s**\n", title)
+	for _, item := range topDiagnosticItems(items, limit) {
+		fmt.Fprintf(b, "> - %s：%d%s\n", item.Label, item.Count, diagnosticPercentText(item.Count, total))
+	}
+}
+
+func diagnosticPercentText(count, total int) string {
+	if total <= 0 || count <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("（%d%%）", percent(count, total))
+}
+
+func thresholdText(cfg AccountPoolConfig) string {
+	parts := make([]string, 0, 2)
+	if cfg.MinAvailable > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个", cfg.MinAvailable))
+	}
+	if cfg.MinAvailableRatio > 0 {
+		parts = append(parts, fmt.Sprintf("%d%%", cfg.MinAvailableRatio))
+	}
+	if len(parts) == 0 {
+		return "未配置阈值"
+	}
+	return strings.Join(parts, " 或 ")
 }
 
 func topDiagnosticItems(items []DiagnosticItem, limit int) []DiagnosticItem {
@@ -511,13 +539,9 @@ func RenderTestMarkdown(cfg AccountPoolConfig, available, total int, now time.Ti
 }
 
 func RenderDiagnosticTestMarkdown(cfg AccountPoolConfig, diagnostics AccountPoolDiagnostics, now time.Time) string {
-	snapshot := diagnostics.Snapshot
 	var b strings.Builder
-	fmt.Fprintf(&b, "## codex2api 告警测试\n")
-	fmt.Fprintf(&b, "> 实例：%s\n", displayInstanceName(cfg))
-	fmt.Fprintf(&b, "> 当前账号：%d / %d（%d%%）\n", snapshot.Available, snapshot.Total, snapshot.Ratio)
-	fmt.Fprintf(&b, "> 阈值：%d 个或 %d%%\n", cfg.MinAvailable, cfg.MinAvailableRatio)
-	fmt.Fprintf(&b, "> 时间：%s\n", now.Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, "## codex2api 告警测试\n\n")
+	appendStatusCardMarkdown(&b, "测试通知", "info", cfg, diagnostics, now, true)
 	appendDiagnosticsMarkdown(&b, diagnostics)
 	return b.String()
 }
