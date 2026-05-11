@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/codex2api/alerting"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security/promptfilter"
@@ -3174,6 +3175,235 @@ func (s *Store) AvailableCount() int {
 		}
 	}
 	return count
+}
+
+// AccountPoolDiagnostics 返回账号池诊断摘要，供告警模块生成可行动通知。
+func (s *Store) AccountPoolDiagnostics() alerting.AccountPoolDiagnostics {
+	if s == nil {
+		return alerting.AccountPoolDiagnostics{}
+	}
+	now := time.Now()
+	s.mu.RLock()
+	accounts := make([]*Account, len(s.accounts))
+	copy(accounts, s.accounts)
+	s.mu.RUnlock()
+
+	total := len(accounts)
+	available := 0
+	issues := make(map[string]int)
+	healthTiers := make(map[string]int)
+	plans := make(map[string]int)
+
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		dispatchPaused := atomic.LoadInt32(&acc.DispatchPaused) != 0
+		atomicDisabled := atomic.LoadInt32(&acc.Disabled) != 0
+
+		acc.mu.RLock()
+		plan := strings.ToLower(strings.TrimSpace(acc.PlanType))
+		if plan == "" {
+			plan = "unknown"
+		}
+		plans[plan]++
+
+		tier := string(acc.healthTierLocked())
+		if tier == "" {
+			tier = string(HealthTierWarm)
+		}
+		healthTiers[tier]++
+
+		usageExhausted := acc.usageExhaustedLocked()
+		premium5hLimited := acc.premium5hRateLimitedLocked(now)
+		hasAccessToken := acc.AccessToken != ""
+		status := acc.Status
+		cooldownReason := strings.TrimSpace(acc.CooldownReason)
+		cooling := status == StatusCooldown && now.Before(acc.CooldownUtil)
+		availableNow := !atomicDisabled &&
+			!dispatchPaused &&
+			status != StatusError &&
+			acc.healthTierLocked() != HealthTierBanned &&
+			!usageExhausted &&
+			!premium5hLimited &&
+			!(status == StatusCooldown && now.Before(acc.CooldownUtil)) &&
+			hasAccessToken
+		acc.mu.RUnlock()
+
+		if availableNow {
+			available++
+			continue
+		}
+
+		switch {
+		case dispatchPaused:
+			issues["dispatch_paused"]++
+		case tier == string(HealthTierBanned) || cooldownReason == "unauthorized":
+			issues["unauthorized"]++
+		case status == StatusError:
+			issues["error"]++
+		case usageExhausted:
+			issues["usage_7d_exhausted"]++
+		case premium5hLimited:
+			issues["rate_limited_5h"]++
+		case cooling && cooldownReason == "rate_limited":
+			issues["rate_limited_7d_or_generic"]++
+		case cooling:
+			issues["cooldown"]++
+		case !hasAccessToken:
+			issues["no_access_token"]++
+		case atomicDisabled:
+			issues["temporarily_disabled"]++
+		default:
+			issues["other_unavailable"]++
+		}
+	}
+
+	snapshot := alerting.AccountPoolSnapshot{
+		Available: available,
+		Total:     total,
+		Ratio:     accountPoolPercent(available, total),
+	}
+	issueItems := diagnosticMapToItems(issues, accountPoolIssueLabel)
+	return alerting.AccountPoolDiagnostics{
+		Snapshot:        snapshot,
+		Issues:          issueItems,
+		HealthTiers:     orderedDiagnosticItems(healthTiers, []string{"healthy", "warm", "risky", "banned"}, accountPoolHealthTierLabel),
+		Plans:           diagnosticMapToItems(plans, accountPoolPlanLabel),
+		Recommendations: accountPoolRecommendations(issueItems),
+	}
+}
+
+func accountPoolPercent(available, total int) int {
+	if total <= 0 {
+		return 0
+	}
+	return int(math.Round(float64(available) * 100 / float64(total)))
+}
+
+func diagnosticMapToItems(values map[string]int, labelFn func(string) string) []alerting.DiagnosticItem {
+	items := make([]alerting.DiagnosticItem, 0, len(values))
+	for key, count := range values {
+		if count <= 0 {
+			continue
+		}
+		items = append(items, alerting.DiagnosticItem{Key: key, Label: labelFn(key), Count: count})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Count == items[j].Count {
+			return items[i].Key < items[j].Key
+		}
+		return items[i].Count > items[j].Count
+	})
+	return items
+}
+
+func orderedDiagnosticItems(values map[string]int, order []string, labelFn func(string) string) []alerting.DiagnosticItem {
+	items := make([]alerting.DiagnosticItem, 0, len(values))
+	seen := make(map[string]struct{}, len(order))
+	for _, key := range order {
+		seen[key] = struct{}{}
+		if values[key] > 0 {
+			items = append(items, alerting.DiagnosticItem{Key: key, Label: labelFn(key), Count: values[key]})
+		}
+	}
+	remaining := make(map[string]int)
+	for key, count := range values {
+		if _, ok := seen[key]; !ok {
+			remaining[key] = count
+		}
+	}
+	return append(items, diagnosticMapToItems(remaining, labelFn)...)
+}
+
+func accountPoolIssueLabel(key string) string {
+	switch key {
+	case "dispatch_paused":
+		return "已禁用调度"
+	case "temporarily_disabled":
+		return "401 临时禁用"
+	case "unauthorized":
+		return "授权失效 / banned"
+	case "error":
+		return "错误状态"
+	case "usage_7d_exhausted":
+		return "7d 用量耗尽"
+	case "rate_limited_5h":
+		return "5h 限流"
+	case "rate_limited_7d_or_generic":
+		return "7d/通用限流"
+	case "cooldown":
+		return "冷却中"
+	case "no_access_token":
+		return "缺少 Access Token"
+	default:
+		return "其它不可用"
+	}
+}
+
+func accountPoolHealthTierLabel(key string) string {
+	switch key {
+	case "healthy":
+		return "healthy"
+	case "warm":
+		return "warm"
+	case "risky":
+		return "risky"
+	case "banned":
+		return "banned"
+	default:
+		return key
+	}
+}
+
+func accountPoolPlanLabel(key string) string {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "free":
+		return "free"
+	case "plus":
+		return "plus"
+	case "pro":
+		return "pro"
+	case "team":
+		return "team"
+	case "enterprise":
+		return "enterprise"
+	default:
+		return key
+	}
+}
+
+func accountPoolRecommendations(issues []alerting.DiagnosticItem) []string {
+	recommendations := make([]string, 0, 4)
+	seen := map[string]struct{}{}
+	add := func(text string) {
+		if _, ok := seen[text]; ok {
+			return
+		}
+		seen[text] = struct{}{}
+		recommendations = append(recommendations, text)
+	}
+	for _, issue := range issues {
+		switch issue.Key {
+		case "rate_limited_5h":
+			add("等待 5h 窗口重置，或临时提高其它健康账号权重。")
+		case "rate_limited_7d_or_generic", "usage_7d_exhausted":
+			add("检查 7d 用量耗尽账号，补充账号或等待 7d 窗口恢复。")
+		case "unauthorized", "temporarily_disabled":
+			add("优先刷新或重新导入授权失效账号，确认 Refresh Token 是否可用。")
+		case "error", "no_access_token":
+			add("批量测试/刷新错误账号，必要时清理后重新导入。")
+		case "dispatch_paused":
+			add("检查是否有账号被手动禁用调度。")
+		}
+		if len(recommendations) >= 3 {
+			break
+		}
+	}
+	if len(recommendations) == 0 {
+		add("查看账号管理页的限流、错误和健康层级分布。")
+	}
+	return recommendations
 }
 
 // Accounts 返回所有账号（用于统计）

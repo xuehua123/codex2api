@@ -118,7 +118,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				usage_log_flush_interval_seconds INTEGER DEFAULT 5,
 				stream_flush_policy TEXT DEFAULT 'immediate',
 				stream_flush_interval_ms INTEGER DEFAULT 20,
-				image_storage_config TEXT DEFAULT '{}'
+				image_storage_config TEXT DEFAULT '{}',
+				account_alert_config TEXT DEFAULT '{}'
 			);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -298,6 +299,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "stream_flush_policy", "TEXT DEFAULT 'immediate'"},
 		{"system_settings", "stream_flush_interval_ms", "INTEGER DEFAULT 20"},
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
+		{"system_settings", "account_alert_config", "TEXT DEFAULT '{}'"},
 		{"accounts", "enabled", "INTEGER DEFAULT 1"},
 		{"accounts", "locked", "INTEGER DEFAULT 0"},
 		{"accounts", "image_quota_remaining", "INTEGER NULL"},

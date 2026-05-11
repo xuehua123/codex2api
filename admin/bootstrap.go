@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/codex2api/alerting"
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
@@ -206,5 +207,6 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		UsageLogFlushIntervalSeconds:     5,
 		StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 		StreamFlushIntervalMS:            20,
+		AccountAlertConfig:               alerting.AccountPoolConfigToJSON(alerting.DefaultAccountPoolConfig()),
 	}
 }

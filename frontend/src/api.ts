@@ -319,6 +319,21 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  testAccountAlertNotification: (data: {
+    webhook_url: string
+    instance_name: string
+    min_available: number
+    min_available_ratio: number
+    check_interval_seconds: number
+    consecutive_failures: number
+    cooldown_minutes: number
+    recovery_buffer: number
+    recovery_ratio_buffer: number
+  }) =>
+    request<{ ok: boolean }>('/settings/account-alert/test', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getPromptFilterLogs: (params: number | { page?: number; pageSize?: number; limit?: number; source?: string; action?: string; endpoint?: string; model?: string; apiKeyId?: string; q?: string } = 100) => {
     const search = new URLSearchParams()
     if (typeof params === 'number') {

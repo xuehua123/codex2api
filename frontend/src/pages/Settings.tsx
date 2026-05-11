@@ -26,7 +26,7 @@ import {
 } from '@/components/ui/table'
 import { cn } from '@/lib/utils'
 
-import { ExternalLink, RefreshCw, Save, Trash2 } from 'lucide-react'
+import { ExternalLink, RefreshCw, Save, Send, Trash2 } from 'lucide-react'
 
 type ModelMappingEntry = [string, string]
 
@@ -282,9 +282,21 @@ export default function Settings() {
     image_s3_secret_key: '',
     image_s3_prefix: '',
     image_s3_force_path_style: false,
+    account_alert_enabled: false,
+    account_alert_webhook_url: '',
+    account_alert_webhook_configured: false,
+    account_alert_instance_name: 'codex2api',
+    account_alert_min_available: 50,
+    account_alert_min_available_ratio: 20,
+    account_alert_check_interval_seconds: 60,
+    account_alert_consecutive_failures: 2,
+    account_alert_cooldown_minutes: 30,
+    account_alert_recovery_buffer: 10,
+    account_alert_recovery_ratio_buffer: 5,
   })
   const [savingSettings, setSavingSettings] = useState(false)
   const [testingImageStorage, setTestingImageStorage] = useState(false)
+  const [testingAccountAlert, setTestingAccountAlert] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
   const [modelItems, setModelItems] = useState<ModelInfo[]>([])
@@ -358,6 +370,28 @@ export default function Settings() {
       showToast(`${t('settings.imageS3TestFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
       setTestingImageStorage(false)
+    }
+  }
+
+  const handleTestAccountAlert = async () => {
+    setTestingAccountAlert(true)
+    try {
+      await api.testAccountAlertNotification({
+        webhook_url: settingsForm.account_alert_webhook_url,
+        instance_name: settingsForm.account_alert_instance_name,
+        min_available: settingsForm.account_alert_min_available,
+        min_available_ratio: settingsForm.account_alert_min_available_ratio,
+        check_interval_seconds: settingsForm.account_alert_check_interval_seconds,
+        consecutive_failures: settingsForm.account_alert_consecutive_failures,
+        cooldown_minutes: settingsForm.account_alert_cooldown_minutes,
+        recovery_buffer: settingsForm.account_alert_recovery_buffer,
+        recovery_ratio_buffer: settingsForm.account_alert_recovery_ratio_buffer,
+      })
+      showToast(t('settings.accountAlertTestSuccess'))
+    } catch (error) {
+      showToast(`${t('settings.accountAlertTestFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setTestingAccountAlert(false)
     }
   }
 
@@ -454,6 +488,117 @@ export default function Settings() {
                   {isExternalCache ? t('common.connected') : t('common.running')}
                 </Badge>
               </StatusTile>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard
+            title={t('settings.accountAlertTitle')}
+            description={t('settings.accountAlertDesc')}
+            footer={
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="text-xs text-muted-foreground">
+                  {settingsForm.account_alert_webhook_configured
+                    ? t('settings.accountAlertWebhookConfigured')
+                    : t('settings.accountAlertWebhookNotConfigured')}
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleTestAccountAlert()}
+                  disabled={testingAccountAlert || !settingsForm.account_alert_webhook_url}
+                >
+                  <Send className="size-4" />
+                  {testingAccountAlert ? t('settings.accountAlertTesting') : t('settings.accountAlertTest')}
+                </Button>
+              </div>
+            }
+          >
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4">
+              <SettingField label={t('settings.accountAlertEnabled')} description={t('settings.accountAlertEnabledDesc')}>
+                <Select
+                  value={settingsForm.account_alert_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, account_alert_enabled: value === 'true' }))}
+                  options={booleanOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.accountAlertInstanceName')} description={t('settings.accountAlertInstanceNameDesc')}>
+                <Input
+                  value={settingsForm.account_alert_instance_name}
+                  placeholder="codex2api"
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, account_alert_instance_name: e.target.value }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.accountAlertWebhook')} description={t('settings.accountAlertWebhookDesc')}>
+                <Input
+                  type="password"
+                  autoComplete="new-password"
+                  value={settingsForm.account_alert_webhook_url}
+                  placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, account_alert_webhook_url: e.target.value }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.accountAlertMinAvailable')} description={t('settings.accountAlertMinAvailableDesc')}>
+                <Input
+                  type="number"
+                  min={0}
+                  value={settingsForm.account_alert_min_available}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, account_alert_min_available: parseInt(e.target.value) || 0 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.accountAlertMinRatio')} description={t('settings.accountAlertMinRatioDesc')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={settingsForm.account_alert_min_available_ratio}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, account_alert_min_available_ratio: parseInt(e.target.value) || 0 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.accountAlertCheckInterval')} description={t('settings.accountAlertCheckIntervalDesc')}>
+                <Input
+                  type="number"
+                  min={10}
+                  max={3600}
+                  value={settingsForm.account_alert_check_interval_seconds}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, account_alert_check_interval_seconds: parseInt(e.target.value) || 60 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.accountAlertConsecutiveFailures')} description={t('settings.accountAlertConsecutiveFailuresDesc')}>
+                <Input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={settingsForm.account_alert_consecutive_failures}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, account_alert_consecutive_failures: parseInt(e.target.value) || 1 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.accountAlertCooldown')} description={t('settings.accountAlertCooldownDesc')}>
+                <Input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  value={settingsForm.account_alert_cooldown_minutes}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, account_alert_cooldown_minutes: parseInt(e.target.value) || 30 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.accountAlertRecoveryBuffer')} description={t('settings.accountAlertRecoveryBufferDesc')}>
+                <Input
+                  type="number"
+                  min={0}
+                  value={settingsForm.account_alert_recovery_buffer}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, account_alert_recovery_buffer: parseInt(e.target.value) || 0 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.accountAlertRecoveryRatioBuffer')} description={t('settings.accountAlertRecoveryRatioBufferDesc')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={settingsForm.account_alert_recovery_ratio_buffer}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, account_alert_recovery_ratio_buffer: parseInt(e.target.value) || 0 }))}
+                />
+              </SettingField>
             </div>
           </SettingsCard>
 

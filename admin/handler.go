@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/codex2api/alerting"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
@@ -49,6 +50,7 @@ type Handler struct {
 	cacheLabel     string
 	adminSecretEnv string
 	imageProxy     *proxy.Handler
+	accountAlert   *alerting.AccountPoolMonitor
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -95,6 +97,11 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 	h.pgMaxConns = pgMaxConns
 	h.redisPoolSize = redisPoolSize
+}
+
+// SetAccountAlertMonitor 注入账号池告警后台任务，用于设置更新后实时生效。
+func (h *Handler) SetAccountAlertMonitor(monitor *alerting.AccountPoolMonitor) {
+	h.accountAlert = monitor
 }
 
 // RegisterRoutes 注册管理 API 路由
@@ -144,6 +151,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
+	api.POST("/settings/account-alert/test", h.TestAccountAlertNotification)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
@@ -2379,6 +2387,17 @@ type settingsResponse struct {
 	ImageS3SecretKey                 string `json:"image_s3_secret_key"`
 	ImageS3Prefix                    string `json:"image_s3_prefix"`
 	ImageS3ForcePathStyle            bool   `json:"image_s3_force_path_style"`
+	AccountAlertEnabled              bool   `json:"account_alert_enabled"`
+	AccountAlertWebhookURL           string `json:"account_alert_webhook_url"`
+	AccountAlertWebhookConfigured    bool   `json:"account_alert_webhook_configured"`
+	AccountAlertInstanceName         string `json:"account_alert_instance_name"`
+	AccountAlertMinAvailable         int    `json:"account_alert_min_available"`
+	AccountAlertMinAvailableRatio    int    `json:"account_alert_min_available_ratio"`
+	AccountAlertCheckIntervalSeconds int    `json:"account_alert_check_interval_seconds"`
+	AccountAlertConsecutiveFailures  int    `json:"account_alert_consecutive_failures"`
+	AccountAlertCooldownMinutes      int    `json:"account_alert_cooldown_minutes"`
+	AccountAlertRecoveryBuffer       int    `json:"account_alert_recovery_buffer"`
+	AccountAlertRecoveryRatioBuffer  int    `json:"account_alert_recovery_ratio_buffer"`
 }
 
 type updateSettingsReq struct {
@@ -2430,6 +2449,48 @@ type updateSettingsReq struct {
 	ImageS3SecretKey                 *string `json:"image_s3_secret_key"`
 	ImageS3Prefix                    *string `json:"image_s3_prefix"`
 	ImageS3ForcePathStyle            *bool   `json:"image_s3_force_path_style"`
+	AccountAlertEnabled              *bool   `json:"account_alert_enabled"`
+	AccountAlertWebhookURL           *string `json:"account_alert_webhook_url"`
+	AccountAlertInstanceName         *string `json:"account_alert_instance_name"`
+	AccountAlertMinAvailable         *int    `json:"account_alert_min_available"`
+	AccountAlertMinAvailableRatio    *int    `json:"account_alert_min_available_ratio"`
+	AccountAlertCheckIntervalSeconds *int    `json:"account_alert_check_interval_seconds"`
+	AccountAlertConsecutiveFailures  *int    `json:"account_alert_consecutive_failures"`
+	AccountAlertCooldownMinutes      *int    `json:"account_alert_cooldown_minutes"`
+	AccountAlertRecoveryBuffer       *int    `json:"account_alert_recovery_buffer"`
+	AccountAlertRecoveryRatioBuffer  *int    `json:"account_alert_recovery_ratio_buffer"`
+}
+
+func accountAlertSettingsResponse(cfg alerting.AccountPoolConfig) settingsResponse {
+	cfg = alerting.NormalizeAccountPoolConfig(cfg)
+	return settingsResponse{
+		AccountAlertEnabled:              cfg.Enabled,
+		AccountAlertWebhookURL:           alerting.MaskWebhookURL(cfg.WebhookURL),
+		AccountAlertWebhookConfigured:    strings.TrimSpace(cfg.WebhookURL) != "",
+		AccountAlertInstanceName:         cfg.InstanceName,
+		AccountAlertMinAvailable:         cfg.MinAvailable,
+		AccountAlertMinAvailableRatio:    cfg.MinAvailableRatio,
+		AccountAlertCheckIntervalSeconds: cfg.CheckIntervalSeconds,
+		AccountAlertConsecutiveFailures:  cfg.ConsecutiveFailures,
+		AccountAlertCooldownMinutes:      cfg.CooldownMinutes,
+		AccountAlertRecoveryBuffer:       cfg.RecoveryBuffer,
+		AccountAlertRecoveryRatioBuffer:  cfg.RecoveryRatioBuffer,
+	}
+}
+
+func applyAccountAlertResponse(dst *settingsResponse, cfg alerting.AccountPoolConfig) {
+	alertResp := accountAlertSettingsResponse(cfg)
+	dst.AccountAlertEnabled = alertResp.AccountAlertEnabled
+	dst.AccountAlertWebhookURL = alertResp.AccountAlertWebhookURL
+	dst.AccountAlertWebhookConfigured = alertResp.AccountAlertWebhookConfigured
+	dst.AccountAlertInstanceName = alertResp.AccountAlertInstanceName
+	dst.AccountAlertMinAvailable = alertResp.AccountAlertMinAvailable
+	dst.AccountAlertMinAvailableRatio = alertResp.AccountAlertMinAvailableRatio
+	dst.AccountAlertCheckIntervalSeconds = alertResp.AccountAlertCheckIntervalSeconds
+	dst.AccountAlertConsecutiveFailures = alertResp.AccountAlertConsecutiveFailures
+	dst.AccountAlertCooldownMinutes = alertResp.AccountAlertCooldownMinutes
+	dst.AccountAlertRecoveryBuffer = alertResp.AccountAlertRecoveryBuffer
+	dst.AccountAlertRecoveryRatioBuffer = alertResp.AccountAlertRecoveryRatioBuffer
 }
 
 // GetSettings 获取当前系统设置
@@ -2440,18 +2501,20 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	_, adminAuthSource := h.resolveAdminSecret(c.Request.Context())
 	adminSecret := ""
 	var resinURL, resinPlatformName string
+	accountAlertCfg := alerting.DefaultAccountPoolConfig()
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
 	if dbSettings != nil {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
+		accountAlertCfg = alerting.AccountPoolConfigFromJSON(dbSettings.AccountAlertConfig)
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	imgCfg := imagestore.CurrentConfig()
 	imgPrefix := strings.TrimSuffix(imgCfg.Prefix, "/")
-	c.JSON(http.StatusOK, settingsResponse{
+	resp := settingsResponse{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
@@ -2505,7 +2568,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ImageS3SecretKey:                 imgCfg.SecretKey,
 		ImageS3Prefix:                    imgPrefix,
 		ImageS3ForcePathStyle:            imgCfg.ForcePathStyle,
-	})
+	}
+	applyAccountAlertResponse(&resp, accountAlertCfg)
+	c.JSON(http.StatusOK, resp)
 }
 
 // UpdateSettings 更新系统设置（实时生效）
@@ -2517,8 +2582,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	currentAdminSecret := ""
+	accountAlertCfg := alerting.DefaultAccountPoolConfig()
 	if dbSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && dbSettings != nil {
 		currentAdminSecret = dbSettings.AdminSecret
+		accountAlertCfg = alerting.AccountPoolConfigFromJSON(dbSettings.AccountAlertConfig)
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -2901,6 +2968,66 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		imgConfigJSON = "{}"
 	}
 
+	accountAlertChanged := false
+	if req.AccountAlertEnabled != nil {
+		accountAlertCfg.Enabled = *req.AccountAlertEnabled
+		accountAlertChanged = true
+	}
+	if req.AccountAlertWebhookURL != nil {
+		webhookURL := strings.TrimSpace(*req.AccountAlertWebhookURL)
+		switch {
+		case webhookURL == "":
+			accountAlertCfg.WebhookURL = ""
+		case alerting.IsMaskedWebhookURL(webhookURL):
+			// 前端提交脱敏值时保留数据库中的真实 Webhook。
+		default:
+			if err := alerting.ValidateWeComWebhookURL(webhookURL); err != nil {
+				writeError(c, http.StatusBadRequest, err.Error())
+				return
+			}
+			accountAlertCfg.WebhookURL = webhookURL
+		}
+		accountAlertChanged = true
+	}
+	if req.AccountAlertInstanceName != nil {
+		accountAlertCfg.InstanceName = strings.TrimSpace(*req.AccountAlertInstanceName)
+		accountAlertChanged = true
+	}
+	if req.AccountAlertMinAvailable != nil {
+		accountAlertCfg.MinAvailable = *req.AccountAlertMinAvailable
+		accountAlertChanged = true
+	}
+	if req.AccountAlertMinAvailableRatio != nil {
+		accountAlertCfg.MinAvailableRatio = *req.AccountAlertMinAvailableRatio
+		accountAlertChanged = true
+	}
+	if req.AccountAlertCheckIntervalSeconds != nil {
+		accountAlertCfg.CheckIntervalSeconds = *req.AccountAlertCheckIntervalSeconds
+		accountAlertChanged = true
+	}
+	if req.AccountAlertConsecutiveFailures != nil {
+		accountAlertCfg.ConsecutiveFailures = *req.AccountAlertConsecutiveFailures
+		accountAlertChanged = true
+	}
+	if req.AccountAlertCooldownMinutes != nil {
+		accountAlertCfg.CooldownMinutes = *req.AccountAlertCooldownMinutes
+		accountAlertChanged = true
+	}
+	if req.AccountAlertRecoveryBuffer != nil {
+		accountAlertCfg.RecoveryBuffer = *req.AccountAlertRecoveryBuffer
+		accountAlertChanged = true
+	}
+	if req.AccountAlertRecoveryRatioBuffer != nil {
+		accountAlertCfg.RecoveryRatioBuffer = *req.AccountAlertRecoveryRatioBuffer
+		accountAlertChanged = true
+	}
+	accountAlertCfg = alerting.NormalizeAccountPoolConfig(accountAlertCfg)
+	if accountAlertCfg.Enabled && strings.TrimSpace(accountAlertCfg.WebhookURL) == "" {
+		writeError(c, http.StatusBadRequest, "启用账号池告警前请先配置企业微信 Webhook")
+		return
+	}
+	accountAlertConfigJSON := alerting.AccountPoolConfigToJSON(accountAlertCfg)
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
@@ -2944,9 +3071,16 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
 		ImageStorageConfig:               imgConfigJSON,
+		AccountAlertConfig:               accountAlertConfigJSON,
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		writeError(c, http.StatusInternalServerError, "保存设置失败: "+err.Error())
+		return
+	}
+	if accountAlertChanged && h.accountAlert != nil {
+		h.accountAlert.UpdateConfig(accountAlertCfg)
+		log.Printf("设置已更新: account_alert enabled=%t min_available=%d min_ratio=%d", accountAlertCfg.Enabled, accountAlertCfg.MinAvailable, accountAlertCfg.MinAvailableRatio)
 	}
 
 	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {
@@ -2962,7 +3096,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		adminSecretForDisplay = ""
 	}
 
-	c.JSON(http.StatusOK, settingsResponse{
+	resp := settingsResponse{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
@@ -3017,7 +3151,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ImageS3SecretKey:                 imgCfg.SecretKey,
 		ImageS3Prefix:                    strings.TrimSuffix(imgCfg.Prefix, "/"),
 		ImageS3ForcePathStyle:            imgCfg.ForcePathStyle,
-	})
+	}
+	applyAccountAlertResponse(&resp, accountAlertCfg)
+	c.JSON(http.StatusOK, resp)
 }
 
 type testImageStorageReq struct {
@@ -3028,6 +3164,80 @@ type testImageStorageReq struct {
 	SecretKey      string `json:"secret_key"`
 	Prefix         string `json:"prefix"`
 	ForcePathStyle bool   `json:"force_path_style"`
+}
+
+type testAccountAlertReq struct {
+	WebhookURL           *string `json:"webhook_url"`
+	InstanceName         *string `json:"instance_name"`
+	MinAvailable         *int    `json:"min_available"`
+	MinAvailableRatio    *int    `json:"min_available_ratio"`
+	CheckIntervalSeconds *int    `json:"check_interval_seconds"`
+	ConsecutiveFailures  *int    `json:"consecutive_failures"`
+	CooldownMinutes      *int    `json:"cooldown_minutes"`
+	RecoveryBuffer       *int    `json:"recovery_buffer"`
+	RecoveryRatioBuffer  *int    `json:"recovery_ratio_buffer"`
+}
+
+func (h *Handler) TestAccountAlertNotification(c *gin.Context) {
+	var req testAccountAlertReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	cfg := alerting.DefaultAccountPoolConfig()
+	if dbSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && dbSettings != nil {
+		cfg = alerting.AccountPoolConfigFromJSON(dbSettings.AccountAlertConfig)
+	}
+	if req.WebhookURL != nil {
+		webhookURL := strings.TrimSpace(*req.WebhookURL)
+		if webhookURL == "" {
+			cfg.WebhookURL = ""
+		} else if !alerting.IsMaskedWebhookURL(webhookURL) {
+			cfg.WebhookURL = webhookURL
+		}
+	}
+	if req.InstanceName != nil {
+		cfg.InstanceName = strings.TrimSpace(*req.InstanceName)
+	}
+	if req.MinAvailable != nil {
+		cfg.MinAvailable = *req.MinAvailable
+	}
+	if req.MinAvailableRatio != nil {
+		cfg.MinAvailableRatio = *req.MinAvailableRatio
+	}
+	if req.CheckIntervalSeconds != nil {
+		cfg.CheckIntervalSeconds = *req.CheckIntervalSeconds
+	}
+	if req.ConsecutiveFailures != nil {
+		cfg.ConsecutiveFailures = *req.ConsecutiveFailures
+	}
+	if req.CooldownMinutes != nil {
+		cfg.CooldownMinutes = *req.CooldownMinutes
+	}
+	if req.RecoveryBuffer != nil {
+		cfg.RecoveryBuffer = *req.RecoveryBuffer
+	}
+	if req.RecoveryRatioBuffer != nil {
+		cfg.RecoveryRatioBuffer = *req.RecoveryRatioBuffer
+	}
+	cfg = alerting.NormalizeAccountPoolConfig(cfg)
+	if strings.TrimSpace(cfg.WebhookURL) == "" {
+		writeError(c, http.StatusBadRequest, "请先填写企业微信 Webhook")
+		return
+	}
+	if err := alerting.ValidateWeComWebhookURL(cfg.WebhookURL); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	if err := alerting.SendWeComMarkdown(ctx, nil, cfg.WebhookURL, alerting.RenderDiagnosticTestMarkdown(cfg, h.store.AccountPoolDiagnostics(), time.Now())); err != nil {
+		writeError(c, http.StatusBadGateway, "测试通知发送失败: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // TestImageStorageConnection 用提交的字段临时构造一次 S3Backend，调用 HeadBucket 验证可达性。

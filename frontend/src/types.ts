@@ -260,6 +260,17 @@ export interface SystemSettings {
   image_s3_secret_key: string
   image_s3_prefix: string
   image_s3_force_path_style: boolean
+  account_alert_enabled: boolean
+  account_alert_webhook_url: string
+  account_alert_webhook_configured: boolean
+  account_alert_instance_name: string
+  account_alert_min_available: number
+  account_alert_min_available_ratio: number
+  account_alert_check_interval_seconds: number
+  account_alert_consecutive_failures: number
+  account_alert_cooldown_minutes: number
+  account_alert_recovery_buffer: number
+  account_alert_recovery_ratio_buffer: number
 }
 
 export interface PromptFilterMatch {

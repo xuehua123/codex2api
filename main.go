@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/codex2api/admin"
+	"github.com/codex2api/alerting"
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
@@ -94,6 +95,7 @@ func main() {
 			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:            20,
 			ImageStorageConfig:               "{}",
+			AccountAlertConfig:               alerting.AccountPoolConfigToJSON(alerting.DefaultAccountPoolConfig()),
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -124,6 +126,7 @@ func main() {
 			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:            20,
 			ImageStorageConfig:               "{}",
+			AccountAlertConfig:               alerting.AccountPoolConfigToJSON(alerting.DefaultAccountPoolConfig()),
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
@@ -217,6 +220,11 @@ func main() {
 	// 初始化 admin handler 的连接池设置跟踪
 	adminHandler.SetPoolSizes(settings.PgMaxConns, settings.RedisPoolSize)
 	store.SetUsageProbeFunc(adminHandler.ProbeUsageSnapshot)
+
+	accountAlert := alerting.NewAccountPoolMonitor(store, alerting.AccountPoolConfigFromJSON(settings.AccountAlertConfig))
+	accountAlert.Start()
+	defer accountAlert.Stop()
+	adminHandler.SetAccountAlertMonitor(accountAlert)
 
 	// 启动后台刷新
 	store.StartBackgroundRefresh()
