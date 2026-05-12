@@ -67,6 +67,7 @@ func main() {
 		// 初次运行，保存初始安全设置到数据库
 		log.Printf("初次运行，初始化系统默认设置...")
 		settings = &database.SystemSettings{
+			SiteName:                         database.DefaultSiteName,
 			MaxConcurrency:                   2,
 			GlobalRPM:                        0,
 			TestModel:                        "gpt-5.4",
@@ -101,6 +102,7 @@ func main() {
 	} else if err != nil {
 		log.Printf("警告: 读取系统设置失败: %v，将采用安全后备策略", err)
 		settings = &database.SystemSettings{
+			SiteName:                         database.DefaultSiteName,
 			MaxConcurrency:                   2,
 			GlobalRPM:                        0,
 			TestModel:                        "gpt-5.4",
@@ -163,6 +165,7 @@ func main() {
 	default:
 		log.Printf("%s 连接成功: %s, pool_size=%d", cfg.Cache.Label(), cache.RedactRedisAddr(cfg.Cache.Redis.Addr), redisPoolSize)
 	}
+	proxy.SetResponseContextCache(tc)
 
 	// 4b. 应用数据库连接池设置
 	if settings.PgMaxConns > 0 {
@@ -254,6 +257,7 @@ func main() {
 	// 从环境变量读取 Codex 画像与 Beta 配置。
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
+	handler.SetRuntimeCache(tc)
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket

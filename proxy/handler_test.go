@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
@@ -359,11 +360,53 @@ func TestAccountFilterForSparkRequiresPro(t *testing.T) {
 	if normalFilter == nil || !normalFilter(&auth.Account{PlanType: "plus"}) {
 		t.Fatal("non-spark model filter should allow available accounts")
 	}
+	directOpenAIAccount := &auth.Account{
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://api.openai.com",
+		APIKey:       "sk-test",
+		Models:       []string{"gpt-4.1"},
+	}
+	if normalFilter(directOpenAIAccount) {
+		t.Fatal("codex account filter should reject direct OpenAI Responses accounts")
+	}
+	responsesFilter := accountFilterForResponsesModel("gpt-4.1", false)
+	if !responsesFilter(directOpenAIAccount) {
+		t.Fatal("responses filter should allow direct OpenAI account for configured model")
+	}
+	if responsesFilter(&auth.Account{AccessToken: "codex-at", PlanType: "plus"}) {
+		t.Fatal("responses filter should reject codex accounts for direct-only models")
+	}
+	if !accountFilterForResponsesModel("gpt-4.1", true)(&auth.Account{AccessToken: "codex-at", PlanType: "plus"}) {
+		t.Fatal("responses filter should allow codex accounts when model is in Codex catalog")
+	}
+	if accountFilterForResponsesModel("gpt-4.2", false)(directOpenAIAccount) {
+		t.Fatal("responses filter should reject direct OpenAI account for unconfigured model")
+	}
 	cooled := &auth.Account{PlanType: "pro"}
 	cooled.SetModelCooldownUntil("gpt-5.3-codex-spark", "model_capacity", time.Now().Add(time.Minute))
 	if filter(cooled) {
 		t.Fatal("filter should reject model-cooled accounts")
 	}
+}
+
+func TestSupportedModelIDsIncludesOpenAIResponsesAccountModels(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://api.openai.com",
+		APIKey:       "sk-test",
+		Models:       []string{"gpt-4.1-direct"},
+	})
+
+	handler := &Handler{store: store}
+	models := handler.supportedModelIDs(context.Background())
+	for _, model := range models {
+		if model == "gpt-4.1-direct" {
+			return
+		}
+	}
+	t.Fatalf("supported models missing direct OpenAI model: %v", models)
 }
 
 func TestClassify429UsageLimitExactResetUsesAccountCooldown(t *testing.T) {
@@ -795,6 +838,59 @@ func TestAuthMiddlewareSetsAPIKeyContext(t *testing.T) {
 	}
 	if payload.Raw != key {
 		t.Fatalf("raw = %q, want %q", payload.Raw, key)
+	}
+}
+
+func TestAuthMiddlewareUsesRuntimeAPIKeyCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	key := "sk-test-runtime-cache-1234567890"
+	tc := cache.NewMemory(1)
+	ctx := context.Background()
+	keyPayload, _ := json.Marshal(apiKeyRuntimeRecord{
+		ID:        42,
+		Name:      "Cached Team",
+		CreatedAt: time.Now(),
+	})
+	if err := tc.SetRuntime(ctx, apiKeyCacheNamespace, key, keyPayload, time.Minute); err != nil {
+		t.Fatalf("SetRuntime api key: %v", err)
+	}
+	countPayload, _ := json.Marshal(apiKeyCountRuntimeRecord{Count: 1})
+	if err := tc.SetRuntime(ctx, apiKeyCountCacheNamespace, "all", countPayload, time.Minute); err != nil {
+		t.Fatalf("SetRuntime api key count: %v", err)
+	}
+
+	handler := NewHandler(nil, nil, nil, nil)
+	handler.SetRuntimeCache(tc)
+	router := gin.New()
+	router.Use(handler.authMiddleware())
+	router.GET("/ok", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"id":   c.MustGet(contextAPIKeyID),
+			"name": c.MustGet(contextAPIKeyName),
+			"raw":  c.MustGet("apiKey"),
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
+		Raw  string `json:"raw"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal 返回错误: %v", err)
+	}
+	if payload.ID != 42 || payload.Name != "Cached Team" || payload.Raw != key {
+		t.Fatalf("payload = %#v", payload)
 	}
 }
 
