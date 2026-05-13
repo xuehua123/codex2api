@@ -715,6 +715,154 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 	}
 }
 
+type sseReadResult struct {
+	data []byte
+	err  error
+}
+
+func ReadSSEStreamWithIdleTimeout(body io.Reader, idleTimeout time.Duration, callback func(data []byte) bool) error {
+	if idleTimeout <= 0 {
+		return ReadSSEStream(body, callback)
+	}
+
+	buf := make([]byte, 64*1024)
+
+	lineBufPtr := sseLineBufPool.Get().(*[]byte)
+	lineBuf := (*lineBufPtr)[:0]
+	defer func() {
+		if cap(lineBuf) <= 256*1024 {
+			*lineBufPtr = lineBuf[:0]
+			sseLineBufPool.Put(lineBufPtr)
+		}
+	}()
+
+	var dataLines [][]byte
+	emitEvent := func() bool {
+		if len(dataLines) == 0 {
+			return true
+		}
+
+		data := bytes.Join(dataLines, []byte("\n"))
+		dataLines = dataLines[:0]
+		if bytes.Equal(data, []byte("[DONE]")) {
+			return false
+		}
+		return callback(data)
+	}
+
+	readCh := make(chan sseReadResult, 1)
+	done := make(chan struct{})
+	var doneOnce sync.Once
+	closeDone := func() {
+		doneOnce.Do(func() {
+			close(done)
+			if closer, ok := body.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		})
+	}
+	defer closeDone()
+
+	startRead := func() {
+		go func() {
+			n, err := body.Read(buf)
+			result := sseReadResult{err: err}
+			if n > 0 {
+				result.data = make([]byte, n)
+				copy(result.data, buf[:n])
+			}
+			select {
+			case readCh <- result:
+			case <-done:
+			}
+		}()
+	}
+
+	timer := time.NewTimer(idleTimeout)
+	defer timer.Stop()
+	resetTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(idleTimeout)
+	}
+
+	startRead()
+	for {
+		select {
+		case <-timer.C:
+			closeDone()
+			return fmt.Errorf("idle timeout waiting for upstream SSE")
+		case result := <-readCh:
+			if len(result.data) > 0 {
+				lineBuf = append(lineBuf, result.data...)
+
+				for {
+					idx := bytes.IndexByte(lineBuf, '\n')
+					if idx < 0 {
+						break
+					}
+
+					line := bytes.TrimRight(lineBuf[:idx], "\r")
+					lineBuf = lineBuf[idx+1:]
+
+					if len(line) == 0 {
+						if !emitEvent() {
+							return nil
+						}
+						continue
+					}
+
+					if bytes.HasPrefix(line, []byte(":")) {
+						continue
+					}
+
+					if bytes.HasPrefix(line, []byte("data:")) {
+						data := bytes.TrimPrefix(line, []byte("data:"))
+						data = bytes.TrimPrefix(data, []byte(" "))
+						dataCopy := make([]byte, len(data))
+						copy(dataCopy, data)
+						dataLines = append(dataLines, dataCopy)
+						resetTimer()
+					}
+				}
+
+				if len(lineBuf) > 0 && cap(lineBuf) > 4096 && len(lineBuf) < cap(lineBuf)/4 {
+					compact := make([]byte, len(lineBuf), cap(lineBuf)/2)
+					copy(compact, lineBuf)
+					lineBuf = compact
+				}
+			}
+
+			if result.err != nil {
+				if result.err == io.EOF {
+					if len(lineBuf) > 0 {
+						line := bytes.TrimRight(lineBuf, "\r")
+						if bytes.HasPrefix(line, []byte("data:")) {
+							data := bytes.TrimPrefix(line, []byte("data:"))
+							data = bytes.TrimPrefix(data, []byte(" "))
+							dataCopy := make([]byte, len(data))
+							copy(dataCopy, data)
+							dataLines = append(dataLines, dataCopy)
+							resetTimer()
+						}
+					}
+					if !emitEvent() {
+						return nil
+					}
+					return nil
+				}
+				return result.err
+			}
+
+			startRead()
+		}
+	}
+}
+
 // sseBufferPool 用于复用 SSE 读取缓冲区（64KB 以适应 reasoning 模型的大 thinking block）
 var sseBufferPool = sync.Pool{
 	New: func() interface{} {

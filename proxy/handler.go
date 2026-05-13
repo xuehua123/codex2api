@@ -679,6 +679,86 @@ type streamOutcome struct {
 	penalize       bool
 }
 
+func buildSyntheticResponseFailedPayload(code, message string) []byte {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		code = ErrorCodeUpstreamStreamBreak
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "Upstream stream ended before response.completed"
+	}
+
+	payload := map[string]any{
+		"type": "response.failed",
+		"response": map[string]any{
+			"status": "failed",
+			"error": map[string]any{
+				"type":    ErrorTypeUpstreamError,
+				"code":    code,
+				"message": message,
+			},
+		},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return []byte(`{"type":"response.failed","response":{"status":"failed","error":{"type":"upstream_error","code":"upstream_stream_break","message":"Upstream stream ended before response.completed"}}}`)
+	}
+	return data
+}
+
+func finishResponsesStream(streamWriter *streamFlushWriter, stopKeepalive func() error, pendingPreambleEvents *[][]byte, committed *bool, gotTerminal bool, readErr error, priorWriteErr error, terminalFailurePayload []byte, allowSyntheticFailure bool) ([]byte, error) {
+	writeErr := priorWriteErr
+	if stopKeepalive != nil {
+		if err := stopKeepalive(); writeErr == nil {
+			writeErr = err
+		}
+	}
+	if !gotTerminal && writeErr == nil && allowSyntheticFailure {
+		message := "上游流提前结束，未收到 response.completed 或 response.failed"
+		if readErr != nil {
+			message = fmt.Sprintf("上游流读取失败: %v", readErr)
+		}
+		syntheticFailurePayload := buildSyntheticResponseFailedPayload(ErrorCodeUpstreamStreamBreak, message)
+		writeErr = writeResponsesStreamEvent(streamWriter, pendingPreambleEvents, committed, "response.failed", syntheticFailurePayload)
+		if writeErr == nil {
+			terminalFailurePayload = syntheticFailurePayload
+		}
+	}
+	if writeErr == nil {
+		writeErr = streamWriter.Flush()
+	}
+	return terminalFailurePayload, writeErr
+}
+
+func writeResponsesStreamEvent(streamWriter *streamFlushWriter, pending *[][]byte, committed *bool, eventType string, data []byte) error {
+	if streamWriter == nil {
+		return nil
+	}
+	if pending == nil || committed == nil {
+		return streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", data))
+	}
+
+	if !*committed && isResponsesPreambleEvent(eventType) {
+		*pending = append(*pending, append([]byte(nil), data...))
+		return nil
+	}
+
+	if !*committed {
+		for _, queued := range *pending {
+			if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", queued)); err != nil {
+				return err
+			}
+		}
+		*pending = nil
+	}
+	if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", data)); err != nil {
+		return err
+	}
+	*committed = true
+	return nil
+}
+
 func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) streamOutcome {
 	if gotTerminal {
 		return streamOutcome{logStatusCode: http.StatusOK}
@@ -792,6 +872,13 @@ func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries
 		return false
 	}
 	return true
+}
+
+func shouldHoldRetryableResponseFailed(payload []byte, attempt int, maxRetries int, wroteAnyBody bool, ctxErr error) bool {
+	if attempt >= maxRetries || wroteAnyBody || ctxErr != nil {
+		return false
+	}
+	return classifyResponseFailedOutcome(payload).penalize
 }
 
 func imageGenerationOutputKey(item gjson.Result) string {
@@ -1463,8 +1550,10 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 				streamWriter := newStreamFlushWriter(c.Writer, flusher)
+				stopKeepalive := startStreamKeepalive(c.Request.Context(), streamWriter)
+				var pendingPreambleEvents [][]byte
 				clientGone := false
-				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+				readErr = ReadSSEStreamWithIdleTimeout(resp.Body, currentStreamIdleTimeout(), func(data []byte) bool {
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
 					if !ttftRecorded && isFirstTokenEvent(eventType) {
@@ -1484,23 +1573,23 @@ func (h *Handler) Responses(c *gin.Context) {
 					if eventType == "response.failed" {
 						terminalFailurePayload = append([]byte(nil), data...)
 						gotTerminal = true
+						if shouldHoldRetryableResponseFailed(data, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err()) {
+							return false
+						}
 					}
 					if image, ok := extractImageFromOutputItemDone(data, model); ok {
 						imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 					}
 					if !clientGone {
-						if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", data)); err != nil {
+						if err := writeResponsesStreamEvent(streamWriter, &pendingPreambleEvents, &wroteAnyBody, eventType, data); err != nil {
 							writeErr = err
 							clientGone = true
-						} else {
-							wroteAnyBody = true
 						}
 					}
 					return eventType != "response.completed" && eventType != "response.failed"
 				})
-				if writeErr == nil {
-					writeErr = streamWriter.Flush()
-				}
+				allowSyntheticFailure := attempt >= maxRetries || wroteAnyBody
+				terminalFailurePayload, writeErr = finishResponsesStream(streamWriter, stopKeepalive, &pendingPreambleEvents, &wroteAnyBody, gotTerminal, readErr, writeErr, terminalFailurePayload, allowSyntheticFailure)
 			} else {
 				var respBody []byte
 				respBody, readErr = io.ReadAll(resp.Body)
@@ -1516,7 +1605,6 @@ func (h *Handler) Responses(c *gin.Context) {
 					c.Data(http.StatusOK, contentType, respBody)
 				}
 			}
-
 			totalDuration := int(time.Since(start).Milliseconds())
 			outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 			if len(terminalFailurePayload) > 0 {
@@ -1732,11 +1820,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
+			stopKeepalive := startStreamKeepalive(c.Request.Context(), streamWriter)
+			var pendingPreambleEvents [][]byte
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
 			clientGone := false
-			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+			readErr = ReadSSEStreamWithIdleTimeout(resp.Body, currentStreamIdleTimeout(), func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 				ttftTrace.observe(start, eventType)
@@ -1768,21 +1858,21 @@ func (h *Handler) Responses(c *gin.Context) {
 				if eventType == "response.failed" {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
+					if shouldHoldRetryableResponseFailed(data, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err()) {
+						return false
+					}
 				}
 
 				if !clientGone {
-					if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", data)); err != nil {
+					if err := writeResponsesStreamEvent(streamWriter, &pendingPreambleEvents, &wroteAnyBody, eventType, data); err != nil {
 						writeErr = err
 						clientGone = true
-					} else {
-						wroteAnyBody = true
 					}
 				}
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
-			if writeErr == nil {
-				writeErr = streamWriter.Flush()
-			}
+			allowSyntheticFailure := attempt >= maxRetries || wroteAnyBody
+			terminalFailurePayload, writeErr = finishResponsesStream(streamWriter, stopKeepalive, &pendingPreambleEvents, &wroteAnyBody, gotTerminal, readErr, writeErr, terminalFailurePayload, allowSyntheticFailure)
 		} else {
 			// 非流式收集
 			var lastResponseData []byte
@@ -2404,13 +2494,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return
 			}
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
+			stopKeepalive := startStreamKeepalive(c.Request.Context(), streamWriter)
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
 			clientGone := false
-			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
-				chunk, done := streamTranslator.Translate(data)
-
+			readErr = ReadSSEStreamWithIdleTimeout(resp.Body, currentStreamIdleTimeout(), func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
@@ -2431,8 +2520,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				if eventType == "response.failed" {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
+					if shouldHoldRetryableResponseFailed(data, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err()) {
+						return false
+					}
 				}
 
+				chunk, done := streamTranslator.Translate(data)
 				if !clientGone && chunk != nil {
 					if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", chunk)); err != nil {
 						writeErr = err
@@ -2461,6 +2554,27 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 				return true
 			})
+			if err := stopKeepalive(); writeErr == nil {
+				writeErr = err
+			}
+			if !gotTerminal && writeErr == nil && (attempt >= maxRetries || wroteAnyBody) {
+				message := "上游流提前结束，未收到 response.completed 或 response.failed"
+				if readErr != nil {
+					message = fmt.Sprintf("上游流读取失败: %v", readErr)
+				}
+				terminalFailurePayload = buildSyntheticResponseFailedPayload(ErrorCodeUpstreamStreamBreak, message)
+				chunk, done := streamTranslator.Translate(terminalFailurePayload)
+				if chunk != nil {
+					if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", chunk)); err != nil {
+						writeErr = err
+					}
+				}
+				if done && writeErr == nil {
+					if err := streamWriter.WriteString("data: [DONE]\n\n"); err != nil {
+						writeErr = err
+					}
+				}
+			}
 			if writeErr == nil {
 				writeErr = streamWriter.Flush()
 			}
@@ -2612,15 +2726,21 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 	}
 
 	streamWriter := newStreamFlushWriter(c.Writer, flusher)
+	stopKeepalive := startStreamKeepalive(c.Request.Context(), streamWriter)
+	gotTerminal := false
+	var writeErr error
 	err := ReadSSEStream(body, func(data []byte) bool {
 		chunk, done := TranslateStreamChunk(data, model, chunkID, created)
 		if chunk != nil {
 			if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", chunk)); err != nil {
+				writeErr = err
 				return false
 			}
 		}
 		if done {
+			gotTerminal = true
 			if err := streamWriter.WriteString("data: [DONE]\n\n"); err != nil {
+				writeErr = err
 				return false
 			}
 			_ = streamWriter.Flush()
@@ -2628,10 +2748,31 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 		}
 		return true
 	})
-	_ = streamWriter.Flush()
+	if keepaliveErr := stopKeepalive(); writeErr == nil {
+		writeErr = keepaliveErr
+	}
+	if !gotTerminal && writeErr == nil {
+		message := "上游流提前结束，未收到 response.completed 或 response.failed"
+		if err != nil {
+			message = fmt.Sprintf("上游流读取失败: %v", err)
+		}
+		chunk, done := TranslateStreamChunk(buildSyntheticResponseFailedPayload(ErrorCodeUpstreamStreamBreak, message), model, chunkID, created)
+		if chunk != nil {
+			writeErr = streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", chunk))
+		}
+		if done && writeErr == nil {
+			writeErr = streamWriter.WriteString("data: [DONE]\n\n")
+		}
+	}
+	if writeErr == nil {
+		writeErr = streamWriter.Flush()
+	}
 
 	if err != nil {
 		log.Printf("读取上游流失败: %v", err)
+	}
+	if writeErr != nil {
+		log.Printf("写入下游流失败: %v", writeErr)
 	}
 }
 

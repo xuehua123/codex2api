@@ -1129,6 +1129,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		readErr        error
 	)
 	streamWriter := newStreamFlushWriter(c.Writer, flusher)
+	stopKeepalive := startStreamKeepalive(c.Request.Context(), streamWriter)
 	writeEvent := func(eventName string, payload []byte) {
 		var builder strings.Builder
 		if strings.TrimSpace(eventName) != "" {
@@ -1216,6 +1217,9 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		}
 		return true
 	})
+	if keepaliveErr := stopKeepalive(); readErr == nil {
+		readErr = keepaliveErr
+	}
 	if err != nil {
 		return usage, imageCount, firstTokenMs, imageLogInfo, err
 	}

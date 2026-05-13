@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -29,10 +30,26 @@ func sendAnthropicError(c *gin.Context, statusCode int, errType, message string)
 
 // sendAnthropicStreamError 在流式模式中发送错误事件
 func sendAnthropicStreamError(c *gin.Context, errType, message string) {
-	fmt.Fprintf(c.Writer, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":\"%s\"}}\n\n", errType, message)
+	_, _ = fmt.Fprint(c.Writer, anthropicStreamErrorSSE(errType, message))
 	if flusher, ok := c.Writer.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+func anthropicStreamErrorSSE(errType, message string) string {
+	payload, _ := json.Marshal(gin.H{
+		"type": "error",
+		"error": gin.H{
+			"type":    errType,
+			"message": message,
+		},
+	})
+	return fmt.Sprintf("event: error\ndata: %s\n\n", payload)
+}
+
+func anthropicStreamErrorForResponseFailed(payload []byte) string {
+	outcome := classifyResponseFailedOutcome(payload)
+	return anthropicStreamErrorSSE(mapHTTPStatusToAnthropicError(outcome.logStatusCode), outcome.failureMessage)
 }
 
 // mapHTTPStatusToAnthropicError 将 HTTP 状态码映射为 Anthropic 错误类型
@@ -279,8 +296,9 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			translator := newAnthropicStreamTranslator(originalModel)
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
+			stopKeepalive := startStreamKeepalive(c.Request.Context(), streamWriter)
 
-			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+			readErr = ReadSSEStreamWithIdleTimeout(resp.Body, currentStreamIdleTimeout(), func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
@@ -303,6 +321,19 @@ func (h *Handler) Messages(c *gin.Context) {
 				if eventType == "response.failed" {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
+					if shouldHoldRetryableResponseFailed(data, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err()) {
+						return false
+					}
+					if err := streamWriter.WriteString(anthropicStreamErrorForResponseFailed(data)); err != nil {
+						writeErr = err
+					} else {
+						wroteAnyBody = true
+					}
+					return false
+				}
+
+				if !wroteAnyBody && isResponsesPreambleEvent(eventType) {
+					return true
 				}
 
 				// 翻译并写入
@@ -318,12 +349,30 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
+			if err := stopKeepalive(); writeErr == nil {
+				writeErr = err
+			}
 			if writeErr == nil {
 				writeErr = streamWriter.Flush()
 			}
 
-			// 流结束后补齐事件
+			if !gotTerminal && writeErr == nil && (attempt >= maxRetries || wroteAnyBody) {
+				message := "上游流提前结束，未收到 response.completed 或 response.failed"
+				if readErr != nil {
+					message = fmt.Sprintf("上游流读取失败: %v", readErr)
+				}
+				if err := streamWriter.WriteString(anthropicStreamErrorSSE("api_error", message)); err != nil {
+					writeErr = err
+				} else {
+					wroteAnyBody = true
+				}
+			}
 			if writeErr == nil {
+				writeErr = streamWriter.Flush()
+			}
+
+			// 流正常 EOF 时补齐事件；异常断流不能假装正常完成。
+			if writeErr == nil && readErr == nil {
 				finalEvents := translator.finalize()
 				// 仅在 message_stop 未发送过时输出
 				if !gotTerminal {

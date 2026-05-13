@@ -411,6 +411,8 @@ export default function Settings() {
     usage_log_flush_interval_seconds: 5,
     stream_flush_policy: 'immediate',
     stream_flush_interval_ms: 20,
+    stream_idle_timeout_seconds: 120,
+    stream_keepalive_interval_seconds: 10,
     image_storage_backend: 'local',
     image_s3_endpoint: '',
     image_s3_region: '',
@@ -921,6 +923,30 @@ export default function Settings() {
                   max={1000}
                   value={settingsForm.stream_flush_interval_ms}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, stream_flush_interval_ms: parseInt(e.target.value) || 20 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.streamIdleTimeout')} description={t('settings.streamIdleTimeoutDesc')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={3600}
+                  value={settingsForm.stream_idle_timeout_seconds}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const value = parseInt(e.target.value, 10)
+                    setSettingsForm(f => ({ ...f, stream_idle_timeout_seconds: Number.isNaN(value) ? 120 : value }))
+                  }}
+                />
+              </SettingField>
+              <SettingField label={t('settings.streamKeepaliveInterval')} description={t('settings.streamKeepaliveIntervalDesc')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={300}
+                  value={settingsForm.stream_keepalive_interval_seconds}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const value = parseInt(e.target.value, 10)
+                    setSettingsForm(f => ({ ...f, stream_keepalive_interval_seconds: Number.isNaN(value) ? 10 : value }))
+                  }}
                 />
               </SettingField>
             </div>

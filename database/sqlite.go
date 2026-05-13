@@ -123,6 +123,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				usage_log_flush_interval_seconds INTEGER DEFAULT 5,
 				stream_flush_policy TEXT DEFAULT 'immediate',
 				stream_flush_interval_ms INTEGER DEFAULT 20,
+				stream_idle_timeout_seconds INTEGER DEFAULT 120,
+				stream_keepalive_interval_seconds INTEGER DEFAULT 10,
 				image_storage_config TEXT DEFAULT '{}',
 				account_alert_config TEXT DEFAULT '{}'
 			);`,
@@ -308,6 +310,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "usage_log_flush_interval_seconds", "INTEGER DEFAULT 5"},
 		{"system_settings", "stream_flush_policy", "TEXT DEFAULT 'immediate'"},
 		{"system_settings", "stream_flush_interval_ms", "INTEGER DEFAULT 20"},
+		{"system_settings", "stream_idle_timeout_seconds", "INTEGER DEFAULT 120"},
+		{"system_settings", "stream_keepalive_interval_seconds", "INTEGER DEFAULT 10"},
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "account_alert_config", "TEXT DEFAULT '{}'"},
 		{"accounts", "enabled", "INTEGER DEFAULT 1"},

@@ -95,6 +95,8 @@ func main() {
 			UsageLogFlushIntervalSeconds:     5,
 			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:            20,
+			StreamIdleTimeoutSeconds:         120,
+			StreamKeepaliveIntervalSeconds:   10,
 			ImageStorageConfig:               "{}",
 			AccountAlertConfig:               alerting.AccountPoolConfigToJSON(alerting.DefaultAccountPoolConfig()),
 		}
@@ -127,6 +129,8 @@ func main() {
 			UsageLogFlushIntervalSeconds:     5,
 			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:            20,
+			StreamIdleTimeoutSeconds:         120,
+			StreamKeepaliveIntervalSeconds:   10,
 			ImageStorageConfig:               "{}",
 			AccountAlertConfig:               alerting.AccountPoolConfigToJSON(alerting.DefaultAccountPoolConfig()),
 		}
@@ -174,7 +178,7 @@ func main() {
 	}
 	db.SetUsageLogConfig(settings.UsageLogMode, settings.UsageLogBatchSize, settings.UsageLogFlushIntervalSeconds)
 	runtimeSettings := proxy.ApplyRuntimeSettingsFromSystem(settings)
-	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms",
+	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms stream_idle=%ds keepalive=%ds",
 		runtimeSettings.ClientCompatMode,
 		runtimeSettings.CodexMinCLIVersion,
 		db.GetUsageLogMode(),
@@ -182,6 +186,8 @@ func main() {
 		db.GetUsageLogFlushIntervalSeconds(),
 		runtimeSettings.StreamFlushPolicy,
 		runtimeSettings.StreamFlushIntervalMS,
+		runtimeSettings.StreamIdleTimeoutSeconds,
+		runtimeSettings.StreamKeepaliveIntervalSeconds,
 	)
 
 	// 4b'. 应用图片存储后端配置

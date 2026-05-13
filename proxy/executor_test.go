@@ -3,9 +3,11 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 )
@@ -29,6 +31,66 @@ func TestReadSSEStream_MergesMultilineData(t *testing.T) {
 	want := "{\"type\":\"response.output_text.delta\",\n\"delta\":\"hello\"}"
 	if events[0] != want {
 		t.Fatalf("unexpected merged event: got %q want %q", events[0], want)
+	}
+}
+
+func TestReadSSEStreamWithIdleTimeout(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer func() { _ = writer.Close() }()
+
+	err := ReadSSEStreamWithIdleTimeout(reader, 5*time.Millisecond, func(data []byte) bool {
+		t.Fatalf("unexpected SSE data: %s", data)
+		return false
+	})
+	if err == nil || !strings.Contains(err.Error(), "idle timeout waiting for upstream SSE") {
+		t.Fatalf("ReadSSEStreamWithIdleTimeout error = %v, want idle timeout", err)
+	}
+}
+
+func TestReadSSEStreamWithIdleTimeoutAllowsSlowEvents(t *testing.T) {
+	input := strings.NewReader("data: {\"type\":\"response.created\"}\n\n" +
+		"data: {\"type\":\"response.completed\"}\n\n")
+
+	var events []string
+	err := ReadSSEStreamWithIdleTimeout(input, time.Second, func(data []byte) bool {
+		events = append(events, string(data))
+		return true
+	})
+	if err != nil {
+		t.Fatalf("ReadSSEStreamWithIdleTimeout returned error: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2", len(events))
+	}
+}
+
+func TestReadSSEStreamWithIdleTimeoutIgnoresComments(t *testing.T) {
+	reader, writer := io.Pipe()
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if _, err := writer.Write([]byte(": upstream-heartbeat\n\n")); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	err := ReadSSEStreamWithIdleTimeout(reader, 20*time.Millisecond, func(data []byte) bool {
+		t.Fatalf("unexpected SSE data: %s", data)
+		return false
+	})
+	_ = writer.Close()
+	if err == nil || !strings.Contains(err.Error(), "idle timeout waiting for upstream SSE") {
+		t.Fatalf("ReadSSEStreamWithIdleTimeout error = %v, want idle timeout", err)
 	}
 }
 
@@ -176,6 +238,27 @@ func TestShouldTransparentRetryStream(t *testing.T) {
 	}
 	if shouldTransparentRetryStream(retryable, 0, 2, false, context.Canceled, nil) {
 		t.Fatal("expected retry to stop when downstream context is canceled")
+	}
+}
+
+func TestShouldHoldRetryableResponseFailed(t *testing.T) {
+	retryablePayload := []byte(`{"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream overloaded"}}}`)
+	clientPayload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_value","type":"invalid_request_error","message":"bad input"}}}`)
+
+	if !shouldHoldRetryableResponseFailed(retryablePayload, 0, 2, false, nil) {
+		t.Fatal("expected retryable response.failed before first body byte to be held for retry")
+	}
+	if shouldHoldRetryableResponseFailed(retryablePayload, 0, 2, true, nil) {
+		t.Fatal("expected response.failed to be forwarded after downstream body was committed")
+	}
+	if shouldHoldRetryableResponseFailed(retryablePayload, 2, 2, false, nil) {
+		t.Fatal("expected response.failed to be forwarded after max retries")
+	}
+	if shouldHoldRetryableResponseFailed(retryablePayload, 0, 2, false, context.Canceled) {
+		t.Fatal("expected response.failed to be forwarded when downstream context is canceled")
+	}
+	if shouldHoldRetryableResponseFailed(clientPayload, 0, 2, false, nil) {
+		t.Fatal("expected client-side response.failed to be forwarded instead of retried")
 	}
 }
 

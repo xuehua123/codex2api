@@ -160,6 +160,32 @@ func TestUsageLogErrorMessageExtractsStructuredError(t *testing.T) {
 	}
 }
 
+func TestAnthropicStreamErrorSSEEscapesMessage(t *testing.T) {
+	got := anthropicStreamErrorSSE("api_error", `bad "quote"`)
+	if !strings.Contains(got, `event: error`) {
+		t.Fatalf("missing error event: %s", got)
+	}
+	if !strings.Contains(got, `bad \"quote\"`) {
+		t.Fatalf("message was not JSON escaped: %s", got)
+	}
+}
+
+func TestAnthropicStreamErrorForResponseFailed(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"Too many requests"}}}`)
+
+	got := anthropicStreamErrorForResponseFailed(payload)
+
+	if !strings.Contains(got, "event: error") {
+		t.Fatalf("missing error event: %s", got)
+	}
+	if !strings.Contains(got, `"type":"rate_limit_error"`) {
+		t.Fatalf("missing Anthropic rate limit error type: %s", got)
+	}
+	if strings.Contains(got, "message_stop") {
+		t.Fatalf("response.failed must not be translated as a normal stop: %s", got)
+	}
+}
+
 func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

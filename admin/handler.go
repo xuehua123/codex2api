@@ -3235,6 +3235,8 @@ type settingsResponse struct {
 	UsageLogFlushIntervalSeconds     int    `json:"usage_log_flush_interval_seconds"`
 	StreamFlushPolicy                string `json:"stream_flush_policy"`
 	StreamFlushIntervalMS            int    `json:"stream_flush_interval_ms"`
+	StreamIdleTimeoutSeconds         int    `json:"stream_idle_timeout_seconds"`
+	StreamKeepaliveIntervalSeconds   int    `json:"stream_keepalive_interval_seconds"`
 	ImageStorageBackend              string `json:"image_storage_backend"`
 	ImageS3Endpoint                  string `json:"image_s3_endpoint"`
 	ImageS3Region                    string `json:"image_s3_region"`
@@ -3299,6 +3301,8 @@ type updateSettingsReq struct {
 	UsageLogFlushIntervalSeconds     *int    `json:"usage_log_flush_interval_seconds"`
 	StreamFlushPolicy                *string `json:"stream_flush_policy"`
 	StreamFlushIntervalMS            *int    `json:"stream_flush_interval_ms"`
+	StreamIdleTimeoutSeconds         *int    `json:"stream_idle_timeout_seconds"`
+	StreamKeepaliveIntervalSeconds   *int    `json:"stream_keepalive_interval_seconds"`
 	ImageStorageBackend              *string `json:"image_storage_backend"`
 	ImageS3Endpoint                  *string `json:"image_s3_endpoint"`
 	ImageS3Region                    *string `json:"image_s3_region"`
@@ -3487,6 +3491,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:     h.db.GetUsageLogFlushIntervalSeconds(),
 		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		StreamIdleTimeoutSeconds:         runtimeCfg.StreamIdleTimeoutSeconds,
+		StreamKeepaliveIntervalSeconds:   runtimeCfg.StreamKeepaliveIntervalSeconds,
 		ImageStorageBackend:              imgCfg.Backend,
 		ImageS3Endpoint:                  imgCfg.Endpoint,
 		ImageS3Region:                    imgCfg.Region,
@@ -3749,6 +3755,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.StreamFlushIntervalMS != nil {
 		runtimeCfg.StreamFlushIntervalMS = *req.StreamFlushIntervalMS
 		log.Printf("设置已更新: stream_flush_interval_ms = %d", runtimeCfg.StreamFlushIntervalMS)
+	}
+	if req.StreamIdleTimeoutSeconds != nil {
+		runtimeCfg.StreamIdleTimeoutSeconds = *req.StreamIdleTimeoutSeconds
+		log.Printf("设置已更新: stream_idle_timeout_seconds = %d", runtimeCfg.StreamIdleTimeoutSeconds)
+	}
+	if req.StreamKeepaliveIntervalSeconds != nil {
+		runtimeCfg.StreamKeepaliveIntervalSeconds = *req.StreamKeepaliveIntervalSeconds
+		log.Printf("设置已更新: stream_keepalive_interval_seconds = %d", runtimeCfg.StreamKeepaliveIntervalSeconds)
 	}
 	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
 
@@ -4017,6 +4031,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:     usageLogFlushIntervalSeconds,
 		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		StreamIdleTimeoutSeconds:         runtimeCfg.StreamIdleTimeoutSeconds,
+		StreamKeepaliveIntervalSeconds:   runtimeCfg.StreamKeepaliveIntervalSeconds,
 		ImageStorageConfig:               imgConfigJSON,
 		AccountAlertConfig:               accountAlertConfigJSON,
 	})
@@ -4092,6 +4108,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:     usageLogFlushIntervalSeconds,
 		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		StreamIdleTimeoutSeconds:         runtimeCfg.StreamIdleTimeoutSeconds,
+		StreamKeepaliveIntervalSeconds:   runtimeCfg.StreamKeepaliveIntervalSeconds,
 		ImageStorageBackend:              imgCfg.Backend,
 		ImageS3Endpoint:                  imgCfg.Endpoint,
 		ImageS3Region:                    imgCfg.Region,

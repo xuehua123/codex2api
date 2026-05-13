@@ -22,13 +22,20 @@ const (
 	defaultStreamFlushIntervalMS = 20
 	minStreamFlushIntervalMS     = 1
 	maxStreamFlushIntervalMS     = 1000
+
+	defaultStreamIdleTimeoutSeconds       = 120
+	defaultStreamKeepaliveIntervalSeconds = 10
+	maxStreamIdleTimeoutSeconds           = 3600
+	maxStreamKeepaliveIntervalSeconds     = 300
 )
 
 type RuntimeSettings struct {
-	ClientCompatMode      string
-	CodexMinCLIVersion    string
-	StreamFlushPolicy     string
-	StreamFlushIntervalMS int
+	ClientCompatMode               string
+	CodexMinCLIVersion             string
+	StreamFlushPolicy              string
+	StreamFlushIntervalMS          int
+	StreamIdleTimeoutSeconds       int
+	StreamKeepaliveIntervalSeconds int
 }
 
 var runtimeSettings atomic.Value // stores RuntimeSettings
@@ -39,10 +46,12 @@ func init() {
 
 func DefaultRuntimeSettings() RuntimeSettings {
 	return RuntimeSettings{
-		ClientCompatMode:      defaultClientCompatMode,
-		CodexMinCLIVersion:    defaultCodexMinCLIVersion,
-		StreamFlushPolicy:     defaultStreamFlushPolicy,
-		StreamFlushIntervalMS: defaultStreamFlushIntervalMS,
+		ClientCompatMode:               defaultClientCompatMode,
+		CodexMinCLIVersion:             defaultCodexMinCLIVersion,
+		StreamFlushPolicy:              defaultStreamFlushPolicy,
+		StreamFlushIntervalMS:          defaultStreamFlushIntervalMS,
+		StreamIdleTimeoutSeconds:       defaultStreamIdleTimeoutSeconds,
+		StreamKeepaliveIntervalSeconds: defaultStreamKeepaliveIntervalSeconds,
 	}
 }
 
@@ -85,6 +94,18 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.StreamFlushIntervalMS > maxStreamFlushIntervalMS {
 		settings.StreamFlushIntervalMS = maxStreamFlushIntervalMS
 	}
+	if settings.StreamIdleTimeoutSeconds < 0 {
+		settings.StreamIdleTimeoutSeconds = defaults.StreamIdleTimeoutSeconds
+	}
+	if settings.StreamIdleTimeoutSeconds > maxStreamIdleTimeoutSeconds {
+		settings.StreamIdleTimeoutSeconds = maxStreamIdleTimeoutSeconds
+	}
+	if settings.StreamKeepaliveIntervalSeconds < 0 {
+		settings.StreamKeepaliveIntervalSeconds = defaults.StreamKeepaliveIntervalSeconds
+	}
+	if settings.StreamKeepaliveIntervalSeconds > maxStreamKeepaliveIntervalSeconds {
+		settings.StreamKeepaliveIntervalSeconds = maxStreamKeepaliveIntervalSeconds
+	}
 	return settings
 }
 
@@ -95,6 +116,8 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexMinCLIVersion = settings.CodexMinCLIVersion
 		next.StreamFlushPolicy = settings.StreamFlushPolicy
 		next.StreamFlushIntervalMS = settings.StreamFlushIntervalMS
+		next.StreamIdleTimeoutSeconds = settings.StreamIdleTimeoutSeconds
+		next.StreamKeepaliveIntervalSeconds = settings.StreamKeepaliveIntervalSeconds
 	}
 	next = NormalizeRuntimeSettings(next)
 	runtimeSettings.Store(next)
@@ -120,4 +143,20 @@ func currentStreamFlushInterval() time.Duration {
 		ms = defaultStreamFlushIntervalMS
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+func currentStreamIdleTimeout() time.Duration {
+	seconds := CurrentRuntimeSettings().StreamIdleTimeoutSeconds
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func currentStreamKeepaliveInterval() time.Duration {
+	seconds := CurrentRuntimeSettings().StreamKeepaliveIntervalSeconds
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
