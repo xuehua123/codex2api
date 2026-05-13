@@ -22,6 +22,66 @@ func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 	}
 }
 
+func TestRequestTraceEventsBufferedFlushAndFilter(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertRequestTraceEvent(ctx, &RequestTraceEventInput{
+		RequestID:      "trace-test-1",
+		APIKeyID:       42,
+		APIKeyName:     "Team A",
+		APIKeyMasked:   "sk-a****1111",
+		AccountID:      7,
+		Endpoint:       "/v1/responses",
+		Model:          "gpt-5.5",
+		EffectiveModel: "gpt-5.5",
+		Stream:         true,
+		Stage:          "request_start",
+		Message:        "started",
+	}); err != nil {
+		t.Fatalf("InsertRequestTraceEvent(request_start) 返回错误: %v", err)
+	}
+	if err := db.InsertRequestTraceEvent(ctx, &RequestTraceEventInput{
+		RequestID: "trace-test-1",
+		APIKeyID:  42,
+		AccountID: 7,
+		Endpoint:  "/v1/responses",
+		Model:     "gpt-5.5",
+		Stream:    true,
+		Stage:     "request_completed",
+		Attempt:   1,
+		ElapsedMs: 1234,
+	}); err != nil {
+		t.Fatalf("InsertRequestTraceEvent(request_completed) 返回错误: %v", err)
+	}
+	db.flushRequestTraceEvents()
+
+	apiKeyID := int64(42)
+	events, err := db.ListRequestTraceEvents(ctx, RequestTraceEventFilter{
+		RequestID: "trace-test-1",
+		APIKeyID:  &apiKeyID,
+		Limit:     10,
+	})
+	if err != nil {
+		t.Fatalf("ListRequestTraceEvents 返回错误: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2", len(events))
+	}
+	if events[0].Stage != "request_completed" {
+		t.Fatalf("events[0].Stage = %q, want request_completed", events[0].Stage)
+	}
+	if events[1].APIKeyName != "Team A" || events[1].AccountID != 7 || !events[1].Stream {
+		t.Fatalf("request_start event metadata = %+v", events[1])
+	}
+}
+
 func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

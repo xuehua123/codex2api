@@ -1309,6 +1309,12 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	trace := newRequestTrace(c, "/v1/responses", gjson.GetBytes(rawBody, "model").String(), gjson.GetBytes(rawBody, "stream").Bool())
+	traceTerminal := false
+	defer h.traceRequestFallback(c, trace, &traceTerminal)
+	h.traceRequestEvent(c, trace, "request_start", requestTraceFields{
+		Message: fmt.Sprintf("body_bytes=%d stream=%t", len(rawBody), trace.Stream),
+	})
 
 	// Validate request
 	validator := api.NewValidator(rawBody)
@@ -1365,6 +1371,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
+	trace.EffectiveModel = effectiveModel
+	h.traceRequestEvent(c, trace, "request_validated", requestTraceFields{EffectiveModel: effectiveModel})
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
@@ -1388,24 +1396,61 @@ func (h *Handler) Responses(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
+		h.traceRequestEvent(c, trace, "attempt_start", requestTraceFields{
+			Attempt:        attempt + 1,
+			EffectiveModel: effectiveModel,
+		})
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
+			h.traceRequestEvent(c, trace, "queue_wait_start", requestTraceFields{
+				Attempt:        attempt + 1,
+				EffectiveModel: effectiveModel,
+				Message:        "no account immediately available; waiting up to 30s",
+			})
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					traceTerminal = true
+					h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+						Attempt:        attempt + 1,
+						StatusCode:     lastStatusCode,
+						ErrorKind:      "rate_limit",
+						EffectiveModel: effectiveModel,
+						Message:        "no account became available after upstream rate limit retries",
+					})
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
+				traceTerminal = true
+				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+					Attempt:        attempt + 1,
+					StatusCode:     http.StatusServiceUnavailable,
+					ErrorKind:      ErrorCodeNoAvailableAccount,
+					EffectiveModel: effectiveModel,
+					Message:        "no account became available after queue wait",
+				})
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
+			h.traceRequestEvent(c, trace, "queue_wait_end", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				EffectiveModel: effectiveModel,
+				Message:        "account became available",
+			})
 		}
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		useWebsocket := h.shouldUseWebsocketForHTTP()
+		h.traceRequestEvent(c, trace, "account_selected", requestTraceFields{
+			AccountID:      account.ID(),
+			Attempt:        attempt + 1,
+			EffectiveModel: effectiveModel,
+			Message:        fmt.Sprintf("transport_websocket=%t", useWebsocket),
+		})
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -1430,10 +1475,24 @@ func (h *Handler) Responses(c *gin.Context) {
 			lastUpstreamCancel = upstreamCancel
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
+			h.traceRequestEvent(c, trace, "upstream_start", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				EffectiveModel: effectiveModel,
+				Message:        "sending request to OpenAI Responses account",
+			})
 			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, openAIResponsesBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
+				h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     http.StatusBadGateway,
+					ErrorKind:      classifyTransportFailure(reqErr),
+					EffectiveModel: effectiveModel,
+					Message:        reqErr.Error(),
+				})
 				if kind := classifyTransportFailure(reqErr); kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
@@ -1442,17 +1501,49 @@ func (h *Handler) Responses(c *gin.Context) {
 				excludeAccounts[account.ID()] = true
 
 				if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+					traceTerminal = true
+					h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						StatusCode:     http.StatusBadGateway,
+						ErrorKind:      "request_error",
+						EffectiveModel: effectiveModel,
+						Message:        reqErr.Error(),
+					})
 					ErrorToGinResponse(c, reqErr)
 					return
 				}
 
 				log.Printf("OpenAI Responses 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 				if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+					h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						ErrorKind:      classifyTransportFailure(reqErr),
+						EffectiveModel: effectiveModel,
+						Message:        "retrying after request error",
+					})
 					continue
 				}
+				traceTerminal = true
+				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     http.StatusBadGateway,
+					ErrorKind:      classifyTransportFailure(reqErr),
+					EffectiveModel: effectiveModel,
+					Message:        reqErr.Error(),
+				})
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
+			h.traceRequestEvent(c, trace, "upstream_headers", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     resp.StatusCode,
+				EffectiveModel: effectiveModel,
+				Message:        fmt.Sprintf("upstream responded in %dms", durationMs),
+			})
 
 			if resp.StatusCode != http.StatusOK {
 				errBody, _ := io.ReadAll(resp.Body)
@@ -1490,6 +1581,15 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				errorKind := upstreamErrorKind(resp.StatusCode, errBody, decision)
+				h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     resp.StatusCode,
+					ErrorKind:      errorKind,
+					EffectiveModel: effectiveModel,
+					Message:        usageLogErrorMessage(resp.StatusCode, errBody),
+				})
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:         account.ID(),
 					Endpoint:          "/v1/responses",
@@ -1503,16 +1603,33 @@ func (h *Handler) Responses(c *gin.Context) {
 					ServiceTier:       serviceTier,
 					IsRetryAttempt:    shouldRetry,
 					AttemptIndex:      attempt + 1,
-					UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+					UpstreamErrorKind: errorKind,
 					ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 				})
 
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
+					h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						StatusCode:     resp.StatusCode,
+						ErrorKind:      errorKind,
+						EffectiveModel: effectiveModel,
+						Message:        "retrying after upstream HTTP error",
+					})
 					continue
 				}
 
+				traceTerminal = true
+				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     resp.StatusCode,
+					ErrorKind:      errorKind,
+					EffectiveModel: effectiveModel,
+					Message:        usageLogErrorMessage(resp.StatusCode, errBody),
+				})
 				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 				return
 			}
@@ -1533,6 +1650,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			wroteAnyBody := false
 			var imageLogInfo imageUsageLogInfo
 			var terminalFailurePayload []byte
+			firstSSETraced := false
+			firstContentTraced := false
 
 			if isStream {
 				c.Header("Content-Type", "text/event-stream")
@@ -1556,9 +1675,27 @@ func (h *Handler) Responses(c *gin.Context) {
 				readErr = ReadSSEStreamWithIdleTimeout(resp.Body, currentStreamIdleTimeout(), func(data []byte) bool {
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
+					if !firstSSETraced {
+						firstSSETraced = true
+						h.traceRequestEvent(c, trace, "first_sse", requestTraceFields{
+							AccountID:      account.ID(),
+							Attempt:        attempt + 1,
+							EffectiveModel: effectiveModel,
+							Message:        eventType,
+						})
+					}
 					if !ttftRecorded && isFirstTokenEvent(eventType) {
 						firstTokenMs = int(time.Since(start).Milliseconds())
 						ttftRecorded = true
+					}
+					if !firstContentTraced && isFirstTokenEvent(eventType) {
+						firstContentTraced = true
+						h.traceRequestEvent(c, trace, "first_content", requestTraceFields{
+							AccountID:      account.ID(),
+							Attempt:        attempt + 1,
+							EffectiveModel: effectiveModel,
+							Message:        eventType,
+						})
 					}
 					if eventType == "response.output_text.delta" {
 						deltaCharCount += len(parsed.Get("delta").String())
@@ -1573,6 +1710,14 @@ func (h *Handler) Responses(c *gin.Context) {
 					if eventType == "response.failed" {
 						terminalFailurePayload = append([]byte(nil), data...)
 						gotTerminal = true
+						h.traceRequestEvent(c, trace, "response_failed", requestTraceFields{
+							AccountID:      account.ID(),
+							Attempt:        attempt + 1,
+							StatusCode:     responseFailedStatusCode(data),
+							ErrorKind:      upstreamErrorKind(responseFailedStatusCode(data), data, codex429Decision{}),
+							EffectiveModel: effectiveModel,
+							Message:        usageLogErrorMessage(responseFailedStatusCode(data), data),
+						})
 						if shouldHoldRetryableResponseFailed(data, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err()) {
 							return false
 						}
@@ -1594,6 +1739,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				var respBody []byte
 				respBody, readErr = io.ReadAll(resp.Body)
 				if readErr == nil {
+					h.traceRequestEvent(c, trace, "upstream_body", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						StatusCode:     http.StatusOK,
+						EffectiveModel: effectiveModel,
+						Message:        fmt.Sprintf("body_bytes=%d", len(respBody)),
+					})
 					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
@@ -1612,6 +1764,14 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+				h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     outcome.logStatusCode,
+					ErrorKind:      outcome.failureKind,
+					EffectiveModel: effectiveModel,
+					Message:        outcome.failureMessage,
+				})
 				recyclePooledClient(account, proxyURL)
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 				resp.Body.Close()
@@ -1626,6 +1786,14 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				log.Printf("OpenAI Responses 流异常结束 (account %d, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
+				h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     outcome.logStatusCode,
+					ErrorKind:      outcome.failureKind,
+					EffectiveModel: effectiveModel,
+					Message:        outcome.failureMessage,
+				})
 				if deltaCharCount > 0 {
 					estOutputTokens := deltaCharCount / 3
 					if estOutputTokens < 1 {
@@ -1669,6 +1837,25 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			applyImageUsageLogInfo(logInput, imageLogInfo)
 			h.logUsageForRequest(c, logInput)
+			traceTerminal = true
+			if outcome.logStatusCode == http.StatusOK {
+				h.traceRequestEvent(c, trace, "request_completed", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     http.StatusOK,
+					EffectiveModel: effectiveModel,
+					Message:        fmt.Sprintf("duration_ms=%d first_token_ms=%d", totalDuration, firstTokenMs),
+				})
+			} else {
+				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     outcome.logStatusCode,
+					ErrorKind:      outcome.failureKind,
+					EffectiveModel: effectiveModel,
+					Message:        outcome.failureMessage,
+				})
+			}
 
 			resp.Body.Close()
 			if outcome.penalize {
@@ -1693,10 +1880,24 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 		lastUpstreamCancel = upstreamCancel
+		h.traceRequestEvent(c, trace, "upstream_start", requestTraceFields{
+			AccountID:      account.ID(),
+			Attempt:        attempt + 1,
+			EffectiveModel: effectiveModel,
+			Message:        fmt.Sprintf("sending request via codex account websocket=%t", useWebsocket),
+		})
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     http.StatusBadGateway,
+				ErrorKind:      classifyTransportFailure(reqErr),
+				EffectiveModel: effectiveModel,
+				Message:        reqErr.Error(),
+			})
 			if kind := classifyTransportFailure(reqErr); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -1706,17 +1907,49 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			// 不可重试的结构化错误直接返回
 			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+				traceTerminal = true
+				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     http.StatusBadGateway,
+					ErrorKind:      "request_error",
+					EffectiveModel: effectiveModel,
+					Message:        reqErr.Error(),
+				})
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					ErrorKind:      classifyTransportFailure(reqErr),
+					EffectiveModel: effectiveModel,
+					Message:        "retrying after request error",
+				})
 				continue
 			}
+			traceTerminal = true
+			h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     http.StatusBadGateway,
+				ErrorKind:      classifyTransportFailure(reqErr),
+				EffectiveModel: effectiveModel,
+				Message:        reqErr.Error(),
+			})
 			ErrorToGinResponse(c, reqErr)
 			return
 		}
+		h.traceRequestEvent(c, trace, "upstream_headers", requestTraceFields{
+			AccountID:      account.ID(),
+			Attempt:        attempt + 1,
+			StatusCode:     resp.StatusCode,
+			EffectiveModel: effectiveModel,
+			Message:        fmt.Sprintf("upstream responded in %dms", durationMs),
+		})
 
 		if resp.StatusCode != http.StatusOK {
 			errBody, _ := io.ReadAll(resp.Body)
@@ -1755,6 +1988,15 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			errorKind := upstreamErrorKind(resp.StatusCode, errBody, decision)
+			h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     resp.StatusCode,
+				ErrorKind:      errorKind,
+				EffectiveModel: effectiveModel,
+				Message:        usageLogErrorMessage(resp.StatusCode, errBody),
+			})
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),
 				Endpoint:          "/v1/responses",
@@ -1768,16 +2010,33 @@ func (h *Handler) Responses(c *gin.Context) {
 				ServiceTier:       serviceTier,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind: errorKind,
 				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     resp.StatusCode,
+					ErrorKind:      errorKind,
+					EffectiveModel: effectiveModel,
+					Message:        "retrying after upstream HTTP error",
+				})
 				continue
 			}
 
+			traceTerminal = true
+			h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     resp.StatusCode,
+				ErrorKind:      errorKind,
+				EffectiveModel: effectiveModel,
+				Message:        usageLogErrorMessage(resp.StatusCode, errBody),
+			})
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
@@ -1802,6 +2061,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		var responseJSON []byte
 		var imageLogInfo imageUsageLogInfo
 		var terminalFailurePayload []byte
+		firstSSETraced := false
+		firstContentTraced := false
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -1829,12 +2090,30 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStreamWithIdleTimeout(resp.Body, currentStreamIdleTimeout(), func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				if !firstSSETraced {
+					firstSSETraced = true
+					h.traceRequestEvent(c, trace, "first_sse", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						EffectiveModel: effectiveModel,
+						Message:        eventType,
+					})
+				}
 				ttftTrace.observe(start, eventType)
 
 				// TTFT: 记录第一个 output_text.delta 事件的时间
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+				}
+				if !firstContentTraced && isFirstTokenEvent(eventType) {
+					firstContentTraced = true
+					h.traceRequestEvent(c, trace, "first_content", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						EffectiveModel: effectiveModel,
+						Message:        eventType,
+					})
 				}
 
 				// 累计 delta 字符数
@@ -1858,6 +2137,15 @@ func (h *Handler) Responses(c *gin.Context) {
 				if eventType == "response.failed" {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
+					statusCode := responseFailedStatusCode(data)
+					h.traceRequestEvent(c, trace, "response_failed", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						StatusCode:     statusCode,
+						ErrorKind:      upstreamErrorKind(statusCode, data, codex429Decision{}),
+						EffectiveModel: effectiveModel,
+						Message:        usageLogErrorMessage(statusCode, data),
+					})
 					if shouldHoldRetryableResponseFailed(data, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err()) {
 						return false
 					}
@@ -1883,6 +2171,15 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				if !firstSSETraced {
+					firstSSETraced = true
+					h.traceRequestEvent(c, trace, "first_sse", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						EffectiveModel: effectiveModel,
+						Message:        eventType,
+					})
+				}
 				ttftTrace.observe(start, eventType)
 				if outputItem, ok := extractResponseOutputItemDone(data, seenOutputItems); ok {
 					outputItems = append(outputItems, outputItem)
@@ -1893,6 +2190,15 @@ func (h *Handler) Responses(c *gin.Context) {
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+				}
+				if !firstContentTraced && isFirstTokenEvent(eventType) {
+					firstContentTraced = true
+					h.traceRequestEvent(c, trace, "first_content", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						EffectiveModel: effectiveModel,
+						Message:        eventType,
+					})
 				}
 				// 累计 delta 字符数
 				if eventType == "response.output_text.delta" {
@@ -1913,6 +2219,15 @@ func (h *Handler) Responses(c *gin.Context) {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 					lastResponseData = data
+					statusCode := responseFailedStatusCode(data)
+					h.traceRequestEvent(c, trace, "response_failed", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						StatusCode:     statusCode,
+						ErrorKind:      upstreamErrorKind(statusCode, data, codex429Decision{}),
+						EffectiveModel: effectiveModel,
+						Message:        usageLogErrorMessage(statusCode, data),
+					})
 					return false
 				}
 				return true
@@ -1937,6 +2252,14 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     outcome.logStatusCode,
+				ErrorKind:      outcome.failureKind,
+				EffectiveModel: effectiveModel,
+				Message:        outcome.failureMessage,
+			})
 			recyclePooledClient(account, proxyURL)
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -1950,6 +2273,14 @@ func (h *Handler) Responses(c *gin.Context) {
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
+			h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     outcome.logStatusCode,
+				ErrorKind:      outcome.failureKind,
+				EffectiveModel: effectiveModel,
+				Message:        outcome.failureMessage,
+			})
 			if deltaCharCount > 0 {
 				estOutputTokens := deltaCharCount / 3 // 粗略估算: 约 3 字符 = 1 token
 				if estOutputTokens < 1 {
@@ -2008,6 +2339,25 @@ func (h *Handler) Responses(c *gin.Context) {
 		applyImageUsageLogInfo(logInput, imageLogInfo)
 		logSlowResponseTTFT(c, "/v1/responses", model, reasoningEffort, account.ID(), isStream, totalDuration, ttftTrace, usage)
 		h.logUsageForRequest(c, logInput)
+		traceTerminal = true
+		if logStatusCode == http.StatusOK {
+			h.traceRequestEvent(c, trace, "request_completed", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     http.StatusOK,
+				EffectiveModel: effectiveModel,
+				Message:        fmt.Sprintf("duration_ms=%d first_token_ms=%d", totalDuration, firstTokenMs),
+			})
+		} else {
+			h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     logStatusCode,
+				ErrorKind:      outcome.failureKind,
+				EffectiveModel: effectiveModel,
+				Message:        outcome.failureMessage,
+			})
+		}
 
 		resp.Body.Close()
 		SyncCodexUsageState(h.store, account, resp)
@@ -2264,6 +2614,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	trace := newRequestTrace(c, "/v1/chat/completions", gjson.GetBytes(rawBody, "model").String(), gjson.GetBytes(rawBody, "stream").Bool())
+	traceTerminal := false
+	defer h.traceRequestFallback(c, trace, &traceTerminal)
+	h.traceRequestEvent(c, trace, "request_start", requestTraceFields{
+		Message: fmt.Sprintf("body_bytes=%d stream=%t", len(rawBody), trace.Stream),
+	})
 
 	// Validate request
 	validator := api.NewValidator(rawBody)
@@ -2317,6 +2673,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
+	trace.EffectiveModel = effectiveModel
+	h.traceRequestEvent(c, trace, "request_validated", requestTraceFields{EffectiveModel: effectiveModel})
 	accountFilter := accountFilterForModel(effectiveModel)
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
@@ -2343,24 +2701,61 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
+		h.traceRequestEvent(c, trace, "attempt_start", requestTraceFields{
+			Attempt:        attempt + 1,
+			EffectiveModel: effectiveModel,
+		})
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
+			h.traceRequestEvent(c, trace, "queue_wait_start", requestTraceFields{
+				Attempt:        attempt + 1,
+				EffectiveModel: effectiveModel,
+				Message:        "no account immediately available; waiting up to 30s",
+			})
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					traceTerminal = true
+					h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+						Attempt:        attempt + 1,
+						StatusCode:     lastStatusCode,
+						ErrorKind:      "rate_limit",
+						EffectiveModel: effectiveModel,
+						Message:        "no account became available after upstream rate limit retries",
+					})
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
+				traceTerminal = true
+				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+					Attempt:        attempt + 1,
+					StatusCode:     http.StatusServiceUnavailable,
+					ErrorKind:      ErrorCodeNoAvailableAccount,
+					EffectiveModel: effectiveModel,
+					Message:        "no account became available after queue wait",
+				})
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
+			h.traceRequestEvent(c, trace, "queue_wait_end", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				EffectiveModel: effectiveModel,
+				Message:        "account became available",
+			})
 		}
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		useWebsocket := h.shouldUseWebsocketForHTTP()
+		h.traceRequestEvent(c, trace, "account_selected", requestTraceFields{
+			AccountID:      account.ID(),
+			Attempt:        attempt + 1,
+			EffectiveModel: effectiveModel,
+			Message:        fmt.Sprintf("transport_websocket=%t", useWebsocket),
+		})
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -2387,10 +2782,24 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 		lastUpstreamCancel = upstreamCancel
+		h.traceRequestEvent(c, trace, "upstream_start", requestTraceFields{
+			AccountID:      account.ID(),
+			Attempt:        attempt + 1,
+			EffectiveModel: effectiveModel,
+			Message:        fmt.Sprintf("sending request via codex account websocket=%t", useWebsocket),
+		})
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     http.StatusBadGateway,
+				ErrorKind:      classifyTransportFailure(reqErr),
+				EffectiveModel: effectiveModel,
+				Message:        reqErr.Error(),
+			})
 			if kind := classifyTransportFailure(reqErr); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -2400,17 +2809,49 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			// 不可重试的结构化错误直接返回
 			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+				traceTerminal = true
+				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     http.StatusBadGateway,
+					ErrorKind:      "request_error",
+					EffectiveModel: effectiveModel,
+					Message:        reqErr.Error(),
+				})
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					ErrorKind:      classifyTransportFailure(reqErr),
+					EffectiveModel: effectiveModel,
+					Message:        "retrying after request error",
+				})
 				continue
 			}
+			traceTerminal = true
+			h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     http.StatusBadGateway,
+				ErrorKind:      classifyTransportFailure(reqErr),
+				EffectiveModel: effectiveModel,
+				Message:        reqErr.Error(),
+			})
 			ErrorToGinResponse(c, reqErr)
 			return
 		}
+		h.traceRequestEvent(c, trace, "upstream_headers", requestTraceFields{
+			AccountID:      account.ID(),
+			Attempt:        attempt + 1,
+			StatusCode:     resp.StatusCode,
+			EffectiveModel: effectiveModel,
+			Message:        fmt.Sprintf("upstream responded in %dms", durationMs),
+		})
 
 		if resp.StatusCode != http.StatusOK {
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
@@ -2428,6 +2869,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", model, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			errorKind := upstreamErrorKind(resp.StatusCode, errBody, decision)
+			h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     resp.StatusCode,
+				ErrorKind:      errorKind,
+				EffectiveModel: effectiveModel,
+				Message:        usageLogErrorMessage(resp.StatusCode, errBody),
+			})
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),
 				Endpoint:          "/v1/chat/completions",
@@ -2441,16 +2891,33 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				ServiceTier:       serviceTier,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind: errorKind,
 				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
+					AccountID:      account.ID(),
+					Attempt:        attempt + 1,
+					StatusCode:     resp.StatusCode,
+					ErrorKind:      errorKind,
+					EffectiveModel: effectiveModel,
+					Message:        "retrying after upstream HTTP error",
+				})
 				continue
 			}
 
+			traceTerminal = true
+			h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     resp.StatusCode,
+				ErrorKind:      errorKind,
+				EffectiveModel: effectiveModel,
+				Message:        usageLogErrorMessage(resp.StatusCode, errBody),
+			})
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
@@ -2473,6 +2940,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		wroteAnyBody := false
 		var compactResult []byte
 		var terminalFailurePayload []byte
+		firstSSETraced := false
+		firstContentTraced := false
 
 		chunkID := "chatcmpl-" + uuid.New().String()[:8]
 		created := time.Now().Unix()
@@ -2502,9 +2971,27 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = ReadSSEStreamWithIdleTimeout(resp.Body, currentStreamIdleTimeout(), func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				if !firstSSETraced {
+					firstSSETraced = true
+					h.traceRequestEvent(c, trace, "first_sse", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						EffectiveModel: effectiveModel,
+						Message:        eventType,
+					})
+				}
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+				}
+				if !firstContentTraced && isFirstTokenEvent(eventType) {
+					firstContentTraced = true
+					h.traceRequestEvent(c, trace, "first_content", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						EffectiveModel: effectiveModel,
+						Message:        eventType,
+					})
 				}
 				// 累计 delta 字符数（文本 + function call 参数）
 				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
@@ -2520,6 +3007,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				if eventType == "response.failed" {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
+					statusCode := responseFailedStatusCode(data)
+					h.traceRequestEvent(c, trace, "response_failed", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						StatusCode:     statusCode,
+						ErrorKind:      upstreamErrorKind(statusCode, data, codex429Decision{}),
+						EffectiveModel: effectiveModel,
+						Message:        usageLogErrorMessage(statusCode, data),
+					})
 					if shouldHoldRetryableResponseFailed(data, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err()) {
 						return false
 					}
@@ -2585,9 +3081,27 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				if !firstSSETraced {
+					firstSSETraced = true
+					h.traceRequestEvent(c, trace, "first_sse", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						EffectiveModel: effectiveModel,
+						Message:        eventType,
+					})
+				}
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+				}
+				if !firstContentTraced && isFirstTokenEvent(eventType) {
+					firstContentTraced = true
+					h.traceRequestEvent(c, trace, "first_content", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						EffectiveModel: effectiveModel,
+						Message:        eventType,
+					})
 				}
 				switch eventType {
 				case "response.output_text.delta":
@@ -2608,6 +3122,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				case "response.failed":
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
+					statusCode := responseFailedStatusCode(data)
+					h.traceRequestEvent(c, trace, "response_failed", requestTraceFields{
+						AccountID:      account.ID(),
+						Attempt:        attempt + 1,
+						StatusCode:     statusCode,
+						ErrorKind:      upstreamErrorKind(statusCode, data, codex429Decision{}),
+						EffectiveModel: effectiveModel,
+						Message:        usageLogErrorMessage(statusCode, data),
+					})
 					return false
 				}
 				return true
@@ -2624,6 +3147,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     outcome.logStatusCode,
+				ErrorKind:      outcome.failureKind,
+				EffectiveModel: effectiveModel,
+				Message:        outcome.failureMessage,
+			})
 			recyclePooledClient(account, proxyURL)
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -2637,6 +3168,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
+			h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     outcome.logStatusCode,
+				ErrorKind:      outcome.failureKind,
+				EffectiveModel: effectiveModel,
+				Message:        outcome.failureMessage,
+			})
 			if deltaCharCount > 0 {
 				estOutputTokens := deltaCharCount / 3
 				if estOutputTokens < 1 {
@@ -2693,6 +3232,25 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logInput.CachedTokens = usage.CachedTokens
 		}
 		h.logUsageForRequest(c, logInput)
+		traceTerminal = true
+		if logStatusCode == http.StatusOK {
+			h.traceRequestEvent(c, trace, "request_completed", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     http.StatusOK,
+				EffectiveModel: effectiveModel,
+				Message:        fmt.Sprintf("duration_ms=%d first_token_ms=%d", totalDuration, firstTokenMs),
+			})
+		} else {
+			h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
+				AccountID:      account.ID(),
+				Attempt:        attempt + 1,
+				StatusCode:     logStatusCode,
+				ErrorKind:      outcome.failureKind,
+				EffectiveModel: effectiveModel,
+				Message:        outcome.failureMessage,
+			})
+		}
 
 		resp.Body.Close()
 		SyncCodexUsageState(h.store, account, resp)

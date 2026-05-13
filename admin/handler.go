@@ -238,6 +238,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
 	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
+	api.GET("/ops/request-traces", h.GetRequestTraceEvents)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
@@ -2881,6 +2882,74 @@ func (h *Handler) GetOpsErrorSummary(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// GetRequestTraceEvents 获取请求链路诊断事件，仅管理员可见。
+func (h *Handler) GetRequestTraceEvents(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	filter := database.RequestTraceEventFilter{
+		RequestID: strings.TrimSpace(c.Query("request_id")),
+		Stage:     strings.TrimSpace(c.Query("stage")),
+		ErrorOnly: c.Query("error_only") == "true",
+	}
+	if limitStr := c.Query("limit"); limitStr != "" {
+		limit, err := strconv.Atoi(limitStr)
+		if err != nil || limit <= 0 || limit > 1000 {
+			writeError(c, http.StatusBadRequest, "limit 参数无效，需要 1-1000")
+			return
+		}
+		filter.Limit = limit
+	}
+	if sinceStr := c.Query("since_minutes"); sinceStr != "" {
+		sinceMinutes, err := strconv.Atoi(sinceStr)
+		if err != nil || sinceMinutes <= 0 || sinceMinutes > 24*60 {
+			writeError(c, http.StatusBadRequest, "since_minutes 参数无效，需要 1-1440")
+			return
+		}
+		filter.End = time.Now()
+		filter.Start = filter.End.Add(-time.Duration(sinceMinutes) * time.Minute)
+	}
+	if startStr := c.Query("start"); startStr != "" {
+		startTime, err := time.Parse(time.RFC3339, startStr)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "start 参数格式错误，需要 RFC3339 格式")
+			return
+		}
+		filter.Start = startTime
+	}
+	if endStr := c.Query("end"); endStr != "" {
+		endTime, err := time.Parse(time.RFC3339, endStr)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "end 参数格式错误，需要 RFC3339 格式")
+			return
+		}
+		filter.End = endTime
+	}
+	if apiKeyIDStr := c.Query("api_key_id"); apiKeyIDStr != "" {
+		apiKeyID, err := strconv.ParseInt(apiKeyIDStr, 10, 64)
+		if err != nil || apiKeyID <= 0 {
+			writeError(c, http.StatusBadRequest, "api_key_id 参数无效，需要正整数")
+			return
+		}
+		filter.APIKeyID = &apiKeyID
+	}
+	if accountIDStr := c.Query("account_id"); accountIDStr != "" {
+		accountID, err := strconv.ParseInt(accountIDStr, 10, 64)
+		if err != nil || accountID <= 0 {
+			writeError(c, http.StatusBadRequest, "account_id 参数无效，需要正整数")
+			return
+		}
+		filter.AccountID = &accountID
+	}
+
+	events, err := h.db.ListRequestTraceEvents(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"events": events})
 }
 
 // GetUsageLogs 获取使用日志

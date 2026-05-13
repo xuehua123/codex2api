@@ -104,6 +104,14 @@ type DB struct {
 	usageLogBatchSize     int64
 	usageLogFlushInterval int64 // ns
 	logFlushNotify        chan struct{}
+
+	// 请求链路诊断事件。与 usage log 分离，usage log 关闭时仍然保留，
+	// 用于定位“客户端 Thinking 但后台没有用量记录”的请求阶段。
+	traceBuf         []requestTraceEntry
+	traceMu          sync.Mutex
+	traceStop        chan struct{}
+	traceWg          sync.WaitGroup
+	traceFlushNotify chan struct{}
 }
 
 const (
@@ -230,10 +238,12 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	}
 
 	db := &DB{
-		conn:           conn,
-		driver:         driver,
-		logStop:        make(chan struct{}),
-		logFlushNotify: make(chan struct{}, 1),
+		conn:             conn,
+		driver:           driver,
+		logStop:          make(chan struct{}),
+		logFlushNotify:   make(chan struct{}, 1),
+		traceStop:        make(chan struct{}),
+		traceFlushNotify: make(chan struct{}, 1),
 	}
 	db.SetUsageLogConfig(defaultUsageLogMode, defaultUsageLogBatchSize, defaultUsageLogFlushIntervalSeconds)
 	if db.isSQLite() {
@@ -264,6 +274,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 
 	// 启动批量写入后台协程
 	db.startLogFlusher()
+	db.startTraceFlusher()
 
 	baselineInsert := `
 		INSERT INTO usage_stats_baseline (id) VALUES (1) ON CONFLICT DO NOTHING
@@ -336,6 +347,9 @@ func (db *DB) Close() error {
 	close(db.logStop)
 	db.logWg.Wait()
 	db.flushLogs() // 最后一次 flush
+	close(db.traceStop)
+	db.traceWg.Wait()
+	db.flushRequestTraceEvents()
 	return db.conn.Close()
 }
 
@@ -504,6 +518,30 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS error_message TEXT DEFAULT '';
 
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);
+
+	CREATE TABLE IF NOT EXISTS request_trace_events (
+		id              SERIAL PRIMARY KEY,
+		request_id      VARCHAR(64) NOT NULL,
+		api_key_id      INT DEFAULT 0,
+		api_key_name    VARCHAR(255) DEFAULT '',
+		api_key_masked  VARCHAR(64) DEFAULT '',
+		account_id      INT DEFAULT 0,
+		endpoint        VARCHAR(100) DEFAULT '',
+		model           VARCHAR(100) DEFAULT '',
+		effective_model VARCHAR(100) DEFAULT '',
+		stream          BOOLEAN DEFAULT false,
+		stage           VARCHAR(64) NOT NULL,
+		attempt         INT DEFAULT 0,
+		elapsed_ms      INT DEFAULT 0,
+		status_code     INT DEFAULT 0,
+		error_kind      VARCHAR(64) DEFAULT '',
+		message         TEXT DEFAULT '',
+		created_at      TIMESTAMPTZ DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_request_trace_events_created_at ON request_trace_events(created_at);
+	CREATE INDEX IF NOT EXISTS idx_request_trace_events_request_created ON request_trace_events(request_id, created_at);
+	CREATE INDEX IF NOT EXISTS idx_request_trace_events_api_key_created ON request_trace_events(api_key_id, created_at);
+	CREATE INDEX IF NOT EXISTS idx_request_trace_events_stage_created ON request_trace_events(stage, created_at);
 
 	CREATE TABLE IF NOT EXISTS api_keys (
 		id         SERIAL PRIMARY KEY,
