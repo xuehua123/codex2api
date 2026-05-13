@@ -275,6 +275,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	// 启动批量写入后台协程
 	db.startLogFlusher()
 	db.startTraceFlusher()
+	db.startTraceCleaner()
 
 	baselineInsert := `
 		INSERT INTO usage_stats_baseline (id) VALUES (1) ON CONFLICT DO NOTHING

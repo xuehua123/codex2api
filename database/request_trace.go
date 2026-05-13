@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	requestTraceBatchSize     = 200
-	requestTraceFlushInterval = time.Second
-	maxRequestTraceBuffer     = 20000
+	requestTraceBatchSize             = 200
+	requestTraceFlushInterval         = time.Second
+	requestTraceCleanupInterval       = 10 * time.Minute
+	defaultRequestTraceRetentionHours = 72
+	maxRequestTraceBuffer             = 20000
 )
 
 type requestTraceEntry struct {
@@ -127,6 +131,63 @@ func shouldFlushRequestTraceStage(stage string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func requestTraceRetentionHoursFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv("REQUEST_TRACE_RETENTION_HOURS"))
+	if raw == "" {
+		return defaultRequestTraceRetentionHours
+	}
+	hours, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("REQUEST_TRACE_RETENTION_HOURS=%q 无效，使用默认 %d 小时", raw, defaultRequestTraceRetentionHours)
+		return defaultRequestTraceRetentionHours
+	}
+	if hours <= 0 {
+		log.Printf("REQUEST_TRACE_RETENTION_HOURS=%d 无效，使用默认 %d 小时", hours, defaultRequestTraceRetentionHours)
+		return defaultRequestTraceRetentionHours
+	}
+	if hours > 24*30 {
+		log.Printf("REQUEST_TRACE_RETENTION_HOURS=%d 过大，限制为 720 小时", hours)
+		return 24 * 30
+	}
+	return hours
+}
+
+func (db *DB) startTraceCleaner() {
+	db.traceWg.Add(1)
+	go func() {
+		defer db.traceWg.Done()
+		db.cleanupOldRequestTraceEvents()
+		ticker := time.NewTicker(requestTraceCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				db.cleanupOldRequestTraceEvents()
+			case <-db.traceStop:
+				return
+			}
+		}
+	}()
+}
+
+func (db *DB) cleanupOldRequestTraceEvents() {
+	if db == nil {
+		return
+	}
+	retentionHours := requestTraceRetentionHoursFromEnv()
+	cutoff := time.Now().Add(-time.Duration(retentionHours) * time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	deleted, err := db.ClearOldRequestTraceEvents(ctx, cutoff)
+	if err != nil {
+		log.Printf("清理请求诊断事件失败: %v", err)
+		return
+	}
+	if deleted > 0 {
+		log.Printf("已清理 %d 条超过 %d 小时的请求诊断事件", deleted, retentionHours)
 	}
 }
 

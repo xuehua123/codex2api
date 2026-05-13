@@ -82,6 +82,64 @@ func TestRequestTraceEventsBufferedFlushAndFilter(t *testing.T) {
 	}
 }
 
+func TestRequestTraceRetentionHoursFromEnv(t *testing.T) {
+	t.Setenv("REQUEST_TRACE_RETENTION_HOURS", "")
+	if got := requestTraceRetentionHoursFromEnv(); got != 72 {
+		t.Fatalf("default retention = %d, want 72", got)
+	}
+
+	t.Setenv("REQUEST_TRACE_RETENTION_HOURS", "48")
+	if got := requestTraceRetentionHoursFromEnv(); got != 48 {
+		t.Fatalf("custom retention = %d, want 48", got)
+	}
+
+	t.Setenv("REQUEST_TRACE_RETENTION_HOURS", "0")
+	if got := requestTraceRetentionHoursFromEnv(); got != 72 {
+		t.Fatalf("invalid retention = %d, want 72", got)
+	}
+}
+
+func TestClearOldRequestTraceEvents(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	oldCreatedAt := time.Now().Add(-96 * time.Hour)
+	recentCreatedAt := time.Now().Add(-2 * time.Hour)
+	for _, row := range []struct {
+		requestID string
+		createdAt time.Time
+	}{
+		{requestID: "old-trace", createdAt: oldCreatedAt},
+		{requestID: "recent-trace", createdAt: recentCreatedAt},
+	} {
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO request_trace_events (request_id, stage, created_at) VALUES ($1, $2, $3)`, row.requestID, "request_start", db.timeArg(row.createdAt)); err != nil {
+			t.Fatalf("insert request_trace_events 返回错误: %v", err)
+		}
+	}
+
+	deleted, err := db.ClearOldRequestTraceEvents(ctx, time.Now().Add(-72*time.Hour))
+	if err != nil {
+		t.Fatalf("ClearOldRequestTraceEvents 返回错误: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+
+	events, err := db.ListRequestTraceEvents(ctx, RequestTraceEventFilter{Limit: 10, Start: time.Now().Add(-7 * 24 * time.Hour)})
+	if err != nil {
+		t.Fatalf("ListRequestTraceEvents 返回错误: %v", err)
+	}
+	if len(events) != 1 || events[0].RequestID != "recent-trace" {
+		t.Fatalf("events after cleanup = %+v, want only recent-trace", events)
+	}
+}
+
 func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
