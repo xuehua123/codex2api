@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
+import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts'
 import { api } from '../api'
 import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
@@ -9,7 +10,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { UsageLog, UsageStats } from '../types'
+import type { APIKeyRow, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats } from '../types'
 import { formatCompactEmail } from '../lib/utils'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -24,7 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, BarChart3, KeyRound, Route } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -54,6 +55,28 @@ function getStatusBadgeClassName(statusCode: number): string {
 
 const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
 
+function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
+  return apiKey.name ? `${apiKey.name} · ${apiKey.key}` : apiKey.key
+}
+
+function formatUsageAPIKeyLabel(name?: string, maskedKey?: string): string {
+  const trimmedName = name?.trim() ?? ''
+  if (trimmedName) {
+    return trimmedName
+  }
+
+  const trimmedKey = maskedKey?.trim() ?? ''
+  if (!trimmedKey) {
+    return ''
+  }
+
+  if (trimmedKey.length <= 8) {
+    return trimmedKey
+  }
+
+  return `${trimmedKey.slice(0, 4)}...${trimmedKey.slice(-4)}`
+}
+
 function isImageUsageLog(log: UsageLog): boolean {
   const endpoint = log.inbound_endpoint || log.endpoint || ''
   return endpoint.includes('/images/') || log.model?.startsWith('gpt-image-') || (log.image_count ?? 0) > 0
@@ -71,6 +94,382 @@ function imageResolution(log: UsageLog): string {
     return `${log.image_width}×${log.image_height}`
   }
   return log.image_size || ''
+}
+
+function safeNumber(value?: number | null): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+function formatPercent(value: number, total: number): string {
+  if (total <= 0) return '0.0%'
+  return `${((value / total) * 100).toFixed(1)}%`
+}
+
+interface ModelPieDatum {
+  model: string
+  value: number
+  requests: number
+  share: number
+}
+
+function buildModelPieData(stats: UsageModelStat[], otherLabel: string): ModelPieDatum[] {
+  const base = stats
+    .map((item) => ({
+      model: item.model || 'unknown',
+      value: safeNumber(item.requests),
+      requests: safeNumber(item.requests),
+      share: 0,
+    }))
+    .filter((item) => item.value > 0)
+
+  const total = base.reduce((sum, item) => sum + item.value, 0)
+  if (total <= 0) return []
+
+  const visible = base.slice(0, 4)
+  const overflow = base.slice(4)
+  if (overflow.length > 0) {
+    visible.push({
+      model: otherLabel,
+      value: overflow.reduce((sum, item) => sum + item.value, 0),
+      requests: overflow.reduce((sum, item) => sum + item.requests, 0),
+      share: 0,
+    })
+  }
+
+  return visible.map((item) => ({
+    ...item,
+    share: (item.value / total) * 100,
+  }))
+}
+
+function ModelSharePie({ stats }: { stats: UsageModelStat[] }) {
+  const { t } = useTranslation()
+  const totalRequests = stats.reduce((sum, item) => sum + safeNumber(item.requests), 0)
+  const pieData = buildModelPieData(stats, t('usage.modelStatsOther'))
+  const centerValue = formatTokens(totalRequests)
+  const metricLabel = t('usage.modelPieRequests')
+
+  if (pieData.length === 0) {
+    return (
+      <div className={modelPieShellClass}>
+        <div className="flex min-h-[150px] flex-1 items-center justify-center px-3 text-center text-sm text-muted-foreground">
+          {t('usage.noModelStats')}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className={modelPieShellClass}>
+      <div className="mb-1.5 flex items-start justify-between gap-3">
+        <div>
+          <div className="text-[13px] font-semibold text-foreground">{t('usage.modelPieTitle')}</div>
+          <div className="mt-0.5 text-xs text-muted-foreground">{metricLabel}</div>
+        </div>
+      </div>
+      <div className="relative h-[150px] max-xl:h-[140px]">
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart>
+            <Pie
+              data={pieData}
+              dataKey="value"
+              nameKey="model"
+              cx="50%"
+              cy="50%"
+              innerRadius="54%"
+              outerRadius="78%"
+              paddingAngle={2}
+              stroke="var(--color-card)"
+              strokeWidth={2}
+            >
+              {pieData.map((_, index) => (
+                <Cell key={index} fill={modelPieColors[index % modelPieColors.length]} />
+              ))}
+            </Pie>
+            <RechartsTooltip
+              formatter={(value, name) => [
+                formatTokens(Number(value ?? 0)),
+                String(name ?? ''),
+              ]}
+              contentStyle={{
+                backgroundColor: 'var(--color-card)',
+                border: '1px solid var(--color-border)',
+                borderRadius: 12,
+                boxShadow: '0 16px 36px rgba(15, 23, 42, 0.14)',
+                fontSize: 12,
+              }}
+              itemStyle={{ color: 'var(--color-foreground)' }}
+            />
+          </PieChart>
+        </ResponsiveContainer>
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <div className="max-w-[112px] text-center">
+            <div className="text-[11px] font-medium text-muted-foreground">{metricLabel}</div>
+            <div className="mt-0.5 truncate font-geist-mono text-[13px] font-semibold tabular-nums text-foreground">
+              {centerValue}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 max-sm:grid-cols-1">
+        {pieData.map((item, index) => (
+          <div key={`${item.model}-${index}`} className="flex items-center gap-2 text-xs">
+            <span className="size-2 shrink-0 rounded-full" style={{ background: modelPieColors[index % modelPieColors.length] }} />
+            <span className="min-w-0 flex-1 truncate font-medium text-foreground" title={item.model}>{item.model}</span>
+            <span className="shrink-0 font-geist-mono tabular-nums text-muted-foreground">{item.share.toFixed(1)}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function ModelStatsPanel({ stats }: { stats: UsageModelStat[] }) {
+  const { t } = useTranslation()
+  const totalRequests = stats.reduce((sum, item) => sum + safeNumber(item.requests), 0)
+  const maxRequests = Math.max(1, ...stats.map((item) => safeNumber(item.requests)))
+
+  return (
+    <Card className="py-0">
+      <CardContent className="flex flex-col p-4">
+        <div className="mb-4 flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h3 className="text-base font-semibold text-foreground">{t('usage.modelStatsTitle')}</h3>
+            <p className="mt-1 text-xs text-muted-foreground">{t('usage.modelStatsDesc')}</p>
+          </div>
+          <div className="size-10 flex shrink-0 items-center justify-center rounded-xl bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-300">
+            <BarChart3 className="size-[18px]" />
+          </div>
+        </div>
+
+        {stats.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-8 text-center text-sm text-muted-foreground">
+            {t('usage.noModelStats')}
+          </div>
+        ) : (
+          <div className="grid grid-cols-[minmax(0,1fr)_minmax(220px,260px)] gap-4 max-lg:grid-cols-1">
+            <div className="space-y-2.5">
+              {stats.slice(0, 5).map((item) => {
+                const share = totalRequests > 0 ? (item.requests / totalRequests) * 100 : 0
+                const width = `${Math.max(4, Math.min(100, (item.requests / maxRequests) * 100))}%`
+                return (
+                  <div key={item.model} className="space-y-1">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate font-geist-mono text-[13px] font-semibold leading-tight text-foreground" title={item.model}>
+                          {item.model}
+                        </div>
+                        <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-muted-foreground">
+                          <span>{t('usage.modelStatsRequests')}: {formatTokens(item.requests)}</span>
+                          <span>{t('usage.modelStatsTokens')}: {formatTokens(item.tokens)}</span>
+                          {item.error_count > 0 && (
+                            <span className="text-amber-600 dark:text-amber-400">{t('usage.modelStatsErrors')}: {formatTokens(item.error_count)}</span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="shrink-0 text-right">
+                        <div className="font-geist-mono text-[13px] font-semibold tabular-nums text-muted-foreground">{share.toFixed(1)}%</div>
+                      </div>
+                    </div>
+                    <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                      <div className="h-full rounded-full bg-blue-500/70" style={{ width }} />
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            <ModelSharePie stats={stats} />
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function FeatureStatsPanel({ stats, totalRequests }: { stats?: UsageFeatureStats; totalRequests: number }) {
+  const { t } = useTranslation()
+  const safeStats = stats ?? {
+    stream_requests: 0,
+    sync_requests: 0,
+    fast_requests: 0,
+    cache_hit_requests: 0,
+    reasoning_requests: 0,
+    image_requests: 0,
+    retry_requests: 0,
+    error_requests: 0,
+  }
+  const items = [
+    { label: t('usage.featureStream'), value: safeStats.stream_requests, color: '#6366f1' },
+    { label: t('usage.featureSync'), value: safeStats.sync_requests, color: '#64748b' },
+    { label: t('usage.featureFast'), value: safeStats.fast_requests, color: '#3b82f6' },
+    { label: t('usage.featureCache'), value: safeStats.cache_hit_requests, color: '#06b6d4' },
+    { label: t('usage.featureReasoning'), value: safeStats.reasoning_requests, color: '#f59e0b' },
+    { label: t('usage.featureImage'), value: safeStats.image_requests, color: '#d946ef' },
+    { label: t('usage.featureRetry'), value: safeStats.retry_requests, color: '#f97316' },
+    { label: t('usage.featureError'), value: safeStats.error_requests, color: '#ef4444' },
+  ]
+
+  return (
+    <Card className="py-0">
+      <CardContent className="flex h-full flex-col p-4">
+        <div className="mb-4 flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h3 className="text-base font-semibold text-foreground">{t('usage.featureStatsTitle')}</h3>
+            <p className="mt-1 text-xs text-muted-foreground">{t('usage.featureStatsDesc')}</p>
+          </div>
+          <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-cyan-500/12 text-cyan-600 dark:bg-cyan-500/20 dark:text-cyan-300">
+            <Activity className="size-[18px]" />
+          </div>
+        </div>
+
+        <div className="grid flex-1 grid-cols-2 gap-2 max-sm:grid-cols-1">
+          {items.map((item) => {
+            const pct = totalRequests > 0 ? (item.value / totalRequests) * 100 : 0
+            return (
+              <div
+                key={item.label}
+                className="group relative overflow-hidden rounded-lg border px-3 py-2.5 transition-colors"
+                style={{
+                  background: `color-mix(in srgb, ${item.color} 10%, transparent)`,
+                  borderColor: `color-mix(in srgb, ${item.color} 28%, transparent)`,
+                }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate text-[12px] font-medium text-foreground/80">{item.label}</span>
+                  <span className="font-geist-mono text-[10px] font-semibold tabular-nums text-foreground/60">
+                    {pct.toFixed(1)}%
+                  </span>
+                </div>
+                <div className="mt-0.5 font-geist-mono text-[20px] font-bold leading-tight tabular-nums text-foreground">
+                  {formatTokens(item.value)}
+                </div>
+                <div className="mt-1.5 h-[3px] overflow-hidden rounded-full bg-foreground/5">
+                  <div
+                    className="h-full rounded-full transition-all"
+                    style={{ width: `${Math.min(100, pct)}%`, background: item.color }}
+                  />
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function EndpointStatsPanel({ stats, totalRequests }: { stats: UsageEndpointStat[]; totalRequests: number }) {
+  const { t } = useTranslation()
+  return (
+    <DistributionPanel
+      title={t('usage.endpointStatsTitle')}
+      description={t('usage.endpointStatsDesc')}
+      emptyText={t('usage.noEndpointStats')}
+      icon={<Route className="size-[18px]" />}
+      items={stats.map((item) => ({
+        key: item.endpoint,
+        label: item.endpoint,
+        requests: item.requests,
+        tokens: item.tokens,
+        errors: item.error_count,
+      }))}
+      totalRequests={totalRequests}
+    />
+  )
+}
+
+function APIKeyStatsPanel({ stats, totalRequests }: { stats: UsageAPIKeyStat[]; totalRequests: number }) {
+  const { t } = useTranslation()
+  return (
+    <DistributionPanel
+      title={t('usage.apiKeyStatsTitle')}
+      description={t('usage.apiKeyStatsDesc')}
+      emptyText={t('usage.noApiKeyStats')}
+      icon={<KeyRound className="size-[18px]" />}
+      items={stats.map((item) => ({
+        key: `${item.api_key_id}-${item.label}`,
+        label: item.label,
+        requests: item.requests,
+        tokens: item.tokens,
+        errors: item.error_count,
+      }))}
+      limit={3}
+      totalRequests={totalRequests}
+    />
+  )
+}
+
+function DistributionPanel({
+  title,
+  description,
+  emptyText,
+  icon,
+  items,
+  limit = 6,
+  totalRequests,
+}: {
+  title: string
+  description: string
+  emptyText: string
+  icon: ReactNode
+  items: Array<{ key: string; label: string; requests: number; tokens: number; errors: number }>
+  limit?: number
+  totalRequests: number
+}) {
+  const { t } = useTranslation()
+  const maxRequests = Math.max(1, ...items.map((item) => safeNumber(item.requests)))
+
+  return (
+    <Card className="h-full py-0">
+      <CardContent className="flex h-full flex-col p-4">
+        <div className="mb-4 flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h3 className="text-base font-semibold text-foreground">{title}</h3>
+            <p className="mt-1 text-xs text-muted-foreground">{description}</p>
+          </div>
+          <div className="size-10 flex shrink-0 items-center justify-center rounded-xl bg-muted text-foreground">
+            {icon}
+          </div>
+        </div>
+
+        {items.length === 0 ? (
+          <div className="flex min-h-[150px] flex-1 items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 px-3 text-center text-sm text-muted-foreground">
+            {emptyText}
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {items.slice(0, limit).map((item) => {
+              const width = `${Math.max(5, Math.min(100, (safeNumber(item.requests) / maxRequests) * 100))}%`
+              return (
+                <div key={item.key} className="space-y-1.5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate font-geist-mono text-[13px] font-semibold text-foreground" title={item.label}>
+                        {item.label}
+                      </div>
+                      <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                        <span>{t('usage.modelStatsRequests')}: {formatTokens(item.requests)}</span>
+                        <span>{t('usage.modelStatsTokens')}: {formatTokens(item.tokens)}</span>
+                        {item.errors > 0 && (
+                          <span className="text-amber-600 dark:text-amber-400">{t('usage.modelStatsErrors')}: {formatTokens(item.errors)}</span>
+                        )}
+                      </div>
+                    </div>
+                    <span className="shrink-0 font-geist-mono text-xs tabular-nums text-muted-foreground">
+                      {formatPercent(item.requests, totalRequests)}
+                    </span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-muted">
+                    <div className="h-full rounded-full bg-emerald-500/70" style={{ width }} />
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
 }
 
 function ImageUsageBadge({ log }: { log: UsageLog }) {
@@ -155,6 +554,8 @@ const usageTableHeadClass = 'text-[12px] font-semibold'
 const usageTableTextClass = 'text-[14px]'
 const usageTableMonoClass = 'font-geist-mono text-[13px] tabular-nums'
 const usageTableBadgeClass = 'text-[13px]'
+const modelPieColors = ['#2563eb', '#059669', '#f59e0b', '#dc2626', '#7c3aed', '#0891b2', '#db2777']
+const modelPieShellClass = 'flex min-h-[196px] flex-col border-l border-border pl-4 max-lg:min-h-0 max-lg:border-l-0 max-lg:border-t max-lg:pl-0 max-lg:pt-3'
 
 export default function Usage() {
   const { t } = useTranslation()
@@ -171,9 +572,12 @@ export default function Usage() {
   const [searchEmail, setSearchEmail] = useState('')
   const [filterModel, setFilterModel] = useState('')
   const [filterEndpoint, setFilterEndpoint] = useState('')
+  const [filterApiKeyId, setFilterApiKeyId] = useState('')
   const [filterFast, setFilterFast] = useState('')
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
+  const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = true
   const pageSizeOptions = [10, 20, 50, 100]
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
@@ -201,6 +605,17 @@ export default function Usage() {
     load: loadStats,
   })
 
+  const loadAPIKeys = useCallback(async () => {
+    try {
+      const response = await api.getAPIKeys()
+      setAPIKeys(response.keys ?? [])
+      setAPIKeyLoadFailed(false)
+    } catch {
+      setAPIKeys([])
+      setAPIKeyLoadFailed(true)
+    }
+  }, [])
+
   // 服务端分页加载日志
   const loadLogs = useCallback(async () => {
     setLogsLoading(true)
@@ -211,6 +626,7 @@ export default function Usage() {
         email: searchEmail || undefined,
         model: filterModel || undefined,
         endpoint: filterEndpoint || undefined,
+        apiKeyId: filterApiKeyId || undefined,
         fast: filterFast || undefined,
         stream: filterStream || undefined,
       })
@@ -221,12 +637,16 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterFast, filterStream])
+  }, [timeRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
     void loadLogs()
   }, [loadLogs])
+
+  useEffect(() => {
+    void loadAPIKeys()
+  }, [loadAPIKeys])
 
   useEffect(() => {
     let active = true
@@ -270,19 +690,28 @@ export default function Usage() {
   const totalPromptTokens = stats?.total_prompt_tokens ?? 0
   const totalCompletionTokens = stats?.total_completion_tokens ?? 0
   const todayRequests = stats?.today_requests ?? 0
+  const modelStats = stats?.model_stats ?? []
+  const featureStats = stats?.feature_stats
+  const endpointStats = stats?.endpoint_stats ?? []
+  const apiKeyStats = stats?.api_key_stats ?? []
   const rpm = stats?.rpm ?? 0
   const tpm = stats?.tpm ?? 0
   const errorRate = stats?.error_rate ?? 0
   const avgDurationMs = stats?.avg_duration_ms ?? 0
   const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
-  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterStream || filterFast)
+  const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
+  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
+  const apiKeyOptions = [
+    { label: t('usage.allApiKeys'), value: '' },
+    ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
+  ]
 
   return (
     <StateShell
       variant="page"
       loading={loading}
       error={error}
-      onRetry={() => { void reload(); void loadLogs() }}
+      onRetry={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
       loadingTitle={t('usage.loadingTitle')}
       loadingDescription={t('usage.loadingDesc')}
       errorTitle={t('usage.errorTitle')}
@@ -291,94 +720,102 @@ export default function Usage() {
         <PageHeader
           title={t('usage.title')}
           description={t('usage.description')}
-          onRefresh={() => { void reload(); void loadLogs() }}
+          onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
         />
 
-        {/* Top stats */}
-        <div className="grid grid-cols-2 gap-3 mb-3 max-sm:grid-cols-1">
+        <div className="space-y-6">
+        {/* Stat overview */}
+        <div className="grid grid-cols-5 gap-3 max-xl:grid-cols-3 max-sm:grid-cols-2">
           <Card className="py-0">
-            <CardContent className="flex flex-col gap-2 p-4">
-              <div className="flex items-center justify-between gap-3">
+            <CardContent className="flex flex-col gap-1.5 p-3">
+              <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalRequestsCard')}</span>
-                <div className="size-10 flex items-center justify-center rounded-xl bg-primary/12 text-primary">
-                  <Activity className="size-[18px]" />
+                <div className="flex size-9 items-center justify-center rounded-lg bg-primary/12 text-primary">
+                  <Activity className="size-4" />
                 </div>
               </div>
-              <div className="text-[26px] font-bold leading-none">
+              <div className="text-[22px] font-bold leading-none tabular-nums">
                 {formatTokens(totalRequests)}
               </div>
-              <div className="text-[12px] text-muted-foreground leading-relaxed">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
                 <span className="text-[hsl(var(--success))]">● {t('usage.success')}: {formatTokens(successRequests)}</span>
-                <span className="ml-2 text-muted-foreground">● {t('usage.today')}: {formatTokens(todayRequests)}</span>
+                <span>● {t('usage.today')}: {formatTokens(todayRequests)}</span>
               </div>
             </CardContent>
           </Card>
 
           <Card className="py-0">
-            <CardContent className="flex flex-col gap-2 p-4">
-              <div className="flex items-center justify-between gap-3">
+            <CardContent className="flex flex-col gap-1.5 p-3">
+              <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalTokensCard')}</span>
-                <div className="size-10 flex items-center justify-center rounded-xl bg-[hsl(var(--info-bg))] text-[hsl(var(--info))]">
-                  <Box className="size-[18px]" />
+                <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(var(--info-bg))] text-[hsl(var(--info))]">
+                  <Box className="size-4" />
                 </div>
               </div>
-              <div className="text-[26px] font-bold leading-none">
+              <div className="text-[22px] font-bold leading-none tabular-nums">
                 {formatTokens(totalTokens)}
               </div>
-              <div className="text-[12px] text-muted-foreground leading-relaxed">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
                 <span>{t('usage.inputTokens')}: {formatTokens(totalPromptTokens)}</span>
-                <span className="ml-2">{t('usage.outputTokens')}: {formatTokens(totalCompletionTokens)}</span>
+                <span>{t('usage.outputTokens')}: {formatTokens(totalCompletionTokens)}</span>
               </div>
+            </CardContent>
+          </Card>
+
+          <Card className="py-0">
+            <CardContent className="flex flex-col gap-1.5 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">RPM</span>
+                <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]">
+                  <Clock className="size-4" />
+                </div>
+              </div>
+              <div className="text-[22px] font-bold leading-none tabular-nums">
+                {Math.round(rpm)}
+              </div>
+              <div className="text-[11px] text-muted-foreground leading-snug">{t('usage.rpmDesc')}</div>
+            </CardContent>
+          </Card>
+
+          <Card className="py-0">
+            <CardContent className="flex flex-col gap-1.5 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">TPM</span>
+                <div className="flex size-9 items-center justify-center rounded-lg bg-destructive/12 text-destructive">
+                  <Zap className="size-4" />
+                </div>
+              </div>
+              <div className="text-[22px] font-bold leading-none tabular-nums">
+                {formatTokens(tpm)}
+              </div>
+              <div className="text-[11px] text-muted-foreground leading-snug">{t('usage.tpmDesc')}</div>
+            </CardContent>
+          </Card>
+
+          <Card className="py-0">
+            <CardContent className="flex flex-col gap-1.5 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.errorRateCard')}</span>
+                <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(36_72%_40%/0.12)] text-[hsl(36,72%,40%)]">
+                  <AlertTriangle className="size-4" />
+                </div>
+              </div>
+              <div className="text-[22px] font-bold leading-none tabular-nums">
+                {errorRate.toFixed(1)}%
+              </div>
+              <div className="text-[11px] text-muted-foreground leading-snug">{t('usage.avgLatencyInline', { value: Math.round(avgDurationMs) })}</div>
             </CardContent>
           </Card>
         </div>
 
-        {/* Bottom stats: 3 columns */}
-        <div className="grid grid-cols-3 gap-3 mb-6 max-sm:grid-cols-1">
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-2 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-[11px] font-bold uppercase text-muted-foreground">RPM</span>
-                <div className="size-10 flex items-center justify-center rounded-xl bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]">
-                  <Clock className="size-[18px]" />
-                </div>
-              </div>
-              <div className="text-[26px] font-bold leading-none">
-                {Math.round(rpm)}
-              </div>
-              <div className="text-[12px] text-muted-foreground">{t('usage.rpmDesc')}</div>
-            </CardContent>
-          </Card>
+        <div className="grid grid-cols-[minmax(0,0.5fr)_minmax(360px,0.5fr)] gap-3 max-lg:grid-cols-1">
+          <ModelStatsPanel stats={modelStats} />
+          <FeatureStatsPanel stats={featureStats} totalRequests={totalRequests} />
+        </div>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-2 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-[11px] font-bold uppercase text-muted-foreground">TPM</span>
-                <div className="size-10 flex items-center justify-center rounded-xl bg-destructive/12 text-destructive">
-                  <Zap className="size-[18px]" />
-                </div>
-              </div>
-              <div className="text-[26px] font-bold leading-none">
-                {formatTokens(tpm)}
-              </div>
-              <div className="text-[12px] text-muted-foreground">{t('usage.tpmDesc')}</div>
-            </CardContent>
-          </Card>
-
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-2 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.errorRateCard')}</span>
-                <div className="size-10 flex items-center justify-center rounded-xl bg-[hsl(36_72%_40%/0.12)] text-[hsl(36,72%,40%)]">
-                  <AlertTriangle className="size-[18px]" />
-                </div>
-              </div>
-              <div className="text-[26px] font-bold leading-none">
-                {errorRate.toFixed(1)}%
-              </div>
-              <div className="text-[12px] text-muted-foreground">{t('usage.avgLatencyInline', { value: Math.round(avgDurationMs) })}</div>
-            </CardContent>
-          </Card>
+        <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
+          <EndpointStatsPanel stats={endpointStats} totalRequests={totalRequests} />
+          <APIKeyStatsPanel stats={apiKeyStats} totalRequests={totalRequests} />
         </div>
 
         {/* Logs table */}
@@ -457,12 +894,12 @@ export default function Usage() {
                 compact
                 value={filterModel}
                 onValueChange={(v) => { setFilterModel(v); setPage(1) }}
-	                placeholder={t('usage.allModels')}
-	                options={[
-	                  { label: t('usage.allModels'), value: '' },
-	                  ...modelOptions.map((m) => ({ label: m, value: m })),
-	                ]}
-	              />
+                placeholder={t('usage.allModels')}
+                options={[
+                  { label: t('usage.allModels'), value: '' },
+                  ...modelOptions.map((m) => ({ label: m, value: m })),
+                ]}
+              />
 
               {/* 端点下拉 */}
               <Select
@@ -480,6 +917,17 @@ export default function Usage() {
                   { label: '/v1/messages', value: '/v1/messages' },
                 ]}
               />
+
+              {showAPIKeyFilter && (
+                <Select
+                  className="w-60"
+                  compact
+                  value={filterApiKeyId}
+                  onValueChange={(v) => { setFilterApiKeyId(v); setPage(1) }}
+                  placeholder={t('usage.allApiKeys')}
+                  options={apiKeyOptions}
+                />
+              )}
 
               {/* 类型下拉 */}
               <Select
@@ -517,6 +965,7 @@ export default function Usage() {
                   onClick={() => {
                     setSearchInput(''); setSearchEmail('')
                     setFilterModel(''); setFilterEndpoint('')
+                    setFilterApiKeyId('')
                     setFilterStream(''); setFilterFast('')
                     setPage(1)
                   }}
@@ -542,6 +991,7 @@ export default function Usage() {
                       <TableHead className={usageTableHeadClass}>{t('usage.tableStatus')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableModel')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableAccount')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableApiKey')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableEndpoint')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableToken')}</TableHead>
@@ -598,6 +1048,11 @@ export default function Usage() {
                         </TableCell>
                         <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
                           {formatCompactEmail(log.account_email)}
+                        </TableCell>
+                        <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
+                          <span className="block max-w-[180px] truncate whitespace-nowrap" title={formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}>
+                            {formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}
+                          </span>
                         </TableCell>
                         <TableCell>
                           <div className={`${usageTableMonoClass} leading-relaxed`}>
@@ -686,6 +1141,7 @@ export default function Usage() {
             </StateShell>
           </CardContent>
         </Card>
+        </div>
 
         <ToastNotice toast={toast} />
         {confirmDialog}
