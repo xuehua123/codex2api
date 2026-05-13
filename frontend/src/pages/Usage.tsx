@@ -10,7 +10,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { APIKeyRow, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats } from '../types'
+import type { UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats } from '../types'
 import { formatCompactEmail } from '../lib/utils'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -25,7 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, BarChart3, KeyRound, Route } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, BarChart3, Route } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -54,28 +54,6 @@ function getStatusBadgeClassName(statusCode: number): string {
 }
 
 const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
-
-function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
-  return apiKey.name ? `${apiKey.name} · ${apiKey.key}` : apiKey.key
-}
-
-function formatUsageAPIKeyLabel(name?: string, maskedKey?: string): string {
-  const trimmedName = name?.trim() ?? ''
-  if (trimmedName) {
-    return trimmedName
-  }
-
-  const trimmedKey = maskedKey?.trim() ?? ''
-  if (!trimmedKey) {
-    return ''
-  }
-
-  if (trimmedKey.length <= 8) {
-    return trimmedKey
-  }
-
-  return `${trimmedKey.slice(0, 4)}...${trimmedKey.slice(-4)}`
-}
 
 function isImageUsageLog(log: UsageLog): boolean {
   const endpoint = log.inbound_endpoint || log.endpoint || ''
@@ -378,27 +356,6 @@ function EndpointStatsPanel({ stats, totalRequests }: { stats: UsageEndpointStat
   )
 }
 
-function APIKeyStatsPanel({ stats, totalRequests }: { stats: UsageAPIKeyStat[]; totalRequests: number }) {
-  const { t } = useTranslation()
-  return (
-    <DistributionPanel
-      title={t('usage.apiKeyStatsTitle')}
-      description={t('usage.apiKeyStatsDesc')}
-      emptyText={t('usage.noApiKeyStats')}
-      icon={<KeyRound className="size-[18px]" />}
-      items={stats.map((item) => ({
-        key: `${item.api_key_id}-${item.label}`,
-        label: item.label,
-        requests: item.requests,
-        tokens: item.tokens,
-        errors: item.error_count,
-      }))}
-      limit={3}
-      totalRequests={totalRequests}
-    />
-  )
-}
-
 function DistributionPanel({
   title,
   description,
@@ -572,12 +529,9 @@ export default function Usage() {
   const [searchEmail, setSearchEmail] = useState('')
   const [filterModel, setFilterModel] = useState('')
   const [filterEndpoint, setFilterEndpoint] = useState('')
-  const [filterApiKeyId, setFilterApiKeyId] = useState('')
   const [filterFast, setFilterFast] = useState('')
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
-  const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
-  const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = true
   const pageSizeOptions = [10, 20, 50, 100]
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
@@ -605,17 +559,6 @@ export default function Usage() {
     load: loadStats,
   })
 
-  const loadAPIKeys = useCallback(async () => {
-    try {
-      const response = await api.getAPIKeys()
-      setAPIKeys(response.keys ?? [])
-      setAPIKeyLoadFailed(false)
-    } catch {
-      setAPIKeys([])
-      setAPIKeyLoadFailed(true)
-    }
-  }, [])
-
   // 服务端分页加载日志
   const loadLogs = useCallback(async () => {
     setLogsLoading(true)
@@ -626,7 +569,6 @@ export default function Usage() {
         email: searchEmail || undefined,
         model: filterModel || undefined,
         endpoint: filterEndpoint || undefined,
-        apiKeyId: filterApiKeyId || undefined,
         fast: filterFast || undefined,
         stream: filterStream || undefined,
       })
@@ -637,16 +579,12 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [timeRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
     void loadLogs()
   }, [loadLogs])
-
-  useEffect(() => {
-    void loadAPIKeys()
-  }, [loadAPIKeys])
 
   useEffect(() => {
     let active = true
@@ -693,25 +631,19 @@ export default function Usage() {
   const modelStats = stats?.model_stats ?? []
   const featureStats = stats?.feature_stats
   const endpointStats = stats?.endpoint_stats ?? []
-  const apiKeyStats = stats?.api_key_stats ?? []
   const rpm = stats?.rpm ?? 0
   const tpm = stats?.tpm ?? 0
   const errorRate = stats?.error_rate ?? 0
   const avgDurationMs = stats?.avg_duration_ms ?? 0
   const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
-  const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
-  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
-  const apiKeyOptions = [
-    { label: t('usage.allApiKeys'), value: '' },
-    ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
-  ]
+  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterStream || filterFast)
 
   return (
     <StateShell
       variant="page"
       loading={loading}
       error={error}
-      onRetry={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
+      onRetry={() => { void reload(); void loadLogs() }}
       loadingTitle={t('usage.loadingTitle')}
       loadingDescription={t('usage.loadingDesc')}
       errorTitle={t('usage.errorTitle')}
@@ -720,7 +652,7 @@ export default function Usage() {
         <PageHeader
           title={t('usage.title')}
           description={t('usage.description')}
-          onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
+          onRefresh={() => { void reload(); void loadLogs() }}
         />
 
         <div className="space-y-6">
@@ -813,9 +745,8 @@ export default function Usage() {
           <FeatureStatsPanel stats={featureStats} totalRequests={totalRequests} />
         </div>
 
-        <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
+        <div className="grid grid-cols-1 gap-3">
           <EndpointStatsPanel stats={endpointStats} totalRequests={totalRequests} />
-          <APIKeyStatsPanel stats={apiKeyStats} totalRequests={totalRequests} />
         </div>
 
         {/* Logs table */}
@@ -918,17 +849,6 @@ export default function Usage() {
                 ]}
               />
 
-              {showAPIKeyFilter && (
-                <Select
-                  className="w-60"
-                  compact
-                  value={filterApiKeyId}
-                  onValueChange={(v) => { setFilterApiKeyId(v); setPage(1) }}
-                  placeholder={t('usage.allApiKeys')}
-                  options={apiKeyOptions}
-                />
-              )}
-
               {/* 类型下拉 */}
               <Select
                 className="w-32"
@@ -965,7 +885,6 @@ export default function Usage() {
                   onClick={() => {
                     setSearchInput(''); setSearchEmail('')
                     setFilterModel(''); setFilterEndpoint('')
-                    setFilterApiKeyId('')
                     setFilterStream(''); setFilterFast('')
                     setPage(1)
                   }}
@@ -991,7 +910,6 @@ export default function Usage() {
                       <TableHead className={usageTableHeadClass}>{t('usage.tableStatus')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableModel')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableAccount')}</TableHead>
-                      <TableHead className={usageTableHeadClass}>{t('usage.tableApiKey')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableEndpoint')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>
                       <TableHead className={usageTableHeadClass}>{t('usage.tableToken')}</TableHead>
@@ -1048,11 +966,6 @@ export default function Usage() {
                         </TableCell>
                         <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
                           {formatCompactEmail(log.account_email)}
-                        </TableCell>
-                        <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
-                          <span className="block max-w-[180px] truncate whitespace-nowrap" title={formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}>
-                            {formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}
-                          </span>
                         </TableCell>
                         <TableCell>
                           <div className={`${usageTableMonoClass} leading-relaxed`}>
