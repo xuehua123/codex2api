@@ -470,6 +470,7 @@ func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool) {
 		}, true
 	}
 	if row, ok := h.resolveAPIKeyFromRuntimeCache(key); ok {
+		h.syncAPIKeyAllowedGroups(row)
 		return row, true
 	}
 	if h.db == nil {
@@ -485,6 +486,7 @@ func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool) {
 		return nil, false
 	}
 	h.setAPIKeyRuntimeCache(row)
+	h.syncAPIKeyAllowedGroups(row)
 	return row, true
 }
 
@@ -539,6 +541,13 @@ func (h *Handler) setAPIKeyRuntimeCache(row *database.APIKeyRow) {
 	if err := h.cache.SetRuntime(ctx, apiKeyCacheNamespace, row.Key, payload, apiKeyCacheTTL); err != nil {
 		log.Printf("写入 API Key Redis 缓存失败: id=%d err=%v", row.ID, err)
 	}
+}
+
+func (h *Handler) syncAPIKeyAllowedGroups(row *database.APIKeyRow) {
+	if h == nil || h.store == nil || row == nil || row.ID <= 0 {
+		return
+	}
+	h.store.SetAPIKeyAllowedGroups(row.ID, row.AllowedGroupIDs)
 }
 
 // isValidKey 检查 key 是否有效（配置文件 + DB）
@@ -1353,6 +1362,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 
 	rawBody = normalizeServiceTierField(rawBody)
+	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
+		return
+	}
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
@@ -2421,6 +2434,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 
 	rawBody = normalizeServiceTierField(rawBody)
+	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
+		return
+	}
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)

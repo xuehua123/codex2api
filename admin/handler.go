@@ -9,9 +9,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"reflect"
@@ -62,13 +64,6 @@ type Handler struct {
 	reqCountMu        sync.RWMutex
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
-
-	// 容器自更新状态（由一次性 Watchtower 容器执行实际更新）
-	selfUpdateMu        sync.Mutex
-	selfUpdateRunning   bool
-	selfUpdateStartedAt time.Time
-	selfUpdateMessage   string
-	selfUpdateError     string
 }
 
 type chartCacheEntry struct {
@@ -83,6 +78,8 @@ const (
 	adminAPIKeyCountNamespace     = "api-key-count"
 	adminUsageStatsCacheTTL       = 5 * time.Second
 	adminChartCacheTTL            = 10 * time.Second
+	importFileSizeLimitBytes      = 20 * 1024 * 1024
+	importFileSizeLimitLabel      = "20MB"
 )
 
 func (h *Handler) getRuntimeJSON(ctx context.Context, namespace, key string, dest interface{}) bool {
@@ -116,6 +113,13 @@ func (h *Handler) setRuntimeJSON(ctx context.Context, namespace, key string, val
 	if err := h.cache.SetRuntime(ctx, namespace, key, payload, ttl); err != nil {
 		log.Printf("写入运行态缓存失败: namespace=%s err=%v", namespace, err)
 	}
+}
+
+func validateImportFileSize(fh *multipart.FileHeader) error {
+	if fh.Size > importFileSizeLimitBytes {
+		return fmt.Errorf("文件 %s 大小超过 %s", fh.Filename, importFileSizeLimitLabel)
+	}
+	return nil
 }
 
 func (h *Handler) deleteRuntimeCache(ctx context.Context, namespace, key string) {
@@ -230,10 +234,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
 	api.GET("/keys", h.ListAPIKeys)
 	api.POST("/keys", h.CreateAPIKey)
+	api.PATCH("/keys/:id", h.UpdateAPIKey)
 	api.DELETE("/keys/:id", h.DeleteAPIKey)
+	api.GET("/account-groups", h.ListAccountGroups)
+	api.POST("/account-groups", h.CreateAccountGroup)
+	api.PATCH("/account-groups/:id", h.UpdateAccountGroup)
+	api.DELETE("/account-groups/:id", h.DeleteAccountGroup)
 	api.GET("/health", h.GetHealth)
-	api.GET("/system/update", h.GetSelfUpdateStatus)
-	api.POST("/system/update", h.StartSelfUpdate)
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
 	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
@@ -256,6 +263,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/images/jobs", h.CreateImageGenerationJob)
 	api.GET("/images/jobs", h.ListImageGenerationJobs)
 	api.GET("/images/jobs/:id", h.GetImageGenerationJob)
+	api.DELETE("/images/jobs/:id", h.DeleteImageGenerationJob)
 	api.GET("/images/assets", h.ListImageAssets)
 	api.GET("/images/assets/:id/file", h.GetImageAssetFile)
 	api.DELETE("/images/assets/:id", h.DeleteImageAsset)
@@ -431,6 +439,8 @@ type accountResponse struct {
 	Enabled                  bool                       `json:"enabled"`
 	Locked                   bool                       `json:"locked"`
 	AllowedAPIKeyIDs         []int64                    `json:"allowed_api_key_ids"`
+	Tags                     []string                   `json:"tags"`
+	GroupIDs                 []int64                    `json:"group_ids"`
 	// 图片配额信息
 	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
@@ -518,6 +528,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Enabled:                  row.Enabled,
 			Locked:                   row.Locked,
 			AllowedAPIKeyIDs:         row.GetCredentialInt64Slice("allowed_api_key_ids"),
+			Tags:                     append([]string(nil), row.Tags...),
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),
 			ScoreBiasEffective:       effectiveScoreBias(planType, row.ScoreBiasOverride),
 			BaseConcurrencyOverride:  nullableInt64Pointer(row.BaseConcurrencyOverride),
@@ -526,6 +537,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			UpdatedAt:                row.UpdatedAt.Format(time.RFC3339),
 		}
 		if acc, ok := accountMap[row.ID]; ok {
+			acc.Mu().RLock()
+			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
+			acc.Mu().RUnlock()
 			resp.ActiveRequests = acc.GetActiveRequests()
 			resp.TotalRequests = acc.GetTotalRequests()
 			debug := acc.GetSchedulerDebugSnapshot(int64(h.store.GetMaxConcurrency()))
@@ -637,6 +651,9 @@ type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
+	Tags                    json.RawMessage `json:"tags"`
+	GroupIDs                json.RawMessage `json:"group_ids"`
+	ProxyURL                *string         `json:"proxy_url"`
 }
 
 // UpdateAccountScheduler 更新账号调度配置。
@@ -670,6 +687,16 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	tags, err := parseOptionalStringSliceField(req.Tags, "tags")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	groupIDs, err := parseOptionalIntegerSliceField(req.GroupIDs, "group_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -689,9 +716,28 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			return
 		}
 	}
+	if groupIDs.Set {
+		missingGroupIDs, err := h.db.VerifyAccountGroupIDs(ctx, groupIDs.Values)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验账号分组失败: "+err.Error())
+			return
+		}
+		if len(missingGroupIDs) > 0 {
+			values := make([]string, 0, len(missingGroupIDs))
+			for _, value := range missingGroupIDs {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
 
-	if err := h.db.UpdateAccountSchedulerConfig(ctx, id, scoreBiasOverride, baseConcurrencyOverride, allowedAPIKeyIDs); err != nil {
-		if err == sql.ErrNoRows {
+	proxyURL := database.OptionalString{}
+	if req.ProxyURL != nil {
+		proxyURL = database.OptionalString{Set: true, Value: *req.ProxyURL}
+	}
+	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, scoreBiasOverride, baseConcurrencyOverride, allowedAPIKeyIDs, database.OptionalStringSlice{Set: tags.Set, Values: tags.Values}, groupIDs, proxyURL); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
 		}
@@ -699,32 +745,106 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
-		h.store.ApplyAccountSchedulerOverrides(id, nullableInt64Pointer(scoreBiasOverride), nullableInt64Pointer(baseConcurrencyOverride))
+		if scoreBiasOverride.Set || baseConcurrencyOverride.Set {
+			current := h.store.FindByID(id)
+			var score *int64
+			var concurrency *int64
+			if current != nil {
+				current.Mu().RLock()
+				if current.ScoreBiasOverride != nil {
+					value := *current.ScoreBiasOverride
+					score = &value
+				}
+				if current.BaseConcurrencyOverride != nil {
+					value := *current.BaseConcurrencyOverride
+					concurrency = &value
+				}
+				current.Mu().RUnlock()
+			}
+			if scoreBiasOverride.Set {
+				score = nullableInt64Pointer(scoreBiasOverride.Value)
+			}
+			if baseConcurrencyOverride.Set {
+				concurrency = nullableInt64Pointer(baseConcurrencyOverride.Value)
+			}
+			h.store.ApplyAccountSchedulerOverrides(id, score, concurrency)
+		}
 		if allowedAPIKeyIDs.Set {
 			h.store.ApplyAccountAllowedAPIKeys(id, allowedAPIKeyIDs.Values)
 		}
+	}
+	if h.store != nil && tags.Set {
+		h.store.ApplyAccountTags(id, tags.Values)
+	}
+	if h.store != nil && groupIDs.Set {
+		h.store.ApplyAccountGroups(id, groupIDs.Values)
+	}
+	if h.store != nil && req.ProxyURL != nil {
+		h.store.ApplyAccountProxyURL(id, *req.ProxyURL)
 	}
 
 	writeMessage(c, http.StatusOK, "账号调度配置已更新")
 }
 
-func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxValue int64) (sql.NullInt64, error) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return sql.NullInt64{}, nil
+type optionalStringSlice struct {
+	Set    bool
+	Values []string
+}
+
+func parseOptionalStringSliceField(raw json.RawMessage, field string) (optionalStringSlice, error) {
+	if len(raw) == 0 {
+		return optionalStringSlice{}, nil
+	}
+	if string(raw) == "null" {
+		return optionalStringSlice{Set: true, Values: []string{}}, nil
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return optionalStringSlice{}, fmt.Errorf("%s 必须是字符串数组或 null", field)
+	}
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		clean := strings.TrimSpace(value)
+		if clean == "" {
+			continue
+		}
+		if utf8.RuneCountInString(clean) > 40 {
+			return optionalStringSlice{}, fmt.Errorf("%s 单个标签不能超过 40 字符", field)
+		}
+		key := strings.ToLower(clean)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, clean)
+	}
+	if len(out) > 32 {
+		return optionalStringSlice{}, fmt.Errorf("%s 最多 32 个标签", field)
+	}
+	return optionalStringSlice{Set: true, Values: out}, nil
+}
+
+func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxValue int64) (database.OptionalNullInt64, error) {
+	if len(raw) == 0 {
+		return database.OptionalNullInt64{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalNullInt64{Set: true}, nil
 	}
 
 	var number json.Number
 	if err := json.Unmarshal(raw, &number); err != nil {
-		return sql.NullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
+		return database.OptionalNullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
 	}
 	value, err := number.Int64()
 	if err != nil {
-		return sql.NullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
+		return database.OptionalNullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
 	}
 	if value < minValue || value > maxValue {
-		return sql.NullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
+		return database.OptionalNullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
 	}
-	return sql.NullInt64{Int64: value, Valid: true}, nil
+	return database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: value, Valid: true}}, nil
 }
 
 func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {
@@ -1293,7 +1413,7 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 	if req.AccountID > 0 && req.APIKey == "" {
 		row, err := h.db.GetAccountByID(c.Request.Context(), req.AccountID)
 		if err != nil {
-			if err == sql.ErrNoRows {
+			if errors.Is(err, sql.ErrNoRows) {
 				writeError(c, http.StatusNotFound, "账号不存在")
 				return
 			}
@@ -1359,7 +1479,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	defer cancel()
 	row, err := h.db.GetAccountByID(ctx, id)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
 		}
@@ -1424,7 +1544,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	}
 
 	if err := h.db.UpdateOpenAIResponsesAccount(ctx, id, name, credentials, req.ProxyURL); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
 		}
@@ -1731,8 +1851,8 @@ func readUploadedImportFiles(c *gin.Context) ([]uploadedImportFile, error) {
 
 	result := make([]uploadedImportFile, 0, len(files))
 	for _, fh := range files {
-		if fh.Size > 2*1024*1024 {
-			return nil, fmt.Errorf("文件 %s 大小超过 2MB", fh.Filename)
+		if err := validateImportFileSize(fh); err != nil {
+			return nil, err
 		}
 
 		f, err := fh.Open()
@@ -1804,8 +1924,8 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 	var allTokens []importToken
 
 	for _, fh := range files {
-		if fh.Size > 2*1024*1024 {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 大小超过 2MB", fh.Filename))
+		if err := validateImportFileSize(fh); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
 			return
 		}
 
@@ -2204,6 +2324,10 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 
 	// 软删除：保留账号数据与事件记录，但从运行时池和 active 列表中移除。
 	if err := h.db.SoftDeleteAccount(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
@@ -2264,7 +2388,7 @@ func (h *Handler) ToggleAccountEnabled(c *gin.Context) {
 	defer cancel()
 
 	if err := h.db.SetAccountEnabled(ctx, id, *req.Enabled); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
 		}
@@ -3085,12 +3209,13 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 }
 
 type createKeyReq struct {
-	Name          string   `json:"name"`
-	Key           string   `json:"key"`
-	QuotaLimit    *float64 `json:"quota_limit"`
-	Quota         *float64 `json:"quota"`
-	ExpiresAt     string   `json:"expires_at"`
-	ExpiresInDays *int     `json:"expires_in_days"`
+	Name            string          `json:"name"`
+	Key             string          `json:"key"`
+	QuotaLimit      *float64        `json:"quota_limit"`
+	Quota           *float64        `json:"quota"`
+	ExpiresAt       string          `json:"expires_at"`
+	ExpiresInDays   *int            `json:"expires_in_days"`
+	AllowedGroupIDs json.RawMessage `json:"allowed_group_ids"`
 }
 
 // generateKey 生成随机 API Key
@@ -3146,6 +3271,11 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	allowedGroupIDs, err := parseOptionalIntegerSliceField(req.AllowedGroupIDs, "allowed_group_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	key := req.Key
 	if key == "" {
@@ -3161,16 +3291,38 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
+	if allowedGroupIDs.Set {
+		missing, err := h.db.VerifyAccountGroupIDs(ctx, allowedGroupIDs.Values)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		if len(missing) > 0 {
+			values := make([]string, 0, len(missing))
+			for _, value := range missing {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
 
 	id, err := h.db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
-		Name:       req.Name,
-		Key:        key,
-		QuotaLimit: quotaLimit,
-		ExpiresAt:  expiresAt,
+		Name:            req.Name,
+		Key:             key,
+		QuotaLimit:      quotaLimit,
+		ExpiresAt:       expiresAt,
+		AllowedGroupIDs: allowedGroupIDs.Values,
 	})
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "创建失败: "+err.Error())
 		return
+	}
+	if allowedGroupIDs.Set {
+		values := dedupeInt64(allowedGroupIDs.Values)
+		if h.store != nil {
+			h.store.SetAPIKeyAllowedGroups(id, values)
+		}
 	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, key)
 
@@ -3183,13 +3335,164 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		expiresAtResponse = &formatted
 	}
 	c.JSON(http.StatusOK, createAPIKeyResponse{
-		ID:         id,
-		Key:        key,
-		Name:       req.Name,
-		QuotaLimit: quotaLimit,
-		QuotaUsed:  0,
-		ExpiresAt:  expiresAtResponse,
+		ID:              id,
+		Key:             key,
+		Name:            req.Name,
+		QuotaLimit:      quotaLimit,
+		QuotaUsed:       0,
+		ExpiresAt:       expiresAtResponse,
+		AllowedGroupIDs: dedupeInt64(allowedGroupIDs.Values),
 	})
+}
+
+type updateAPIKeyReq struct {
+	Name            *string         `json:"name"`
+	QuotaLimit      json.RawMessage `json:"quota_limit"`
+	Quota           json.RawMessage `json:"quota"`
+	ExpiresAt       json.RawMessage `json:"expires_at"`
+	ExpiresInDays   *int            `json:"expires_in_days"`
+	AllowedGroupIDs json.RawMessage `json:"allowed_group_ids"`
+}
+
+func (h *Handler) UpdateAPIKey(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效 ID")
+		return
+	}
+	var req updateAPIKeyReq
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	allowedGroupIDs, err := parseOptionalIntegerSliceField(req.AllowedGroupIDs, "allowed_group_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	quotaLimit, quotaLimitSet, err := parseOptionalAPIKeyQuota(req.QuotaLimit, req.Quota)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	expiresAt, expiresAtSet, err := parseOptionalAPIKeyExpiration(req.ExpiresAt, req.ExpiresInDays)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	row, err := h.db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "API Key 不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	if req.Name != nil {
+		name := security.SanitizeInput(*req.Name)
+		if strings.TrimSpace(name) == "" {
+			writeError(c, http.StatusBadRequest, "名称不能为空")
+			return
+		}
+		if utf8.RuneCountInString(name) > 100 {
+			writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+			return
+		}
+		if security.ContainsXSS(name) {
+			writeError(c, http.StatusBadRequest, "名称包含非法字符")
+			return
+		}
+		req.Name = &name
+	}
+	if quotaLimitSet {
+		if quotaLimit > 1000000000 {
+			writeError(c, http.StatusBadRequest, "额度限制不能超过 1000000000")
+			return
+		}
+	}
+	var allowedGroupValues []int64
+	if allowedGroupIDs.Set {
+		missing, err := h.db.VerifyAccountGroupIDs(ctx, allowedGroupIDs.Values)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		if len(missing) > 0 {
+			values := make([]string, 0, len(missing))
+			for _, value := range missing {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+		allowedGroupValues = dedupeInt64(allowedGroupIDs.Values)
+	}
+	update := database.APIKeyUpdate{
+		QuotaLimit:         quotaLimit,
+		QuotaLimitSet:      quotaLimitSet,
+		ExpiresAt:          expiresAt,
+		ExpiresAtSet:       expiresAtSet,
+		AllowedGroupIDs:    allowedGroupValues,
+		AllowedGroupIDsSet: allowedGroupIDs.Set,
+	}
+	if req.Name != nil {
+		update.Name = *req.Name
+		update.NameSet = true
+	}
+	if err := h.db.UpdateAPIKey(ctx, id, update); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if allowedGroupIDs.Set && h.store != nil {
+		h.store.SetAPIKeyAllowedGroups(id, allowedGroupValues)
+	}
+	h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
+	writeMessage(c, http.StatusOK, "API Key 已更新")
+}
+
+func parseOptionalAPIKeyQuota(quotaLimitRaw, quotaRaw json.RawMessage) (float64, bool, error) {
+	raw := quotaLimitRaw
+	if len(raw) == 0 {
+		raw = quotaRaw
+	}
+	if len(raw) == 0 {
+		return 0, false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 0, true, nil
+	}
+	var value float64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, true, fmt.Errorf("额度限制必须是数字")
+	}
+	if value < 0 {
+		return 0, true, fmt.Errorf("额度限制不能小于 0")
+	}
+	return value, true, nil
+}
+
+func parseOptionalAPIKeyExpiration(raw json.RawMessage, expiresInDays *int) (sql.NullTime, bool, error) {
+	if expiresInDays != nil {
+		expiresAt, err := parseAPIKeyExpiresAt("", expiresInDays)
+		return expiresAt, true, err
+	}
+	if len(raw) == 0 {
+		return sql.NullTime{}, false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return sql.NullTime{}, true, nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return sql.NullTime{}, true, fmt.Errorf("过期时间格式无效")
+	}
+	expiresAt, err := parseAPIKeyExpiresAt(value, nil)
+	return expiresAt, true, err
 }
 
 func parseAPIKeyExpiresAt(raw string, expiresInDays *int) (sql.NullTime, error) {
@@ -3248,6 +3551,9 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 	if err := h.db.DeleteAPIKey(ctx, id); err != nil {
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
+	}
+	if h.store != nil {
+		h.store.SetAPIKeyAllowedGroups(id, nil)
 	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, keyToInvalidate)
 	writeMessage(c, http.StatusOK, "已删除")
@@ -3757,10 +4063,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	if req.ProxyPoolEnabled != nil {
-		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
 		if *req.ProxyPoolEnabled {
-			_ = h.store.ReloadProxyPool()
+			if err := h.store.ReloadProxyPool(); err != nil {
+				writeError(c, http.StatusInternalServerError, "代理池刷新失败: "+err.Error())
+				return
+			}
 		}
+		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
 		log.Printf("设置已更新: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
 	}
 
@@ -4358,7 +4667,7 @@ func (h *Handler) GetAccountAuthJSON(c *gin.Context) {
 
 	row, err := h.db.GetAccountByID(ctx, id)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
 		}
@@ -4731,12 +5040,13 @@ func (h *Handler) AddProxies(c *gin.Context) {
 
 	inserted, err := h.db.InsertProxies(ctx, cleaned, req.Label)
 	if err != nil {
-		writeError(c, http.StatusInternalServerError, "添加代理失败")
+		writeError(c, http.StatusInternalServerError, "添加代理失败: "+err.Error())
 		return
 	}
 
-	// 刷新代理池
-	_ = h.store.ReloadProxyPool()
+	if err := h.store.ReloadProxyPool(); err != nil {
+		log.Printf("代理已添加，但代理池刷新失败: %v", err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":  fmt.Sprintf("成功添加 %d 个代理", inserted),
@@ -4757,11 +5067,17 @@ func (h *Handler) DeleteProxy(c *gin.Context) {
 	defer cancel()
 
 	if err := h.db.DeleteProxy(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "代理不存在")
+			return
+		}
 		writeError(c, http.StatusInternalServerError, "删除代理失败")
 		return
 	}
 
-	_ = h.store.ReloadProxyPool()
+	if err := h.store.ReloadProxyPool(); err != nil {
+		log.Printf("代理已删除，但代理池刷新失败: %v", err)
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "代理已删除"})
 }
 
@@ -4774,6 +5090,7 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	}
 
 	var req struct {
+		URL     *string `json:"url"`
 		Label   *string `json:"label"`
 		Enabled *bool   `json:"enabled"`
 	}
@@ -4785,12 +5102,18 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if err := h.db.UpdateProxy(ctx, id, req.Label, req.Enabled); err != nil {
+	if err := h.db.UpdateProxy(ctx, id, req.URL, req.Label, req.Enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "代理不存在")
+			return
+		}
 		writeError(c, http.StatusInternalServerError, "更新代理失败")
 		return
 	}
 
-	_ = h.store.ReloadProxyPool()
+	if err := h.store.ReloadProxyPool(); err != nil {
+		log.Printf("代理已更新，但代理池刷新失败: %v", err)
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "代理已更新"})
 }
 
@@ -4872,7 +5195,10 @@ func (h *Handler) TestProxy(c *gin.Context) {
 	if req.ID > 0 {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 		defer cancel()
-		_ = h.db.UpdateProxyTestResult(ctx, req.ID, ip, location, latencyMs)
+		if err := h.db.UpdateProxyTestResult(ctx, req.ID, ip, location, latencyMs); err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "error": "代理测试结果保存失败: " + err.Error(), "latency_ms": latencyMs})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
