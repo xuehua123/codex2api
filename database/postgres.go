@@ -1969,6 +1969,16 @@ type TrafficSnapshot struct {
 	TPSPeak float64 `json:"tps_peak"`
 }
 
+// OpsUsageSnapshot 运维首页使用的轻量使用统计。
+type OpsUsageSnapshot struct {
+	RPM           float64
+	TPM           float64
+	ErrorRate     float64
+	TodayRequests int64
+	TodayTokens   int64
+	AvgDurationMs float64
+}
+
 // GetUsageStats 获取使用统计（基线 + 当前日志）
 func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	if db.isSQLite() {
@@ -2256,6 +2266,43 @@ func (db *DB) getUsageAPIKeyStats(ctx context.Context, limit int) ([]UsageAPIKey
 		items = []UsageAPIKeyStat{}
 	}
 	return items, nil
+}
+
+// GetOpsUsageSnapshot 获取运维首页需要的轻量使用统计。
+// 不复用 GetUsageStats，避免为了几个实时指标触发全表分组统计。
+func (db *DB) GetOpsUsageSnapshot(ctx context.Context) (*OpsUsageSnapshot, error) {
+	snapshot := &OpsUsageSnapshot{}
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	minuteAgo := now.Add(-1 * time.Minute)
+
+	var todayErrors int64
+	err := db.conn.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*) AS today_requests,
+			COALESCE(SUM(total_tokens), 0) AS today_tokens,
+			COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0) AS rpm,
+			COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0) AS tpm,
+			COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
+			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
+		FROM usage_logs
+		WHERE created_at >= $1
+		  AND status_code <> 499
+	`, db.timeArg(todayStart), db.timeArg(minuteAgo)).Scan(
+		&snapshot.TodayRequests,
+		&snapshot.TodayTokens,
+		&snapshot.RPM,
+		&snapshot.TPM,
+		&snapshot.AvgDurationMs,
+		&todayErrors,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if snapshot.TodayRequests > 0 {
+		snapshot.ErrorRate = float64(todayErrors) / float64(snapshot.TodayRequests) * 100
+	}
+	return snapshot, nil
 }
 
 // GetTrafficSnapshot 获取近实时流量快照

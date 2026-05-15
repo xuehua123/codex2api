@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -159,16 +160,18 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	usageStats, err := h.getUsageStatsCached(ctx)
+	usageCtx, usageCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	usageSnapshot, err := h.db.GetOpsUsageSnapshot(usageCtx)
+	usageCancel()
 	if err != nil {
-		writeInternalError(c, err)
-		return
+		usageSnapshot = &database.OpsUsageSnapshot{}
 	}
 
-	trafficSnapshot, err := h.db.GetTrafficSnapshot(ctx)
+	trafficCtx, trafficCancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	trafficSnapshot, err := h.db.GetTrafficSnapshot(trafficCtx)
+	trafficCancel()
 	if err != nil {
-		writeInternalError(c, err)
-		return
+		trafficSnapshot = &database.TrafficSnapshot{}
 	}
 
 	dbHealthy := h.db.Ping(ctx) == nil
@@ -263,13 +266,13 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 			QPSPeak:       trafficSnapshot.QPSPeak,
 			TPS:           trafficSnapshot.TPS,
 			TPSPeak:       trafficSnapshot.TPSPeak,
-			RPM:           usageStats.RPM,
-			TPM:           usageStats.TPM,
-			ErrorRate:     usageStats.ErrorRate,
-			TodayRequests: usageStats.TodayRequests,
-			TodayTokens:   usageStats.TodayTokens,
+			RPM:           usageSnapshot.RPM,
+			TPM:           usageSnapshot.TPM,
+			ErrorRate:     usageSnapshot.ErrorRate,
+			TodayRequests: usageSnapshot.TodayRequests,
+			TodayTokens:   usageSnapshot.TodayTokens,
 			RPMLimit:      h.rateLimiter.GetRPM(),
-			AvgDurationMs: usageStats.AvgDurationMs,
+			AvgDurationMs: usageSnapshot.AvgDurationMs,
 		},
 	})
 }
