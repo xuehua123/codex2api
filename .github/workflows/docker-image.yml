@@ -2,6 +2,9 @@ name: Build Docker Image
 
 on:
   push:
+    branches:
+      - main
+      - master
     tags:
       - 'v*'
   workflow_dispatch:
@@ -49,10 +52,11 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short,enable={{is_default_branch}}
             type=ref,event=tag
             type=semver,pattern={{version}},value=${{ inputs.build_version || github.ref_name }},enable=${{ inputs.build_version != '' || startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.build_version || github.ref_name }},enable=${{ inputs.build_version != '' || startsWith(github.ref, 'refs/tags/v') }}
-            type=raw,value=latest
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -68,3 +72,133 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
+
+  deploy-new-stable:
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch
+    steps:
+      - name: Deploy to 新稳如狗
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          RESIN_PROXY_URL: ${{ secrets.RESIN_PROXY_URL }}
+          DOCKER_NO_PROXY: ${{ secrets.DOCKER_NO_PROXY || '127.0.0.1,localhost,postgres,redis' }}
+          COMPOSE_DIR: /srv/codex2api
+          COMPOSE_FILE: docker-compose.yml
+          SERVICE_NAME: codex2api
+          HEALTH_URL: http://127.0.0.1:8080/health
+        with:
+          host: ${{ secrets.NEW_STABLE_HOST }}
+          username: ${{ secrets.NEW_STABLE_USER }}
+          password: ${{ secrets.NEW_STABLE_PASSWORD }}
+          port: ${{ secrets.NEW_STABLE_PORT }}
+          envs: IMAGE_REF,GHCR_TOKEN,GHCR_USERNAME,RESIN_PROXY_URL,DOCKER_NO_PROXY,COMPOSE_DIR,COMPOSE_FILE,SERVICE_NAME,HEALTH_URL
+          script_stop: true
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            short_sha="$(printf '%.7s' "${IMAGE_REF##*:sha-}")"
+            deploy_image="${IMAGE_REF%:sha-*}:sha-${short_sha}"
+            cd "$COMPOSE_DIR"
+
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "${GHCR_USERNAME:-x-access-token}" --password-stdin
+            fi
+
+            if [ -n "${RESIN_PROXY_URL:-}" ]; then
+              export HTTP_PROXY="$RESIN_PROXY_URL"
+              export HTTPS_PROXY="$RESIN_PROXY_URL"
+              export http_proxy="$RESIN_PROXY_URL"
+              export https_proxy="$RESIN_PROXY_URL"
+              export NO_PROXY="$DOCKER_NO_PROXY"
+              export no_proxy="$DOCKER_NO_PROXY"
+            fi
+
+            cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak-$(date +%Y%m%d-%H%M%S)-pre-sha-${short_sha}"
+            DEPLOY_IMAGE="$deploy_image" SERVICE_NAME="$SERVICE_NAME" COMPOSE_FILE="$COMPOSE_FILE" python3 -c "from pathlib import Path; import os; path=Path(os.environ['COMPOSE_FILE']); deploy=os.environ['DEPLOY_IMAGE']; service=os.environ['SERVICE_NAME']; lines=path.read_text().splitlines(); service_idx=next((i for i,line in enumerate(lines) if line.strip()==service + ':'), None); assert service_idx is not None, 'service not found'; service_indent=len(lines[service_idx])-len(lines[service_idx].lstrip()); end=next((i for i in range(service_idx + 1, len(lines)) if lines[i].strip() and len(lines[i])-len(lines[i].lstrip()) <= service_indent), len(lines)); image_idx=next((i for i in range(service_idx + 1, end) if lines[i].lstrip().startswith('image:')), None); assert image_idx is not None, 'image line not found'; prefix=lines[image_idx][:len(lines[image_idx])-len(lines[image_idx].lstrip())]; lines[image_idx]=prefix + 'image: ' + deploy; path.write_text('\n'.join(lines) + '\n')"
+
+            docker compose -f "$COMPOSE_FILE" pull "$SERVICE_NAME"
+            docker compose -f "$COMPOSE_FILE" up -d --no-deps "$SERVICE_NAME"
+
+            container="$(docker compose -f "$COMPOSE_FILE" ps -q "$SERVICE_NAME")"
+            test -n "$container"
+            for _ in $(seq 1 40); do
+              status="$(docker inspect "$container" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}')"
+              echo "health=${status}"
+              if [ "$status" = "healthy" ] || [ "$status" = "running" ]; then
+                break
+              fi
+              sleep 3
+            done
+
+            curl -fsS "$HEALTH_URL"
+            docker compose -f "$COMPOSE_FILE" ps "$SERVICE_NAME"
+            docker image prune -f
+
+  deploy-new-pipixia:
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch
+    steps:
+      - name: Deploy to 新皮皮虾
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          RESIN_PROXY_URL: ${{ secrets.RESIN_PROXY_URL }}
+          DOCKER_NO_PROXY: ${{ secrets.DOCKER_NO_PROXY || '127.0.0.1,localhost,postgres,redis' }}
+          COMPOSE_DIR: /opt/codex2api-stack
+          COMPOSE_FILE: docker-compose.yml
+          SERVICE_NAME: codex2api
+          HEALTH_URL: http://127.0.0.1:8080/health
+        with:
+          host: ${{ secrets.NEW_PIPIXIA_HOST }}
+          username: ${{ secrets.NEW_PIPIXIA_USER }}
+          password: ${{ secrets.NEW_PIPIXIA_PASSWORD }}
+          port: ${{ secrets.NEW_PIPIXIA_PORT }}
+          envs: IMAGE_REF,GHCR_TOKEN,GHCR_USERNAME,RESIN_PROXY_URL,DOCKER_NO_PROXY,COMPOSE_DIR,COMPOSE_FILE,SERVICE_NAME,HEALTH_URL
+          script_stop: true
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            short_sha="$(printf '%.7s' "${IMAGE_REF##*:sha-}")"
+            deploy_image="${IMAGE_REF%:sha-*}:sha-${short_sha}"
+            cd "$COMPOSE_DIR"
+
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "${GHCR_USERNAME:-x-access-token}" --password-stdin
+            fi
+
+            if [ -n "${RESIN_PROXY_URL:-}" ]; then
+              export HTTP_PROXY="$RESIN_PROXY_URL"
+              export HTTPS_PROXY="$RESIN_PROXY_URL"
+              export http_proxy="$RESIN_PROXY_URL"
+              export https_proxy="$RESIN_PROXY_URL"
+              export NO_PROXY="$DOCKER_NO_PROXY"
+              export no_proxy="$DOCKER_NO_PROXY"
+            fi
+
+            cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak-$(date +%Y%m%d-%H%M%S)-pre-sha-${short_sha}"
+            DEPLOY_IMAGE="$deploy_image" SERVICE_NAME="$SERVICE_NAME" COMPOSE_FILE="$COMPOSE_FILE" python3 -c "from pathlib import Path; import os; path=Path(os.environ['COMPOSE_FILE']); deploy=os.environ['DEPLOY_IMAGE']; service=os.environ['SERVICE_NAME']; lines=path.read_text().splitlines(); service_idx=next((i for i,line in enumerate(lines) if line.strip()==service + ':'), None); assert service_idx is not None, 'service not found'; service_indent=len(lines[service_idx])-len(lines[service_idx].lstrip()); end=next((i for i in range(service_idx + 1, len(lines)) if lines[i].strip() and len(lines[i])-len(lines[i].lstrip()) <= service_indent), len(lines)); image_idx=next((i for i in range(service_idx + 1, end) if lines[i].lstrip().startswith('image:')), None); assert image_idx is not None, 'image line not found'; prefix=lines[image_idx][:len(lines[image_idx])-len(lines[image_idx].lstrip())]; lines[image_idx]=prefix + 'image: ' + deploy; path.write_text('\n'.join(lines) + '\n')"
+
+            docker compose -f "$COMPOSE_FILE" pull "$SERVICE_NAME"
+            docker compose -f "$COMPOSE_FILE" up -d --no-deps "$SERVICE_NAME"
+
+            container="$(docker compose -f "$COMPOSE_FILE" ps -q "$SERVICE_NAME")"
+            test -n "$container"
+            for _ in $(seq 1 40); do
+              status="$(docker inspect "$container" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}')"
+              echo "health=${status}"
+              if [ "$status" = "healthy" ] || [ "$status" = "running" ]; then
+                break
+              fi
+              sleep 3
+            done
+
+            curl -fsS "$HEALTH_URL"
+            docker compose -f "$COMPOSE_FILE" ps "$SERVICE_NAME"
+            docker image prune -f
