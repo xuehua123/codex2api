@@ -134,6 +134,12 @@ jobs:
               sleep 3
             done
 
+            for _ in $(seq 1 60); do
+              if curl -fsS "$HEALTH_URL"; then
+                break
+              fi
+              sleep 3
+            done
             curl -fsS "$HEALTH_URL"
             docker compose -f "$COMPOSE_FILE" ps "$SERVICE_NAME"
             docker image prune -f
@@ -199,6 +205,12 @@ jobs:
               sleep 3
             done
 
+            for _ in $(seq 1 60); do
+              if curl -fsS "$HEALTH_URL"; then
+                break
+              fi
+              sleep 3
+            done
             curl -fsS "$HEALTH_URL"
             docker compose -f "$COMPOSE_FILE" ps "$SERVICE_NAME"
             docker image prune -f
