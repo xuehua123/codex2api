@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -90,6 +91,49 @@ func TestAutoDecompressMiddlewareCapsExpandedSizeBeforeRequestSizeLimiter(t *tes
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
+}
+
+func TestBodyCacheMiddlewareReusesRequestSizeLimiterBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(security.RequestSizeLimiter(1024))
+	r.Use(func(c *gin.Context) {
+		c.Request.Body = failingReadCloser{}
+		c.Next()
+	})
+	r.Use(BodyCacheMiddleware())
+	r.POST("/v1/responses", func(c *gin.Context) {
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if got, want := string(body), "cached-body"; got != want {
+			t.Fatalf("body = %q, want %q", got, want)
+		}
+		if got := mustContextInt64(t, c, BodyReadBytesContextKey); got != int64(len("cached-body")) {
+			t.Fatalf("body read bytes = %d, want %d", got, len("cached-body"))
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString("cached-body"))
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+type failingReadCloser struct{}
+
+func (failingReadCloser) Read(_ []byte) (int, error) {
+	return 0, errors.New("body should have been restored from raw_body cache")
+}
+
+func (failingReadCloser) Close() error {
+	return nil
 }
 
 func gzipBytes(t *testing.T, body []byte) *bytes.Buffer {

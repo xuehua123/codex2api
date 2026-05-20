@@ -14,6 +14,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	bodyReadDurationContextKey  = "body_read_ms"
+	bodyReadBytesContextKey     = "body_read_bytes"
+	bodyContentLengthContextKey = "body_content_length"
+	rawBodyContextKey           = "raw_body"
+)
+
 // Security headers middleware
 func SecurityHeadersMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -56,8 +63,18 @@ func RateLimitMiddleware(requests int, window time.Duration) gin.HandlerFunc {
 // RequestSizeLimiter limits request body size
 func RequestSizeLimiter(maxSize int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Read the request body
+		c.Set(bodyContentLengthContextKey, c.Request.ContentLength)
+		c.Set(bodyReadBytesContextKey, int64(0))
+
+		if c.Request.Body == nil || c.Request.Body == http.NoBody {
+			c.Set(bodyReadDurationContextKey, int64(0))
+			c.Next()
+			return
+		}
+
+		readStart := time.Now()
 		body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxSize+1))
+		c.Set(bodyReadDurationContextKey, time.Since(readStart).Milliseconds())
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": gin.H{
@@ -69,6 +86,7 @@ func RequestSizeLimiter(maxSize int64) gin.HandlerFunc {
 			return
 		}
 		defer c.Request.Body.Close()
+		c.Set(bodyReadBytesContextKey, int64(len(body)))
 
 		// Check if body exceeds max size
 		if int64(len(body)) > maxSize {
@@ -83,7 +101,9 @@ func RequestSizeLimiter(maxSize int64) gin.HandlerFunc {
 			return
 		}
 
-		// Replace the body so it can be read again
+		// Cache the body here so downstream middleware and handlers do not
+		// perform a second full read on large streaming requests.
+		c.Set(rawBodyContextKey, body)
 		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 		c.Next()
 	}

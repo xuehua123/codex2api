@@ -1495,6 +1495,11 @@ type Store struct {
 	promptFilterConfig   atomic.Value // promptfilter.Config
 	sessionMu            sync.RWMutex
 	sessionBindings      map[string]sessionAffinity
+
+	// Negative cache for runtime model-cooldown misses. The dispatch hot path can
+	// scan many accounts under load; caching misses prevents repeated Redis GETs
+	// while preserving cross-process cooldown propagation within a short window.
+	modelCooldownMissUntil sync.Map // map[string]int64 unix nano
 }
 
 type sessionAffinity struct {
@@ -1509,6 +1514,7 @@ const (
 	accountCooldownCacheNamespace = "account-cooldown"
 	modelCooldownCacheNamespace   = "model-cooldown"
 	runtimeCooldownCacheTimeout   = 300 * time.Millisecond
+	modelCooldownCacheMissTTL     = 5 * time.Second
 )
 
 type runtimeCooldownRecord struct {
@@ -1543,6 +1549,40 @@ func accountCooldownRuntimeKey(accountID int64) string {
 
 func modelCooldownRuntimeKey(accountID int64, model string) string {
 	return fmt.Sprintf("%d:%s", accountID, normalizeModelCooldownKey(model))
+}
+
+func (s *Store) modelCooldownMissCacheKey(accountID int64, model string) string {
+	return modelCooldownRuntimeKey(accountID, model)
+}
+
+func (s *Store) hasRecentModelCooldownMiss(accountID int64, model string) bool {
+	if s == nil || accountID == 0 {
+		return false
+	}
+	raw, ok := s.modelCooldownMissUntil.Load(s.modelCooldownMissCacheKey(accountID, model))
+	if !ok {
+		return false
+	}
+	until, ok := raw.(int64)
+	if !ok || until <= time.Now().UnixNano() {
+		s.modelCooldownMissUntil.Delete(s.modelCooldownMissCacheKey(accountID, model))
+		return false
+	}
+	return true
+}
+
+func (s *Store) rememberModelCooldownMiss(accountID int64, model string) {
+	if s == nil || accountID == 0 {
+		return
+	}
+	s.modelCooldownMissUntil.Store(s.modelCooldownMissCacheKey(accountID, model), time.Now().Add(modelCooldownCacheMissTTL).UnixNano())
+}
+
+func (s *Store) clearModelCooldownMiss(accountID int64, model string) {
+	if s == nil || accountID == 0 {
+		return
+	}
+	s.modelCooldownMissUntil.Delete(s.modelCooldownMissCacheKey(accountID, model))
 }
 
 func normalizeCooldownReason(reason string) string {
@@ -1677,6 +1717,7 @@ func (s *Store) setCachedModelCooldown(accountID int64, cooldown ModelCooldown) 
 	if key == "" {
 		return
 	}
+	s.clearModelCooldownMiss(accountID, key)
 	ttl, ok := cooldownTTL(cooldown.ResetAt)
 	if !ok {
 		return
@@ -1740,6 +1781,7 @@ func (s *Store) deleteCachedModelCooldown(accountID int64, model string) {
 	if key == "" {
 		return
 	}
+	s.clearModelCooldownMiss(accountID, key)
 	ctx, cancel := cooldownRuntimeContext()
 	defer cancel()
 	if err := s.tokenCache.DeleteRuntime(ctx, modelCooldownCacheNamespace, modelCooldownRuntimeKey(accountID, key)); err != nil {
@@ -1787,10 +1829,15 @@ func (s *Store) accountHasCachedModelCooldown(acc *Account, model string) bool {
 	if acc.IsModelRateLimited(key) {
 		return true
 	}
-	record, ok := s.getCachedModelCooldown(acc.DBID, key)
-	if !ok {
+	if s.hasRecentModelCooldownMiss(acc.DBID, key) {
 		return false
 	}
+	record, ok := s.getCachedModelCooldown(acc.DBID, key)
+	if !ok {
+		s.rememberModelCooldownMiss(acc.DBID, key)
+		return false
+	}
+	s.clearModelCooldownMiss(acc.DBID, key)
 	s.applyCachedModelCooldown(acc, key, record)
 	return true
 }

@@ -113,7 +113,11 @@ func (db *DB) InsertRequestTraceEvent(ctx context.Context, input *RequestTraceEv
 	db.traceMu.Lock()
 	if len(db.traceBuf) >= maxRequestTraceBuffer {
 		db.traceMu.Unlock()
-		return db.insertRequestTraceEventsSync(ctx, []requestTraceEntry{entry})
+		// Request traces are diagnostic-only. Under overload, never fall back to
+		// synchronous DB writes on the request hot path; ask the flusher to catch
+		// up and drop this event instead.
+		db.notifyTraceFlush()
+		return nil
 	}
 	db.traceBuf = append(db.traceBuf, entry)
 	bufLen := len(db.traceBuf)

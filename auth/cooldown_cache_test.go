@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,6 +98,55 @@ func TestStoreSkipsCachedModelCooldown(t *testing.T) {
 	if !primary.IsModelRateLimited("gpt-5.4") {
 		t.Fatal("primary model cooldown should have been synchronized from runtime cache")
 	}
+}
+
+func TestModelCooldownRuntimeMissesAreCachedBriefly(t *testing.T) {
+	memoryCache := cache.NewMemory(4)
+	defer memoryCache.Close()
+	tokenCache := &countingRuntimeCache{TokenCache: memoryCache}
+
+	primary := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	store := &Store{
+		accounts:       []*Account{primary},
+		maxConcurrency: 1,
+		tokenCache:     tokenCache,
+	}
+	filter := store.WithModelCooldownFilter("gpt-5.4", nil)
+
+	if !filter(primary) {
+		t.Fatal("filter should allow account when runtime cache misses")
+	}
+	if !filter(primary) {
+		t.Fatal("filter should allow account from negative miss cache")
+	}
+	if got := tokenCache.modelRuntimeGets.Load(); got != 1 {
+		t.Fatalf("runtime model cooldown GETs = %d, want 1", got)
+	}
+
+	store.setCachedModelCooldown(primary.DBID, ModelCooldown{
+		Model:     "gpt-5.4",
+		Reason:    "model_capacity",
+		ResetAt:   time.Now().Add(time.Hour),
+		UpdatedAt: time.Now(),
+	})
+	if filter(primary) {
+		t.Fatal("filter should reject account after runtime cooldown is written")
+	}
+	if got := tokenCache.modelRuntimeGets.Load(); got != 2 {
+		t.Fatalf("runtime model cooldown GETs after write = %d, want 2", got)
+	}
+}
+
+type countingRuntimeCache struct {
+	cache.TokenCache
+	modelRuntimeGets atomic.Int64
+}
+
+func (c *countingRuntimeCache) GetRuntime(ctx context.Context, namespace string, key string) (json.RawMessage, bool, error) {
+	if namespace == modelCooldownCacheNamespace {
+		c.modelRuntimeGets.Add(1)
+	}
+	return c.TokenCache.GetRuntime(ctx, namespace, key)
 }
 
 func TestCooldownCacheWritesAndDeletes(t *testing.T) {

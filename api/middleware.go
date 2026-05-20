@@ -191,8 +191,24 @@ func randInt() int {
 func BodyCacheMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		contentLength := c.Request.ContentLength
-		c.Set(BodyContentLengthContextKey, contentLength)
-		c.Set(BodyReadBytesContextKey, int64(0))
+		if _, exists := c.Get(BodyContentLengthContextKey); !exists {
+			c.Set(BodyContentLengthContextKey, contentLength)
+		}
+		if _, exists := c.Get(BodyReadBytesContextKey); !exists {
+			c.Set(BodyReadBytesContextKey, int64(0))
+		}
+
+		if cached, exists := c.Get("raw_body"); exists {
+			if body, ok := cached.([]byte); ok {
+				if _, exists := c.Get(BodyReadDurationMsContextKey); !exists {
+					c.Set(BodyReadDurationMsContextKey, int64(0))
+				}
+				c.Set(BodyReadBytesContextKey, int64(len(body)))
+				c.Request.Body = io.NopCloser(bytes.NewReader(body))
+				c.Next()
+				return
+			}
+		}
 
 		if c.Request.Body != nil && c.Request.Body != http.NoBody {
 			readStart := time.Now()

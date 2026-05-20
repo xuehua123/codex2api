@@ -41,6 +41,11 @@ const (
 	apiKeyCountCacheNamespace = "api-key-count"
 	apiKeyCacheTTL            = 5 * time.Minute
 	apiKeyCountCacheTTL       = 30 * time.Second
+
+	preUpstreamAttemptMsContextKey = "pre_upstream_attempt_ms"
+	accountSelectMsContextKey      = "account_select_ms"
+	queueWaitMsContextKey          = "queue_wait_ms"
+	retryCountContextKey           = "retry_count"
 )
 
 type apiKeyRuntimeRecord struct {
@@ -214,6 +219,7 @@ func logSlowResponseTTFT(c *gin.Context, endpoint, model, reasoningEffort string
 	requestID, clientRequestID, clientRequestHash := "", "", ""
 	var arrivalUnixMs, totalSinceArrivalMs, bodyReadMs, bodyBytes, contentLength int64
 	var decompressMs, compressedBytes, decompressedBytes int64
+	var preUpstreamAttemptMs, accountSelectMs, queueWaitMs, retryCount int64
 	if c != nil {
 		rawClientRequestID := strings.TrimSpace(c.GetHeader("X-Client-Request-Id"))
 		clientRequestID = security.SanitizeLog(rawClientRequestID)
@@ -231,9 +237,25 @@ func logSlowResponseTTFT(c *gin.Context, endpoint, model, reasoningEffort string
 		decompressMs, _ = ginContextInt64(c, api.BodyDecompressMsContextKey)
 		compressedBytes, _ = ginContextInt64(c, api.BodyCompressedBytesKey)
 		decompressedBytes, _ = ginContextInt64(c, api.BodyDecompressedBytesKey)
+		preUpstreamAttemptMs, _ = ginContextInt64(c, preUpstreamAttemptMsContextKey)
+		accountSelectMs, _ = ginContextInt64(c, accountSelectMsContextKey)
+		queueWaitMs, _ = ginContextInt64(c, queueWaitMsContextKey)
+		retryCount, _ = ginContextInt64(c, retryCountContextKey)
 	}
-	log.Printf("[slow_ttft] endpoint=%s request_id=%s client_request_id=%s client_request_hash=%s model=%s effort=%s account=%d stream=%t duration_ms=%d total_since_arrival_ms=%d arrival_unix_ms=%d body_read_ms=%d body_bytes=%d content_length=%d decompress_ms=%d compressed_bytes=%d decompressed_bytes=%d headers_ms=%d saw_sse=%t first_sse_ms=%d saw_non_preamble=%t first_non_preamble_ms=%d saw_text=%t first_text_ms=%d saw_tool=%t first_tool_ms=%d events_before_text=%d last_event_before_text=%s input_tokens=%d cached_tokens=%d reasoning_tokens=%d output_tokens=%d",
-		endpoint, requestID, clientRequestID, clientRequestHash, model, reasoningEffort, accountID, stream, totalDurationMs, totalSinceArrivalMs, arrivalUnixMs, bodyReadMs, bodyBytes, contentLength, decompressMs, compressedBytes, decompressedBytes, trace.upstreamHeadersMs, trace.sawSSEEvent, trace.firstSSEEventMs, trace.sawNonPreamble, trace.firstNonPreambleMs, trace.sawTextDelta, trace.firstTextDeltaMs, trace.sawToolDelta, trace.firstToolDeltaMs, trace.eventsBeforeText, trace.lastEventBeforeText, inputTokens, cachedTokens, reasoningTokens, outputTokens)
+	log.Printf("[slow_ttft] endpoint=%s request_id=%s client_request_id=%s client_request_hash=%s model=%s effort=%s account=%d stream=%t duration_ms=%d total_since_arrival_ms=%d pre_upstream_attempt_ms=%d account_select_ms=%d queue_wait_ms=%d retry_count=%d arrival_unix_ms=%d body_read_ms=%d body_bytes=%d content_length=%d decompress_ms=%d compressed_bytes=%d decompressed_bytes=%d headers_ms=%d saw_sse=%t first_sse_ms=%d saw_non_preamble=%t first_non_preamble_ms=%d saw_text=%t first_text_ms=%d saw_tool=%t first_tool_ms=%d events_before_text=%d last_event_before_text=%s input_tokens=%d cached_tokens=%d reasoning_tokens=%d output_tokens=%d",
+		endpoint, requestID, clientRequestID, clientRequestHash, model, reasoningEffort, accountID, stream, totalDurationMs, totalSinceArrivalMs, preUpstreamAttemptMs, accountSelectMs, queueWaitMs, retryCount, arrivalUnixMs, bodyReadMs, bodyBytes, contentLength, decompressMs, compressedBytes, decompressedBytes, trace.upstreamHeadersMs, trace.sawSSEEvent, trace.firstSSEEventMs, trace.sawNonPreamble, trace.firstNonPreambleMs, trace.sawTextDelta, trace.firstTextDeltaMs, trace.sawToolDelta, trace.firstToolDeltaMs, trace.eventsBeforeText, trace.lastEventBeforeText, inputTokens, cachedTokens, reasoningTokens, outputTokens)
+}
+
+func recordUpstreamAttemptTiming(c *gin.Context, upstreamAttemptStart time.Time, attempt int, accountSelectMs, queueWaitMs int64) {
+	if c == nil {
+		return
+	}
+	if reqCtx := api.GetRequestContext(c); reqCtx != nil && !reqCtx.StartTime.IsZero() {
+		c.Set(preUpstreamAttemptMsContextKey, upstreamAttemptStart.Sub(reqCtx.StartTime).Milliseconds())
+	}
+	c.Set(accountSelectMsContextKey, accountSelectMs)
+	c.Set(queueWaitMsContextKey, queueWaitMs)
+	c.Set(retryCountContextKey, int64(attempt))
 }
 
 func ginContextInt64(c *gin.Context, key string) (int64, bool) {
@@ -1413,6 +1435,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			Attempt:        attempt + 1,
 			EffectiveModel: effectiveModel,
 		})
+		accountSelectStart := time.Now()
+		queueWaitMs := int64(0)
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
@@ -1421,8 +1445,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				EffectiveModel: effectiveModel,
 				Message:        "no account immediately available; waiting up to 30s",
 			})
+			queueWaitStart := time.Now()
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			queueWaitMs = time.Since(queueWaitStart).Milliseconds()
 			if account == nil {
+				recordUpstreamAttemptTiming(c, time.Now(), attempt, time.Since(accountSelectStart).Milliseconds(), queueWaitMs)
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					traceTerminal = true
 					h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
@@ -1450,11 +1477,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				AccountID:      account.ID(),
 				Attempt:        attempt + 1,
 				EffectiveModel: effectiveModel,
-				Message:        "account became available",
+				Message:        fmt.Sprintf("account became available queue_wait_ms=%d", queueWaitMs),
 			})
 		}
 
 		start := time.Now()
+		accountSelectMs := time.Since(accountSelectStart).Milliseconds()
+		recordUpstreamAttemptTiming(c, start, attempt, accountSelectMs, queueWaitMs)
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		useWebsocket := h.shouldUseWebsocketForHTTP()
@@ -1462,7 +1491,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			AccountID:      account.ID(),
 			Attempt:        attempt + 1,
 			EffectiveModel: effectiveModel,
-			Message:        fmt.Sprintf("transport_websocket=%t", useWebsocket),
+			Message:        fmt.Sprintf("transport_websocket=%t account_select_ms=%d queue_wait_ms=%d", useWebsocket, accountSelectMs, queueWaitMs),
 		})
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -2471,10 +2500,15 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	invalidEncryptedContentRetried := false
 
 	for attempt := 0; ; attempt++ {
+		accountSelectStart := time.Now()
+		queueWaitMs := int64(0)
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
+			queueWaitStart := time.Now()
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			queueWaitMs = time.Since(queueWaitStart).Milliseconds()
 			if account == nil {
+				recordUpstreamAttemptTiming(c, time.Now(), attempt, time.Since(accountSelectStart).Milliseconds(), queueWaitMs)
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
@@ -2485,6 +2519,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 
 		start := time.Now()
+		recordUpstreamAttemptTiming(c, start, attempt, time.Since(accountSelectStart).Milliseconds(), queueWaitMs)
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 
@@ -2722,6 +2757,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			Attempt:        attempt + 1,
 			EffectiveModel: effectiveModel,
 		})
+		accountSelectStart := time.Now()
+		queueWaitMs := int64(0)
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
@@ -2730,8 +2767,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				EffectiveModel: effectiveModel,
 				Message:        "no account immediately available; waiting up to 30s",
 			})
+			queueWaitStart := time.Now()
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			queueWaitMs = time.Since(queueWaitStart).Milliseconds()
 			if account == nil {
+				recordUpstreamAttemptTiming(c, time.Now(), attempt, time.Since(accountSelectStart).Milliseconds(), queueWaitMs)
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					traceTerminal = true
 					h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
@@ -2759,11 +2799,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				AccountID:      account.ID(),
 				Attempt:        attempt + 1,
 				EffectiveModel: effectiveModel,
-				Message:        "account became available",
+				Message:        fmt.Sprintf("account became available queue_wait_ms=%d", queueWaitMs),
 			})
 		}
 
 		start := time.Now()
+		accountSelectMs := time.Since(accountSelectStart).Milliseconds()
+		recordUpstreamAttemptTiming(c, start, attempt, accountSelectMs, queueWaitMs)
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		useWebsocket := h.shouldUseWebsocketForHTTP()
@@ -2771,7 +2813,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			AccountID:      account.ID(),
 			Attempt:        attempt + 1,
 			EffectiveModel: effectiveModel,
-			Message:        fmt.Sprintf("transport_websocket=%t", useWebsocket),
+			Message:        fmt.Sprintf("transport_websocket=%t account_select_ms=%d queue_wait_ms=%d", useWebsocket, accountSelectMs, queueWaitMs),
 		})
 
 		// 提取 API Key 用于设备指纹稳定化
