@@ -193,13 +193,10 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 		redisIdle = poolStats.IdleConns
 		redisStale = poolStats.StaleConns
 		redisPoolSize = h.cache.PoolSize()
-
-		activeRedis := int(redisTotal) - int(redisIdle) - int(redisStale)
-		if activeRedis < 0 {
-			activeRedis = 0
-		}
 		if redisPoolSize > 0 {
-			redisUsage = float64(activeRedis) / float64(redisPoolSize) * 100
+			// Redis 连接池占用率按当前 live 连接数计算。
+			// StaleConns 是累计移除的陈旧连接数，不应从当前占用里扣减。
+			redisUsage = float64(redisTotal) / float64(redisPoolSize) * 100
 		}
 	}
 

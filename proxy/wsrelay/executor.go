@@ -3,7 +3,6 @@ package wsrelay
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -167,7 +166,6 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 	}
 
 	// 2. 清理多余字段
-	wsBody, _ = sjson.DeleteBytes(wsBody, "previous_response_id")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "prompt_cache_retention")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "safety_identifier")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "disable_response_storage")
@@ -180,9 +178,10 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 		wsBody, _ = sjson.SetBytes(wsBody, "prompt_cache_key", existingCacheKey)
 	}
 
-	// 4. 设置请求类型和 stream
+	// 4. 设置 WebSocket 客户端事件类型，并移除 HTTP 专属传输字段。
 	wsBody, _ = sjson.SetBytes(wsBody, "type", "response.create")
-	wsBody, _ = sjson.SetBytes(wsBody, "stream", true)
+	wsBody, _ = sjson.DeleteBytes(wsBody, "stream")
+	wsBody, _ = sjson.DeleteBytes(wsBody, "background")
 
 	return wsBody
 }
@@ -252,20 +251,17 @@ func (e *Executor) prepareWebsocketHeaders(accessToken, accountID, sessionID, ap
 }
 
 // sendRequest 发送 WebSocket 请求
-func (e *Executor) sendRequest(wc *WsConnection, body []byte, requestID string) error {
+func (e *Executor) sendRequest(wc *WsConnection, body []byte, _ string) error {
 	if !wc.IsConnected() {
 		return fmt.Errorf("websocket connection is not connected")
 	}
 
-	// 构建消息
-	msg := NewHTTPRequestMessage(requestID, wc.session.ID, body)
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshal message failed: %w", err)
+	if len(bytes.TrimSpace(body)) == 0 {
+		return fmt.Errorf("empty websocket request body")
 	}
 
-	// 发送消息（使用 marshaled msgBytes）
-	return wc.WriteMessage(websocket.TextMessage, msgBytes)
+	// Responses WebSocket mode expects response.create as the first client event.
+	return wc.WriteMessage(websocket.TextMessage, body)
 }
 
 // ==================== WebSocket 响应处理 ====================
@@ -462,17 +458,18 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 		return nil, err
 	}
 
-	// 检查 HTTP 握手响应状态
+	// 检查 HTTP 握手响应状态。WebSocket 握手成功返回 101，
+	// 但下游 HTTP handler 期望模拟响应保持 200 才会继续读取 Body。
 	statusCode := http.StatusOK
 	if wsResp.HTTPResponse() != nil {
-		statusCode = wsResp.HTTPResponse().StatusCode
-		// 如果握手失败（非 2xx），返回错误响应
-		if statusCode < 200 || statusCode >= 300 {
+		handshakeStatus := wsResp.HTTPResponse().StatusCode
+		// 如果握手失败（非 101/2xx），返回错误响应
+		if handshakeStatus != http.StatusSwitchingProtocols && (handshakeStatus < 200 || handshakeStatus >= 300) {
 			wsResp.Close()
 			return &http.Response{
-				StatusCode: statusCode,
+				StatusCode: handshakeStatus,
 				Header:     wsResp.HTTPResponse().Header.Clone(),
-				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", statusCode))),
+				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", handshakeStatus))),
 			}, nil
 		}
 	}

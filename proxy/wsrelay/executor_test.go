@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/codex2api/proxy"
+	"github.com/tidwall/gjson"
 )
 
 func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing.T) {
@@ -84,5 +85,31 @@ func TestPrepareWebsocketHeadersOmitsUserAgentByDefault(t *testing.T) {
 	}
 	if got := headers.Get("Conversation_id"); got != "session-123" {
 		t.Fatalf("Conversation_id = %q", got)
+	}
+}
+
+func TestPrepareWebsocketBodyUsesResponsesWebsocketEvent(t *testing.T) {
+	exec := NewExecutor()
+	body := []byte(`{"model":"gpt-5.5","input":"hi","stream":true,"background":false,"previous_response_id":"resp_123"}`)
+
+	got := exec.prepareWebsocketBody(body, "session-123")
+
+	if eventType := gjson.GetBytes(got, "type").String(); eventType != "response.create" {
+		t.Fatalf("type = %q, want response.create", eventType)
+	}
+	if gjson.GetBytes(got, "stream").Exists() {
+		t.Fatalf("stream should be removed for websocket transport: %s", got)
+	}
+	if gjson.GetBytes(got, "background").Exists() {
+		t.Fatalf("background should be removed for websocket transport: %s", got)
+	}
+	if prev := gjson.GetBytes(got, "previous_response_id").String(); prev != "resp_123" {
+		t.Fatalf("previous_response_id = %q, want resp_123", prev)
+	}
+	if cacheKey := gjson.GetBytes(got, "prompt_cache_key").String(); cacheKey != "session-123" {
+		t.Fatalf("prompt_cache_key = %q, want session-123", cacheKey)
+	}
+	if !gjson.GetBytes(got, "instructions").Exists() {
+		t.Fatalf("instructions should be present: %s", got)
 	}
 }
