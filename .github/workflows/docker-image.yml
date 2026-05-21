@@ -58,6 +58,19 @@ jobs:
             type=semver,pattern={{version}},value=${{ inputs.build_version || github.ref_name }},enable=${{ inputs.build_version != '' || startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.build_version || github.ref_name }},enable=${{ inputs.build_version != '' || startsWith(github.ref, 'refs/tags/v') }}
 
+      - name: Compute admin UI version
+        id: app_version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.build_version }}" ]; then
+            version="${{ inputs.build_version }}"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="sha-${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -68,7 +81,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BUILD_VERSION=${{ inputs.build_version || github.ref_name }}
+            BUILD_VERSION=${{ steps.app_version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
