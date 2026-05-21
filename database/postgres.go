@@ -30,6 +30,8 @@ type AccountRow struct {
 	ErrorMessage            string
 	Enabled                 bool
 	Locked                  bool
+	CreditEnabled           bool
+	CreditSkipUsageWindow   bool
 	ScoreBiasOverride       sql.NullInt64
 	BaseConcurrencyOverride sql.NullInt64
 	Tags                    []string
@@ -497,6 +499,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS today_used_count INT DEFAULT 0;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS image_quota_reset_at TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]'::jsonb;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credit_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credit_skip_usage_window BOOLEAN DEFAULT FALSE;
 
 	CREATE TABLE IF NOT EXISTS account_groups (
 		id          SERIAL PRIMARY KEY,
@@ -637,7 +641,8 @@ func (db *DB) migrate(ctx context.Context) error {
 			auto_clean_rate_limited BOOLEAN DEFAULT FALSE,
 			background_refresh_interval_minutes INT DEFAULT 2,
 			usage_probe_max_age_minutes INT DEFAULT 10,
-			recovery_probe_interval_minutes INT DEFAULT 30
+			recovery_probe_interval_minutes INT DEFAULT 30,
+			scheduler_mode VARCHAR(20) DEFAULT 'round_robin'
 		);
 	CREATE TABLE IF NOT EXISTS account_model_cooldowns (
 		account_id BIGINT NOT NULL,
@@ -667,6 +672,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_refresh_interval_minutes INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_max_age_minutes INT DEFAULT 10;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_mode VARCHAR(20) DEFAULT 'round_robin';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_enabled BOOLEAN DEFAULT FALSE;
@@ -1136,6 +1142,7 @@ type SystemSettings struct {
 	BackgroundRefreshIntervalMinutes int
 	UsageProbeMaxAgeMinutes          int
 	RecoveryProbeIntervalMinutes     int
+	SchedulerMode                    string
 	ResinURL                         string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
 	ResinPlatformName                string // Resin 平台标识，例如 codex2api
 	PromptFilterEnabled              bool
@@ -1178,6 +1185,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(background_refresh_interval_minutes, 2),
 		       COALESCE(usage_probe_max_age_minutes, 10),
 		       COALESCE(recovery_probe_interval_minutes, 30),
+		       COALESCE(scheduler_mode, 'round_robin'),
 		       COALESCE(resin_url, ''),
 		       COALESCE(resin_platform_name, ''),
 		       COALESCE(prompt_filter_enabled, false),
@@ -1208,6 +1216,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.RecoveryProbeIntervalMinutes,
+		&s.SchedulerMode,
 		&s.ResinURL, &s.ResinPlatformName,
 		&s.PromptFilterEnabled, &s.PromptFilterMode, &s.PromptFilterThreshold, &s.PromptFilterStrictThreshold,
 		&s.PromptFilterLogMatches, &s.PromptFilterMaxTextLength, &s.PromptFilterSensitiveWords,
@@ -1238,9 +1247,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				client_compat_mode, codex_min_cli_version, usage_log_mode, usage_log_batch_size,
 				usage_log_flush_interval_seconds, stream_flush_policy, stream_flush_interval_ms,
 				stream_idle_timeout_seconds, stream_keepalive_interval_seconds,
-				image_storage_config, account_alert_config
+				image_storage_config, account_alert_config,
+				scheduler_mode
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47)
 			ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1287,7 +1297,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				stream_idle_timeout_seconds = EXCLUDED.stream_idle_timeout_seconds,
 				stream_keepalive_interval_seconds = EXCLUDED.stream_keepalive_interval_seconds,
 				image_storage_config = EXCLUDED.image_storage_config,
-				account_alert_config = EXCLUDED.account_alert_config
+				account_alert_config = EXCLUDED.account_alert_config,
+				scheduler_mode = EXCLUDED.scheduler_mode
 		`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1298,7 +1309,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.PromptFilterSensitiveWords, s.PromptFilterCustomPatterns, s.PromptFilterDisabledPatterns,
 		s.ClientCompatMode, s.CodexMinCLIVersion, s.UsageLogMode, s.UsageLogBatchSize,
 		s.UsageLogFlushIntervalSeconds, s.StreamFlushPolicy, s.StreamFlushIntervalMS,
-		s.StreamIdleTimeoutSeconds, s.StreamKeepaliveIntervalSeconds, s.ImageStorageConfig, s.AccountAlertConfig)
+		s.StreamIdleTimeoutSeconds, s.StreamKeepaliveIntervalSeconds, s.ImageStorageConfig, s.AccountAlertConfig, s.SchedulerMode)
 	return err
 }
 
@@ -3050,12 +3061,21 @@ func (db *DB) GetAccountTimeRangeUsage(ctx context.Context, since time.Time) (ma
 	return result, rows.Err()
 }
 
+// GetAccountBilledSince 返回指定时间戳以来 account_billed 的总和
+func (db *DB) GetAccountBilledSince(ctx context.Context, accountID int64, since time.Time) (float64, error) {
+	var billed float64
+	err := db.conn.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(account_billed), 0) FROM usage_logs WHERE account_id = $1 AND created_at >= $2 AND status_code <> 499`,
+		accountID, db.timeArg(since)).Scan(&billed)
+	return billed, err
+}
+
 // ==================== Accounts ====================
 
 // ListActive 获取所有未删除账号。
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at
 		FROM accounts
 		WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
 		ORDER BY id
@@ -3087,6 +3107,8 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&a.ErrorMessage,
 			&a.Enabled,
 			&a.Locked,
+			&a.CreditEnabled,
+			&a.CreditSkipUsageWindow,
 			&a.ScoreBiasOverride,
 			&a.BaseConcurrencyOverride,
 			&tagsRaw,
@@ -3196,7 +3218,7 @@ func (db *DB) ClearExpiredModelCooldowns(ctx context.Context) error {
 // GetAccountByID 获取未删除账号的完整数据库行。
 func (db *DB) GetAccountByID(ctx context.Context, id int64) (*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at
 		FROM accounts
 		WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
 		LIMIT 1
@@ -3220,6 +3242,8 @@ func (db *DB) GetAccountByID(ctx context.Context, id int64) (*AccountRow, error)
 		&a.ErrorMessage,
 		&a.Enabled,
 		&a.Locked,
+		&a.CreditEnabled,
+		&a.CreditSkipUsageWindow,
 		&a.ScoreBiasOverride,
 		&a.BaseConcurrencyOverride,
 		&tagsRaw,
@@ -3460,6 +3484,46 @@ func (db *DB) SetAccountEnabled(ctx context.Context, id int64, enabled bool) err
 func (db *DB) SetAccountLocked(ctx context.Context, id int64, locked bool) error {
 	_, err := db.conn.ExecContext(ctx, `UPDATE accounts SET locked = $1 WHERE id = $2`, locked, id)
 	return err
+}
+
+// UpdateAccountCredit 更新账号的信用设置（credit_enabled / credit_skip_usage_window）
+// 传入 nil 表示不修改该字段，仅 SET 非 nil 的列。
+func (db *DB) UpdateAccountCredit(ctx context.Context, id int64, creditEnabled, creditSkipUsageWindow *bool) error {
+	var setClauses []string
+	var args []interface{}
+	argIdx := 1
+
+	if creditEnabled != nil {
+		setClauses = append(setClauses, fmt.Sprintf("credit_enabled = $%d", argIdx))
+		args = append(args, *creditEnabled)
+		argIdx++
+	}
+	if creditSkipUsageWindow != nil {
+		setClauses = append(setClauses, fmt.Sprintf("credit_skip_usage_window = $%d", argIdx))
+		args = append(args, *creditSkipUsageWindow)
+		argIdx++
+	}
+
+	if len(setClauses) == 0 {
+		return nil // 没有要更新的字段
+	}
+
+	setClauses = append(setClauses, "updated_at = CURRENT_TIMESTAMP")
+	query := "UPDATE accounts SET " + strings.Join(setClauses, ", ") + fmt.Sprintf(" WHERE id = $%d", argIdx)
+	args = append(args, id)
+
+	res, err := db.conn.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // UpdateCredentials 原子合并更新账号的 credentials（JSONB || 运算符，不覆盖已有字段）

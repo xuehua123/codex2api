@@ -78,6 +78,8 @@ export interface AccountRow {
   usage_7d_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
+  billed_5h?: number
+  billed_7d?: number
   cooldown_until?: ISODateString
   cooldown_reason?: string
   model_cooldowns?: Array<{
@@ -88,6 +90,8 @@ export interface AccountRow {
   }>
   enabled?: boolean
   locked?: boolean
+  credit_enabled?: boolean
+  credit_skip_usage_window?: boolean
   // 图片配额信息
   image_quota_remaining?: number
   image_quota_total?: number
@@ -302,6 +306,7 @@ export interface SystemSettings {
   auto_clean_expired: boolean
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
+  scheduler_mode: string
   max_retries: number
   max_rate_limit_retries: number
   allow_remote_migration: boolean
@@ -761,6 +766,7 @@ export interface CreateImageJobPayload {
   upscale?: string
   api_key_id?: number
   template_id?: number
+  input_images?: string[]
 }
 
 export type ApiListResponse<K extends string, T> = {

@@ -88,6 +88,7 @@ const ACCOUNT_TABLE_COLUMNS = [
   "status",
   "requests",
   "usage",
+	"billed",
   "importTime",
   "updatedAt",
   "actions",
@@ -2442,6 +2443,7 @@ export default function Accounts() {
                   status: t("accounts.status"),
                   requests: t("accounts.requests"),
                   usage: t("accounts.usage"),
+                  billed: t("accounts.billed"),
                   importTime: t("accounts.importTime"),
                   updatedAt: t("accounts.updatedAt"),
                   actions: t("accounts.actions"),
@@ -2670,6 +2672,11 @@ export default function Accounts() {
                               : ""}
                           </TableHead>
                         )}
+                        {visibleColumns.billed && (
+                          <TableHead className="text-[13px] font-semibold">
+                            {t("accounts.billed")}
+                          </TableHead>
+                        )}
                         {visibleColumns.importTime && (
                           <TableHead
                             className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
@@ -2860,6 +2867,11 @@ export default function Accounts() {
                             {visibleColumns.usage && (
                               <TableCell>
                                 <UsageCell account={account} />
+                              </TableCell>
+                            )}
+                            {visibleColumns.billed && (
+                              <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">
+                                <BilledCell account={account} />
                               </TableCell>
                             )}
                             {visibleColumns.importTime && (
@@ -6122,6 +6134,19 @@ function UsageCell({ account }: { account: AccountRow }) {
     );
   }
   return <span className="text-[13px] text-muted-foreground">-</span>;
+}
+
+function BilledCell({ account }: { account: AccountRow }) {
+  const h5 = typeof account.billed_5h === "number" ? account.billed_5h.toFixed(2) : null;
+  const d7 = typeof account.billed_7d === "number" ? account.billed_7d.toFixed(2) : null;
+  if (h5 === null && d7 === null) return <span className="text-[12px] text-muted-foreground">-</span>;
+  return (
+    <span className="text-[12px] text-muted-foreground">
+      {h5 !== null ? `5h: $${h5}` : "5h: -"}
+      {" / "}
+      {d7 !== null ? `7d: $${d7}` : "7d: -"}
+    </span>
+  );
 }
 
 function getAccountStatusCountdownUntil(

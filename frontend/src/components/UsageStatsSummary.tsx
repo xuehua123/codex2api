@@ -37,7 +37,10 @@ export default function UsageStatsSummary({ stats, className = '' }: UsageStatsS
             primaryValue={formatInteger(stats.today_tokens, locale)}
           >
             <MetricLine label={t('dashboard.totalTokens')} value={formatInteger(stats.total_tokens, locale)} />
-            <MetricLine label={t('dashboard.billing')} value={`${t('usage.todayCost')}: ${formatMoney(stats.today_user_billed)} / ${t('dashboard.totalCostShort')}: ${formatMoney(stats.total_user_billed)}`} />
+            <MetricLine
+              label={`${t('usage.inputTokens')} / ${t('usage.outputTokens')}`}
+              value={`${formatInteger(stats.total_prompt_tokens, locale)} / ${formatInteger(stats.total_completion_tokens, locale)}`}
+            />
           </MetricGroup>
 
           <MetricGroup
@@ -107,7 +110,7 @@ function MetricLine({ label, value, tone = 'default' }: { label: string; value: 
   return (
     <div className="flex min-w-0 items-center justify-between gap-3 text-sm">
       <span className="truncate text-muted-foreground" title={label}>{label}</span>
-      <span className={`shrink-0 font-semibold tabular-nums ${tone === 'danger' ? 'text-destructive' : 'text-foreground'}`} title={value}>
+      <span className={`min-w-0 truncate text-right font-semibold tabular-nums ${tone === 'danger' ? 'text-destructive' : 'text-foreground'}`} title={value}>
         {value}
       </span>
     </div>
@@ -129,8 +132,3 @@ function formatLatency(value?: number): string {
   return `${Math.round(ms)}ms`
 }
 
-function formatMoney(value: number): string {
-  if (value >= 100) return `$${value.toLocaleString(undefined, { maximumFractionDigits: 1 })}`
-  if (value >= 1) return `$${value.toFixed(2)}`
-  return `$${value.toFixed(4)}`
-}

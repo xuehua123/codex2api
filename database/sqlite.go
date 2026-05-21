@@ -160,7 +160,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				stream_idle_timeout_seconds INTEGER DEFAULT 120,
 				stream_keepalive_interval_seconds INTEGER DEFAULT 10,
 				image_storage_config TEXT DEFAULT '{}',
-				account_alert_config TEXT DEFAULT '{}'
+				account_alert_config TEXT DEFAULT '{}',
+				scheduler_mode TEXT DEFAULT 'round_robin'
 			);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -355,8 +356,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "stream_keepalive_interval_seconds", "INTEGER DEFAULT 10"},
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "account_alert_config", "TEXT DEFAULT '{}'"},
+		{"system_settings", "scheduler_mode", "TEXT DEFAULT 'round_robin'"},
 		{"accounts", "enabled", "INTEGER DEFAULT 1"},
 		{"accounts", "locked", "INTEGER DEFAULT 0"},
+		{"accounts", "credit_enabled", "INTEGER DEFAULT 0"},
+		{"accounts", "credit_skip_usage_window", "INTEGER DEFAULT 0"},
 		{"accounts", "image_quota_remaining", "INTEGER NULL"},
 		{"accounts", "image_quota_total", "INTEGER NULL"},
 		{"accounts", "today_used_count", "INTEGER DEFAULT 0"},

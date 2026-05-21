@@ -111,6 +111,8 @@ type Account struct {
 	// per-account 调度配置（nil = 跟随默认）
 	ScoreBiasOverride       *int64
 	BaseConcurrencyOverride *int64
+	CreditEnabled           bool // 信用账号标记
+	CreditSkipUsageWindow   bool // 跳过用量窗口惩罚
 	AllowedAPIKeyIDs        []int64
 	allowedAPIKeySet        map[int64]struct{}
 	Tags                    []string
@@ -618,7 +620,7 @@ func (a *Account) schedulerBreakdownLocked(now time.Time) SchedulerBreakdown {
 		}
 	}
 
-	if a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") {
+	if !(a.CreditEnabled && a.CreditSkipUsageWindow) && a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") {
 		switch {
 		case a.UsagePercent7d >= 100:
 			breakdown.UsagePenalty7d = 40
@@ -802,7 +804,7 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	if !a.LastUnauthorizedAt.IsZero() && now.Sub(a.LastUnauthorizedAt) < 24*time.Hour && tier == HealthTierHealthy {
 		tier = HealthTierWarm
 	}
-	if a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") {
+	if !(a.CreditEnabled && a.CreditSkipUsageWindow) && a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") {
 		switch {
 		case a.UsagePercent7d >= 95:
 			tier = HealthTierRisky
@@ -881,6 +883,9 @@ func (a *Account) IsAvailable() bool {
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
 func (a *Account) usageExhaustedLocked() bool {
+	if a.CreditEnabled && a.CreditSkipUsageWindow {
+		return false
+	}
 	return a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") && a.UsagePercent7d >= 100
 }
 
@@ -1013,6 +1018,16 @@ func (a *Account) GetUsagePercent7d() (float64, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.UsagePercent7d, a.UsagePercent7dValid
+}
+
+// usagePercentForScheduling 返回调度排序用的用量百分比（7d 窗口有效则返回，否则 0）。
+func (a *Account) usagePercentForScheduling() float64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.UsagePercent7dValid {
+		return a.UsagePercent7d
+	}
+	return 0
 }
 
 // SetUsageSnapshot5h 更新 5h 用量快照
@@ -1492,6 +1507,7 @@ type Store struct {
 
 	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping         atomic.Value // 模型映射 JSON 字符串
+	schedulerMode        atomic.Value // string: "round_robin" or "remaining_quota"
 	promptFilterConfig   atomic.Value // promptfilter.Config
 	sessionMu            sync.RWMutex
 	sessionBindings      map[string]sessionAffinity
@@ -1889,6 +1905,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			RecoveryProbeIntervalMinutes:     30,
 			ProxyURL:                         "",
 			MaxRateLimitRetries:              1,
+			SchedulerMode:                    "round_robin",
 		}
 	}
 	s := &Store{
@@ -1922,6 +1939,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	}
 	atomic.StoreInt64(&s.maxRateLimitRetries, rateLimitRetries)
 	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)
+	s.schedulerMode.Store(settings.SchedulerMode)
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
 	}
@@ -1930,7 +1948,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
 	if fastEnabled {
-		s.fastScheduler.Store(NewFastScheduler(int64(settings.MaxConcurrency)))
+		s.fastScheduler.Store(NewFastScheduler(int64(settings.MaxConcurrency), s.GetSchedulerMode()))
 		log.Printf("快速调度器已启用（请求热路径将优先走本地内存调度器）")
 	}
 
@@ -2329,6 +2347,8 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		if !row.Enabled {
 			atomic.StoreInt32(&account.DispatchPaused, 1)
 		}
+		account.CreditEnabled = row.CreditEnabled
+		account.CreditSkipUsageWindow = row.CreditSkipUsageWindow
 		if row.Status == "error" {
 			account.Status = StatusError
 			account.ErrorMsg = row.ErrorMessage
@@ -2892,6 +2912,10 @@ func (s *Store) Release(acc *Account) {
 // SetMaxConcurrency 动态更新每账号并发上限
 func (s *Store) SetMaxConcurrency(n int) {
 	atomic.StoreInt64(&s.maxConcurrency, int64(n))
+	// Update existing scheduler's base limit in-place before full rebuild.
+	if scheduler := s.getFastScheduler(); scheduler != nil {
+		scheduler.SetBaseLimit(int64(n))
+	}
 	s.recomputeAllAccountSchedulerState()
 	s.rebuildFastScheduler()
 }
@@ -2984,6 +3008,28 @@ func (s *Store) GetModelMapping() string {
 		return v
 	}
 	return "{}"
+}
+
+// GetSchedulerMode 获取当前调度模式
+func (s *Store) GetSchedulerMode() string {
+	if v, ok := s.schedulerMode.Load().(string); ok {
+		return v
+	}
+	return "round_robin"
+}
+
+// SetSchedulerMode 设置调度模式并传播到 FastScheduler
+func (s *Store) SetSchedulerMode(mode string) {
+	switch mode {
+	case "round_robin", "remaining_quota":
+		// ok
+	default:
+		mode = "round_robin"
+	}
+	s.schedulerMode.Store(mode)
+	if scheduler := s.getFastScheduler(); scheduler != nil {
+		scheduler.SetSchedulerMode(mode)
+	}
 }
 
 func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfilter.Config {
@@ -3116,6 +3162,31 @@ func (s *Store) ApplyAccountGroups(dbID int64, groupIDs []int64) bool {
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	return true
+}
+
+// UpdateAccountCredit 更新账号信用设置
+// 传入 nil 表示不修改该字段。
+func (s *Store) UpdateAccountCredit(dbID int64, creditEnabled, creditSkipUsageWindow *bool) error {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return fmt.Errorf("账号 %d 不存在", dbID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.db.UpdateAccountCredit(ctx, dbID, creditEnabled, creditSkipUsageWindow); err != nil {
+		return err
+	}
+	acc.mu.Lock()
+	if creditEnabled != nil {
+		acc.CreditEnabled = *creditEnabled
+	}
+	if creditSkipUsageWindow != nil {
+		acc.CreditSkipUsageWindow = *creditSkipUsageWindow
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return nil
 }
 
 func (s *Store) ApplyAccountGroupMemberships(memberships map[int64][]int64) {
