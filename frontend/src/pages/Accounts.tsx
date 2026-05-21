@@ -88,7 +88,6 @@ const ACCOUNT_TABLE_COLUMNS = [
   "status",
   "requests",
   "usage",
-	"billed",
   "importTime",
   "updatedAt",
   "actions",
@@ -2443,7 +2442,6 @@ export default function Accounts() {
                   status: t("accounts.status"),
                   requests: t("accounts.requests"),
                   usage: t("accounts.usage"),
-                  billed: t("accounts.billed"),
                   importTime: t("accounts.importTime"),
                   updatedAt: t("accounts.updatedAt"),
                   actions: t("accounts.actions"),
@@ -2672,11 +2670,6 @@ export default function Accounts() {
                               : ""}
                           </TableHead>
                         )}
-                        {visibleColumns.billed && (
-                          <TableHead className="text-[13px] font-semibold">
-                            {t("accounts.billed")}
-                          </TableHead>
-                        )}
                         {visibleColumns.importTime && (
                           <TableHead
                             className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
@@ -2867,11 +2860,6 @@ export default function Accounts() {
                             {visibleColumns.usage && (
                               <TableCell>
                                 <UsageCell account={account} />
-                              </TableCell>
-                            )}
-                            {visibleColumns.billed && (
-                              <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">
-                                <BilledCell account={account} />
                               </TableCell>
                             )}
                             {visibleColumns.importTime && (
@@ -6018,13 +6006,6 @@ function UsageWindowStat({
   const { t } = useTranslation();
   if (!detail || !hasUsageWindowDetail(detail)) return null;
 
-  const accountBilledText =
-    typeof detail.account_billed === "number"
-      ? detail.account_billed.toFixed(4)
-      : "";
-  const userBilledText =
-    typeof detail.user_billed === "number" ? detail.user_billed.toFixed(4) : "";
-
   return (
     <div className="flex flex-col gap-0.5">
       <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
@@ -6036,20 +6017,6 @@ function UsageWindowStat({
           {t("accounts.usageTokUnit")}
         </span>
       </div>
-      {(accountBilledText || userBilledText) && (
-        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-6">
-          {accountBilledText && (
-            <span>
-              {t("accounts.accountBilledLabel")}: ${accountBilledText}
-            </span>
-          )}
-          {userBilledText && (
-            <span>
-              {t("accounts.userBilledLabel")}: ${userBilledText}
-            </span>
-          )}
-        </div>
-      )}
     </div>
   );
 }
@@ -6134,19 +6101,6 @@ function UsageCell({ account }: { account: AccountRow }) {
     );
   }
   return <span className="text-[13px] text-muted-foreground">-</span>;
-}
-
-function BilledCell({ account }: { account: AccountRow }) {
-  const h5 = typeof account.billed_5h === "number" ? account.billed_5h.toFixed(2) : null;
-  const d7 = typeof account.billed_7d === "number" ? account.billed_7d.toFixed(2) : null;
-  if (h5 === null && d7 === null) return <span className="text-[12px] text-muted-foreground">-</span>;
-  return (
-    <span className="text-[12px] text-muted-foreground">
-      {h5 !== null ? `5h: $${h5}` : "5h: -"}
-      {" / "}
-      {d7 !== null ? `7d: $${d7}` : "7d: -"}
-    </span>
-  );
 }
 
 function getAccountStatusCountdownUntil(

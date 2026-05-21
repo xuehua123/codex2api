@@ -28,7 +28,6 @@ import {
 import {
   Copy,
   CalendarClock,
-  CircleDollarSign,
   Eye,
   EyeOff,
   Fingerprint,
@@ -45,7 +44,6 @@ type ExpireMode = "never" | "7" | "30" | "90" | "custom";
 interface CreateKeyFormState {
   name: string;
   key: string;
-  quotaLimit: string;
   expireMode: ExpireMode;
   expiresAt: string;
   allowedGroupIds: number[];
@@ -53,7 +51,6 @@ interface CreateKeyFormState {
 
 interface EditKeyFormState {
   name: string;
-  quotaLimit: string;
   expireMode: ExpireMode;
   expiresAt: string;
   allowedGroupIds: number[];
@@ -62,7 +59,6 @@ interface EditKeyFormState {
 const initialCreateForm: CreateKeyFormState = {
   name: "",
   key: "",
-  quotaLimit: "",
   expireMode: "never",
   expiresAt: "",
   allowedGroupIds: [],
@@ -70,7 +66,6 @@ const initialCreateForm: CreateKeyFormState = {
 
 const initialEditForm: EditKeyFormState = {
   name: "",
-  quotaLimit: "",
   expireMode: "never",
   expiresAt: "",
   allowedGroupIds: [],
@@ -146,16 +141,6 @@ export default function APIKeys() {
     event?.preventDefault();
     setCreating(true);
     try {
-      const quotaLimitText = createForm.quotaLimit.trim();
-      let quotaLimit: number | undefined;
-      if (quotaLimitText) {
-        quotaLimit = Number(quotaLimitText);
-        if (!Number.isFinite(quotaLimit) || quotaLimit < 0) {
-          showToast(t("apiKeys.quotaInvalid"), "error");
-          return;
-        }
-      }
-
       const expirationPayload = buildExpirationPayload(createForm, t) as {
         expires_in_days?: number;
         expires_at?: string;
@@ -163,7 +148,6 @@ export default function APIKeys() {
       const payload = {
         name: createForm.name.trim() || t("apiKeys.defaultName"),
         ...(createForm.key.trim() ? { key: createForm.key.trim() } : {}),
-        ...(quotaLimit && quotaLimit > 0 ? { quota_limit: quotaLimit } : {}),
         allowed_group_ids: createForm.allowedGroupIds,
         ...expirationPayload,
       };
@@ -260,7 +244,6 @@ export default function APIKeys() {
     setEditingKey(keyRow);
     setEditForm({
       name: keyRow.name,
-      quotaLimit: keyRow.quota_limit > 0 ? String(keyRow.quota_limit) : "",
       expireMode: keyRow.expires_at ? "custom" : "never",
       expiresAt: toDateTimeLocalValue(keyRow.expires_at),
       allowedGroupIds: keyRow.allowed_group_ids ?? [],
@@ -287,10 +270,8 @@ export default function APIKeys() {
     }
     setSaving(true);
     try {
-      const quotaLimit = parseQuotaLimit(editForm.quotaLimit, t);
       await api.updateAPIKey(editingKey.id, {
         name: trimmed,
-        quota_limit: quotaLimit,
         allowed_group_ids: editForm.allowedGroupIds,
         ...buildExpirationPayload(editForm, t, { clearNever: true }),
       });
@@ -406,7 +387,6 @@ export default function APIKeys() {
                         <TableHead>{t("common.name")}</TableHead>
                         <TableHead>{t("apiKeys.keyColumn")}</TableHead>
                         <TableHead>{t("apiKeys.allowedGroups")}</TableHead>
-                        <TableHead>{t("apiKeys.quotaColumn")}</TableHead>
                         <TableHead>{t("apiKeys.expiresColumn")}</TableHead>
                         <TableHead>{t("common.createdAt")}</TableHead>
                         <TableHead className="text-right">
@@ -495,23 +475,6 @@ export default function APIKeys() {
                                 groups={groups}
                                 t={t}
                               />
-                            </TableCell>
-                            <TableCell className="min-w-[150px] text-sm text-muted-foreground">
-                              <div className="space-y-1">
-                                <div className="font-medium text-foreground">
-                                  {formatQuotaLimit(keyRow, t)}
-                                </div>
-                                {keyRow.quota_limit > 0 ? (
-                                  <div className="h-1.5 w-28 overflow-hidden rounded-full bg-muted">
-                                    <div
-                                      className="h-full rounded-full bg-primary"
-                                      style={{
-                                        width: `${Math.min(100, Math.max(0, (keyRow.quota_used / keyRow.quota_limit) * 100))}%`,
-                                      }}
-                                    />
-                                  </div>
-                                ) : null}
-                              </div>
                             </TableCell>
                             <TableCell className="text-muted-foreground">
                               {formatExpiration(keyRow, t)}
@@ -644,22 +607,6 @@ export default function APIKeys() {
 
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField
-                label={t("apiKeys.quotaLimitLabel")}
-                icon={<CircleDollarSign className="size-3.5" />}
-              >
-                <Input
-                  type="number"
-                  min="0"
-                  step="0.000001"
-                  inputMode="decimal"
-                  placeholder={t("apiKeys.quotaLimitPlaceholder")}
-                  value={createForm.quotaLimit}
-                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                    updateCreateForm({ quotaLimit: event.target.value })
-                  }
-                />
-              </FormField>
-              <FormField
                 label={t("apiKeys.expireModeLabel")}
                 icon={<CalendarClock className="size-3.5" />}
               >
@@ -764,22 +711,6 @@ export default function APIKeys() {
                     autoFocus
                   />
                 </FormField>
-                <FormField
-                  label={t("apiKeys.quotaLimitLabel")}
-                  icon={<CircleDollarSign className="size-3.5" />}
-                >
-                  <Input
-                    type="number"
-                    min="0"
-                    step="0.000001"
-                    inputMode="decimal"
-                    placeholder={t("apiKeys.quotaLimitPlaceholder")}
-                    value={editForm.quotaLimit}
-                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                      updateEditForm({ quotaLimit: event.target.value })
-                    }
-                  />
-                </FormField>
               </div>
 
               <div className="grid gap-4 sm:grid-cols-2">
@@ -851,16 +782,6 @@ export default function APIKeys() {
 
 type Translator = (key: string, options?: Record<string, unknown>) => string;
 
-function parseQuotaLimit(raw: string, t: Translator): number {
-  const quotaLimitText = raw.trim();
-  if (!quotaLimitText) return 0;
-  const quotaLimit = Number(quotaLimitText);
-  if (!Number.isFinite(quotaLimit) || quotaLimit < 0) {
-    throw new Error(t("apiKeys.quotaInvalid"));
-  }
-  return quotaLimit;
-}
-
 function buildExpirationPayload(
   form: Pick<CreateKeyFormState, "expireMode" | "expiresAt">,
   t: Translator,
@@ -894,8 +815,8 @@ function toDateTimeLocalValue(value?: string | null) {
 
 function getAPIKeyStatus(
   keyRow: APIKeyRow,
-): "active" | "expired" | "quota_exhausted" {
-  if (keyRow.status === "expired" || keyRow.status === "quota_exhausted") {
+): "active" | "expired" {
+  if (keyRow.status === "expired") {
     return keyRow.status;
   }
   if (
@@ -904,20 +825,7 @@ function getAPIKeyStatus(
   ) {
     return "expired";
   }
-  if (keyRow.quota_limit > 0 && keyRow.quota_used >= keyRow.quota_limit) {
-    return "quota_exhausted";
-  }
   return "active";
-}
-
-function formatQuotaLimit(keyRow: APIKeyRow, t: Translator) {
-  if (!keyRow.quota_limit || keyRow.quota_limit <= 0) {
-    return t("apiKeys.unlimited");
-  }
-  return t("apiKeys.quotaUsedOfLimit", {
-    used: formatUSD(keyRow.quota_used),
-    limit: formatUSD(keyRow.quota_limit),
-  });
 }
 
 function formatExpiration(keyRow: APIKeyRow, t: Translator) {
@@ -925,13 +833,6 @@ function formatExpiration(keyRow: APIKeyRow, t: Translator) {
     return t("apiKeys.neverExpires");
   }
   return formatBeijingTime(keyRow.expires_at);
-}
-
-function formatUSD(value: number) {
-  if (!Number.isFinite(value)) return "$0";
-  if (value >= 1) return `$${value.toFixed(2)}`;
-  if (value >= 0.01) return `$${value.toFixed(4)}`;
-  return `$${value.toFixed(6)}`;
 }
 
 function AllowedGroupsDisplay({

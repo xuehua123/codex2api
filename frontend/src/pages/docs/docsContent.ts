@@ -583,8 +583,8 @@ curl --request POST \\
       title: copy(locale, "列出 API 密钥", "List API keys"),
       description: copy(
         locale,
-        "列出后台创建的下游调用密钥，包含额度、用量、过期时间、状态和允许账号分组。该接口会在 raw_key 返回完整密钥，只能在受信任后台使用。",
-        "List downstream API keys created in the admin panel, including quota, usage, expiration, status, and allowed account groups. The raw_key field contains the full secret and must only be used in trusted admin contexts.",
+        "列出后台创建的下游调用密钥，包含过期时间、状态和允许账号分组。该接口会在 raw_key 返回完整密钥，只能在受信任后台使用。",
+        "List downstream API keys created in the admin panel, including expiration, status, and allowed account groups. The raw_key field contains the full secret and must only be used in trusted admin contexts.",
       ),
       curl: `curl --request GET \\
   --url ${baseUrl}/api/admin/keys \\
@@ -599,8 +599,6 @@ curl --request POST \\
       "name": "Claude Code",
       "key": "sk-****...abcd",
       "raw_key": "sk-live-full-key",
-      "quota_limit": 10,
-      "quota_used": 1.25,
       "expires_at": "2026-06-01T00:00:00Z",
       "allowed_group_ids": [1],
       "status": "active",
@@ -618,12 +616,11 @@ curl --request POST \\
       title: copy(locale, "创建 API 密钥", "Create API key"),
       description: copy(
         locale,
-        "创建下游客户端使用的 API Key。key 可省略由系统生成；quota_limit 为 0 或省略表示不限额；allowed_group_ids 为空表示可调度全部账号分组。",
-        "Create a downstream API key. The key can be generated automatically; quota_limit omitted or set to 0 means unlimited; empty allowed_group_ids means all account groups are allowed.",
+        "创建下游客户端使用的 API Key。key 可省略由系统生成；allowed_group_ids 为空表示可调度全部账号分组。",
+        "Create a downstream API key. The key can be generated automatically; empty allowed_group_ids means all account groups are allowed.",
       ),
       defaultBody: `{
   "name": "Claude Code",
-  "quota_limit": 10,
   "expires_in_days": 30,
   "allowed_group_ids": [1]
 }`,
@@ -633,7 +630,6 @@ curl --request POST \\
   --header 'Content-Type: application/json' \\
   --data '{
   "name": "Claude Code",
-  "quota_limit": 10,
   "expires_in_days": 30,
   "allowed_group_ids": [1]
 }'`,
@@ -644,8 +640,6 @@ curl --request POST \\
   "id": 2,
   "key": "sk-...",
   "name": "Claude Code",
-  "quota_limit": 10,
-  "quota_used": 0,
   "expires_at": "2026-06-12T00:00:00Z",
   "allowed_group_ids": [1]
 }`,
@@ -663,12 +657,11 @@ curl --request POST \\
       title: copy(locale, "编辑 API 密钥", "Edit API key"),
       description: copy(
         locale,
-        "编辑密钥名称、额度、过期时间和允许账号分组。字段省略时保持原值；quota_limit 传 0/null 清除额度；expires_at 传 null 或 expires_in_days 传 0 清除过期时间。",
-        "Edit API key name, quota, expiration, and allowed account groups. Omitted fields keep existing values; quota_limit set to 0/null clears the limit; expires_at set to null or expires_in_days set to 0 clears expiration.",
+        "编辑密钥名称、过期时间和允许账号分组。字段省略时保持原值；expires_at 传 null 或 expires_in_days 传 0 清除过期时间。",
+        "Edit API key name, expiration, and allowed account groups. Omitted fields keep existing values; expires_at set to null or expires_in_days set to 0 clears expiration.",
       ),
       defaultBody: `{
   "name": "Cherry Studio",
-  "quota_limit": 25,
   "expires_at": null,
   "allowed_group_ids": []
 }`,
@@ -678,13 +671,11 @@ curl --request POST \\
   --header 'Content-Type: application/json' \\
   --data '{
   "name": "Cherry Studio",
-  "quota_limit": 25,
   "expires_at": null,
   "allowed_group_ids": []
 }'`,
       responses: [
         { code: 200, body: `{"message": "API Key 已更新"}` },
-        { code: 400, body: `{"error": "额度限制不能小于 0"}` },
         { code: 404, body: `{"error": "API Key 不存在"}` },
       ],
     },
