@@ -76,7 +76,7 @@ const (
 	adminChartCacheNamespace      = "admin:chart-data"
 	adminAPIKeyCacheNamespace     = "api-key"
 	adminAPIKeyCountNamespace     = "api-key-count"
-	adminUsageStatsCacheTTL       = 5 * time.Second
+	adminUsageStatsCacheTTL       = 60 * time.Second
 	adminChartCacheTTL            = 10 * time.Second
 	importFileSizeLimitBytes      = 20 * 1024 * 1024
 	importFileSizeLimitLabel      = "20MB"
@@ -2517,7 +2517,7 @@ func (h *Handler) GetHealth(c *gin.Context) {
 
 // GetUsageStats 获取使用统计
 func (h *Handler) GetUsageStats(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
 	stats, err := h.getUsageStatsCached(ctx)

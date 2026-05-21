@@ -2044,10 +2044,30 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 				COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END), 0),
 				COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0),
 				COALESCE(SUM(account_billed), 0),
-				COALESCE(SUM(user_billed), 0)
+				COALESCE(SUM(user_billed), 0),
+				COALESCE(SUM(CASE WHEN stream THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN NOT stream THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN LOWER(COALESCE(service_tier, '')) IN ('fast', 'priority') THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN reasoning_tokens > 0 OR NULLIF(reasoning_effort, '') IS NOT NULL THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN LOWER(COALESCE(NULLIF(inbound_endpoint, ''), endpoint, '')) LIKE '%/images/%' OR LOWER(COALESCE(model, '')) LIKE 'gpt-image-%' OR image_count > 0 THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN is_retry_attempt OR attempt_index > 0 THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0)
 			FROM usage_logs
 			WHERE status_code <> 499
-		`).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &visibleCacheHitRequests, &currentFirstTokenMsSum, &visibleFirstTokenSamples, &currentAccountBilled, &currentUserBilled)
+		`).Scan(
+		&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached,
+		&visibleCacheHitRequests, &currentFirstTokenMsSum, &visibleFirstTokenSamples,
+		&currentAccountBilled, &currentUserBilled,
+		&stats.FeatureStats.StreamRequests,
+		&stats.FeatureStats.SyncRequests,
+		&stats.FeatureStats.FastRequests,
+		&stats.FeatureStats.CacheHitRequests,
+		&stats.FeatureStats.ReasoningRequests,
+		&stats.FeatureStats.ImageRequests,
+		&stats.FeatureStats.RetryRequests,
+		&stats.FeatureStats.ErrorRequests,
+	)
 
 	// 加上基线值（清空日志前保存的累计值）
 	var bReq, bTok, bPrompt, bComp, bCached, bCacheHitRequests, bFirstTokenSamples int64
@@ -2151,29 +2171,31 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 	if stats == nil {
 		return nil
 	}
-	if err := db.conn.QueryRowContext(ctx, `
-		SELECT
-			COALESCE(SUM(CASE WHEN stream THEN 1 ELSE 0 END), 0) AS stream_requests,
-			COALESCE(SUM(CASE WHEN NOT stream THEN 1 ELSE 0 END), 0) AS sync_requests,
-			COALESCE(SUM(CASE WHEN LOWER(COALESCE(service_tier, '')) IN ('fast', 'priority') THEN 1 ELSE 0 END), 0) AS fast_requests,
-			COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0) AS cache_hit_requests,
-			COALESCE(SUM(CASE WHEN reasoning_tokens > 0 OR NULLIF(reasoning_effort, '') IS NOT NULL THEN 1 ELSE 0 END), 0) AS reasoning_requests,
-			COALESCE(SUM(CASE WHEN LOWER(COALESCE(NULLIF(inbound_endpoint, ''), endpoint, '')) LIKE '%/images/%' OR LOWER(COALESCE(model, '')) LIKE 'gpt-image-%' OR image_count > 0 THEN 1 ELSE 0 END), 0) AS image_requests,
-			COALESCE(SUM(CASE WHEN is_retry_attempt OR attempt_index > 0 THEN 1 ELSE 0 END), 0) AS retry_requests,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_requests
-		FROM usage_logs
-		WHERE status_code <> 499
-	`).Scan(
-		&stats.FeatureStats.StreamRequests,
-		&stats.FeatureStats.SyncRequests,
-		&stats.FeatureStats.FastRequests,
-		&stats.FeatureStats.CacheHitRequests,
-		&stats.FeatureStats.ReasoningRequests,
-		&stats.FeatureStats.ImageRequests,
-		&stats.FeatureStats.RetryRequests,
-		&stats.FeatureStats.ErrorRequests,
-	); err != nil {
-		return err
+	if db.isSQLite() {
+		if err := db.conn.QueryRowContext(ctx, `
+			SELECT
+				COALESCE(SUM(CASE WHEN stream THEN 1 ELSE 0 END), 0) AS stream_requests,
+				COALESCE(SUM(CASE WHEN NOT stream THEN 1 ELSE 0 END), 0) AS sync_requests,
+				COALESCE(SUM(CASE WHEN LOWER(COALESCE(service_tier, '')) IN ('fast', 'priority') THEN 1 ELSE 0 END), 0) AS fast_requests,
+				COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0) AS cache_hit_requests,
+				COALESCE(SUM(CASE WHEN reasoning_tokens > 0 OR NULLIF(reasoning_effort, '') IS NOT NULL THEN 1 ELSE 0 END), 0) AS reasoning_requests,
+				COALESCE(SUM(CASE WHEN LOWER(COALESCE(NULLIF(inbound_endpoint, ''), endpoint, '')) LIKE '%/images/%' OR LOWER(COALESCE(model, '')) LIKE 'gpt-image-%' OR image_count > 0 THEN 1 ELSE 0 END), 0) AS image_requests,
+				COALESCE(SUM(CASE WHEN is_retry_attempt OR attempt_index > 0 THEN 1 ELSE 0 END), 0) AS retry_requests,
+				COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_requests
+			FROM usage_logs
+			WHERE status_code <> 499
+		`).Scan(
+			&stats.FeatureStats.StreamRequests,
+			&stats.FeatureStats.SyncRequests,
+			&stats.FeatureStats.FastRequests,
+			&stats.FeatureStats.CacheHitRequests,
+			&stats.FeatureStats.ReasoningRequests,
+			&stats.FeatureStats.ImageRequests,
+			&stats.FeatureStats.RetryRequests,
+			&stats.FeatureStats.ErrorRequests,
+		); err != nil {
+			return err
+		}
 	}
 
 	endpoints, err := db.getUsageEndpointStats(ctx, 8)
