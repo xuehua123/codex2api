@@ -6,9 +6,12 @@ import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
-import ToastNotice from "../components/ToastNotice";
-import { useDataLoader } from "../hooks/useDataLoader";
+import { useDataLoader, type LoadOptions } from "../hooks/useDataLoader";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
+import {
+  DEFAULT_PAGE_SIZE_OPTIONS,
+  usePersistedPageSize,
+} from "../hooks/usePersistedPageSize";
 import { useToast } from "../hooks/useToast";
 import type {
   AccountRow,
@@ -19,6 +22,7 @@ import type {
   APIKeyRow,
   OpsOverviewResponse,
   AccountGroup,
+  SystemSettings,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatCompactEmail } from "../lib/utils";
@@ -56,6 +60,7 @@ import {
   Search,
   Fingerprint,
   FolderOpen,
+  Cloud,
   Lock,
   Unlock,
   RotateCcw,
@@ -63,6 +68,7 @@ import {
   Check,
   ChevronDown,
   Copy,
+  Cookie,
   Power,
   PowerOff,
   Hourglass,
@@ -71,6 +77,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
+import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import ChipInput from "../components/ChipInput";
@@ -244,10 +251,14 @@ async function runAccountBatch(
 
 export default function Accounts() {
   const { t } = useTranslation();
-  const pageSizeOptions = [10, 20, 50, 100];
+  const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
   const [showAdd, setShowAdd] = useState(false);
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(20);
+  const [pageSize, setPageSize] = usePersistedPageSize(
+    "accounts",
+    20,
+    pageSizeOptions,
+  );
   const [statusFilter, setStatusFilter] = useState<
     | "all"
     | "normal"
@@ -268,6 +279,7 @@ export default function Accounts() {
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: "",
+    session_token: "",
     proxy_url: "",
   });
   const [submitting, setSubmitting] = useState(false);
@@ -316,6 +328,7 @@ export default function Accounts() {
   const [editOpenAIModelsLoading, setEditOpenAIModelsLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [showImportPicker, setShowImportPicker] = useState(false);
+  const [showSub2APIImport, setShowSub2APIImport] = useState(false);
   const [dragging, setDragging] = useState(false);
   const dragCounter = useRef(0);
   const [showExportPicker, setShowExportPicker] = useState(false);
@@ -344,9 +357,9 @@ export default function Accounts() {
     failed: 0,
     done: false,
   });
-  const [addMethod, setAddMethod] = useState<"rt" | "at" | "openai" | "oauth">(
-    "rt",
-  );
+  const [addMethod, setAddMethod] = useState<
+    "rt" | "st" | "at" | "openai" | "oauth"
+  >("rt");
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
     proxy_url: "",
@@ -393,25 +406,41 @@ export default function Accounts() {
   >(getInitialAccountVisibleColumns);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
+  const jsonAtInputRef = useRef<HTMLInputElement>(null);
   const atFileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const lazyModeRef = useRef<boolean | null>(null);
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
 
-  const loadAccounts = useCallback(async () => {
-    const [accountsResponse, apiKeysResponse, opsOverview, groupsResponse] =
+  const loadAccounts = useCallback(async (options?: LoadOptions) => {
+    const shouldLoadSettings = !options?.silent || lazyModeRef.current === null;
+    const [
+      accountsResponse,
+      apiKeysResponse,
+      opsOverview,
+      groupsResponse,
+      settings,
+    ] =
       await Promise.all([
         api.getAccounts(),
         api.getAPIKeys(),
         api.getOpsOverview().catch((): OpsOverviewResponse | null => null),
         api.listAccountGroups().catch(() => ({ groups: [] })),
+        shouldLoadSettings
+          ? api.getSettings().catch((): SystemSettings | null => null)
+          : Promise.resolve<SystemSettings | null>(null),
       ]);
+    if (settings) {
+      lazyModeRef.current = settings.lazy_mode;
+    }
     setAllGroups(groupsResponse.groups ?? []);
     return {
       accounts: accountsResponse.accounts ?? [],
       apiKeys: apiKeysResponse.keys ?? [],
       opsOverview,
+      lazyMode: lazyModeRef.current ?? false,
     };
   }, []);
 
@@ -419,17 +448,20 @@ export default function Accounts() {
     accounts: AccountRow[];
     apiKeys: APIKeyRow[];
     opsOverview: OpsOverviewResponse | null;
+    lazyMode: boolean;
   }>({
     initialData: {
       accounts: [],
       apiKeys: [],
       opsOverview: null,
+      lazyMode: false,
     },
     load: loadAccounts,
   });
   const accounts = data.accounts;
   const apiKeys = data.apiKeys;
   const opsOverview = data.opsOverview;
+  const lazyMode = data.lazyMode;
   const usageReloadAttemptsRef = useRef<Map<number, number>>(new Map());
 
   useEffect(() => {
@@ -460,16 +492,16 @@ export default function Accounts() {
       const has5h =
         account.usage_percent_5h !== null &&
         account.usage_percent_5h !== undefined;
-
-      if (plan === "free") {
-        return !has7d;
-      }
-      if (
+      // 与 UsageCell 的显示判定保持一致:plan_type 可能滞后于真实订阅状态,
+      // 看到 5h 重置时间就当订阅账号处理,触发拉取 5h 数据。
+      const looksLikeSubscription =
         plan === "pro" ||
         plan === "team" ||
         plan === "plus" ||
-        plan === "teamplus"
-      ) {
+        plan === "teamplus" ||
+        !!account.reset_5h_at;
+
+      if (looksLikeSubscription) {
         return !has5h || !has7d;
       }
       return !has7d;
@@ -750,14 +782,23 @@ export default function Accounts() {
     }
   }, [allPageSelected, pagedAccountIds]);
 
-  const handleAdd = async () => {
-    if (!addForm.refresh_token.trim()) return;
+  const handleAdd = async (credential: "rt" | "st" = "rt") => {
+    const payload: AddAccountRequest =
+      credential === "st"
+        ? { ...addForm, refresh_token: "" }
+        : { ...addForm, session_token: "" };
+    if (
+      !payload.refresh_token?.trim() &&
+      !payload.session_token?.trim()
+    ) {
+      return;
+    }
     setSubmitting(true);
     try {
-      await api.addAccount(addForm);
+      await api.addAccount(payload);
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
-      setAddForm({ refresh_token: "", proxy_url: "" });
+      setAddForm({ refresh_token: "", session_token: "", proxy_url: "" });
       void reload();
     } catch (error) {
       showToast(
@@ -1052,7 +1093,7 @@ export default function Accounts() {
 
   const importFiles = async (
     files: File[],
-    format: "txt" | "json" | "at_txt",
+    format: "txt" | "json" | "json_at" | "at_txt",
   ) => {
     setImporting(true);
     try {
@@ -1239,6 +1280,14 @@ export default function Accounts() {
     setShowImportPicker(false);
     await importFiles(Array.from(files), "json");
     if (jsonInputRef.current) jsonInputRef.current.value = "";
+  };
+
+  const handleJsonAtImport = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    setShowImportPicker(false);
+    await importFiles(Array.from(files), "json_at");
+    if (jsonAtInputRef.current) jsonAtInputRef.current.value = "";
   };
 
   const handleAtFileImport = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1690,7 +1739,7 @@ export default function Accounts() {
           failed: result.failed,
         }),
       );
-      void reload();
+      void reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.batchTestFailed", { error: getErrorMessage(error) }),
@@ -2170,6 +2219,12 @@ export default function Accounts() {
                       disabled: migrating,
                       onSelect: () => setShowMigrate(true),
                     },
+                    {
+                      key: "sub2api",
+                      label: t("accounts.sub2api.entry"),
+                      icon: <Cloud className="size-3.5" />,
+                      onSelect: () => setShowSub2APIImport(true),
+                    },
                   ]}
                 />
                 <Button onClick={() => setShowAdd(true)}>
@@ -2191,6 +2246,14 @@ export default function Accounts() {
                   multiple
                   className="hidden"
                   onChange={(e) => void handleJsonImport(e)}
+                />
+                <input
+                  ref={jsonAtInputRef}
+                  type="file"
+                  accept=".json"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => void handleJsonAtImport(e)}
                 />
                 <input
                   ref={atFileInputRef}
@@ -2256,6 +2319,14 @@ export default function Accounts() {
                 accounts={accounts}
                 compact
                 className="min-w-0"
+                onProbeStarted={() => {
+                  showToast(t('accounts.quotaDistributionRefreshStarted'), 'success')
+                  // 探针在后台并发执行；稍等一下再静默拉取，让首批结果有机会回流
+                  window.setTimeout(() => {
+                    void reloadSilently()
+                  }, 4000)
+                }}
+                onProbeError={(message) => showToast(message, 'error')}
               />
               <AccountRateLimitRecoveryChart
                 accounts={accounts}
@@ -2269,7 +2340,7 @@ export default function Accounts() {
           ) : null}
 
           <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1fr)_max-content]">
-            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:overflow-x-auto xl:flex-nowrap">
+            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:flex-wrap max-lg:overflow-visible xl:flex-nowrap">
               <span className="shrink-0 whitespace-nowrap font-semibold text-foreground">
                 {t("accounts.filter")}
               </span>
@@ -2317,7 +2388,7 @@ export default function Accounts() {
               ))}
             </div>
 
-            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:overflow-x-auto xl:flex-nowrap">
+            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:flex-wrap max-lg:overflow-visible xl:flex-nowrap">
               <span className="shrink-0 whitespace-nowrap font-semibold text-foreground">
                 {t("accounts.schedulerView")}
               </span>
@@ -2344,7 +2415,7 @@ export default function Accounts() {
             </div>
           </div>
 
-          <div className="mb-4 flex items-center gap-2 overflow-visible max-lg:flex-wrap max-lg:overflow-x-auto">
+          <div className="mb-4 flex items-center gap-2 overflow-visible max-lg:flex-wrap max-lg:overflow-visible">
             <div className="relative w-64 shrink-0 max-sm:w-full">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
               <Input
@@ -2357,7 +2428,7 @@ export default function Accounts() {
                 }}
               />
             </div>
-            <div className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5">
+            <div className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5 max-sm:w-full max-sm:flex-wrap">
               {(["all", "pro", "prolite", "plus", "team", "free"] as const).map(
                 (key) => (
                   <button
@@ -2551,7 +2622,7 @@ export default function Accounts() {
           )}
 
           <Card>
-            <CardContent className="p-4">
+            <CardContent className="p-3 sm:p-4">
               <StateShell
                 variant="section"
                 isEmpty={accounts.length === 0}
@@ -2563,7 +2634,40 @@ export default function Accounts() {
                   </Button>
                 }
               >
-                <div className="data-table-shell">
+                <div className="grid gap-3 lg:hidden">
+                  {pagedAccounts.map((account, index) => {
+                    const isSelected = selected.has(account.id);
+                    return (
+                      <AccountMobileCard
+                        key={account.id}
+                        account={account}
+                        sequence={(currentPage - 1) * pageSize + index + 1}
+                        selected={isSelected}
+                        allGroups={allGroups}
+                        lazyMode={lazyMode}
+                        refreshing={refreshingIds.has(account.id)}
+                        authJsonExporting={authJsonExportingIds.has(account.id)}
+                        t={t}
+                        onToggleSelect={() => toggleSelect(account.id)}
+                        onEdit={() => openSchedulerEditor(account)}
+                        onUsage={() => setUsageAccount(account)}
+                        onTest={() => setTestingAccount(account)}
+                        onRefresh={() => void handleRefresh(account)}
+                        onGenerateAuthJson={() =>
+                          void handleGenerateAuthJSON(account)
+                        }
+                        onToggleEnabled={() =>
+                          void handleToggleEnabled(account)
+                        }
+                        onToggleLock={() => void handleToggleLock(account)}
+                        onResetStatus={() => void handleResetStatus(account)}
+                        onDelete={() => void handleDelete(account)}
+                      />
+                    );
+                  })}
+                </div>
+
+                <div className="data-table-shell hidden lg:block">
                   <Table>
                     <TableHeader>
                       <TableRow>
@@ -2868,8 +2972,29 @@ export default function Accounts() {
                               </TableCell>
                             )}
                             {visibleColumns.updatedAt && (
-                              <TableCell className="text-[14px] text-muted-foreground">
-                                {formatRelativeTime(account.updated_at)}
+                              <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">
+                                {lazyMode ? (
+                                  <div className="space-y-0.5 leading-tight">
+                                    <div title={t("accounts.recordUpdatedAt")}>
+                                      <span className="mr-1 text-[11px] text-muted-foreground/70">
+                                        {t("accounts.recordUpdatedAtShort")}
+                                      </span>
+                                      {formatRelativeTime(account.updated_at)}
+                                    </div>
+                                    <div title={t("accounts.usageUpdatedAt")}>
+                                      <span className="mr-1 text-[11px] text-muted-foreground/70">
+                                        {t("accounts.usageUpdatedAtShort")}
+                                      </span>
+                                      {account.codex_usage_updated_at
+                                        ? formatRelativeTime(
+                                            account.codex_usage_updated_at,
+                                          )
+                                        : t("accounts.noUsageUpdatedAt")}
+                                    </div>
+                                  </div>
+                                ) : (
+                                  formatRelativeTime(account.updated_at)
+                                )}
                               </TableCell>
                             )}
                             {visibleColumns.actions && (
@@ -3036,7 +3161,7 @@ export default function Accounts() {
           <Modal
             show={showAdd}
             title={t("accounts.addTitle")}
-            contentClassName="sm:max-w-[640px]"
+            contentClassName="sm:max-w-[780px]"
             onClose={() => {
               setShowAdd(false);
               setAddMethod("rt");
@@ -3077,7 +3202,14 @@ export default function Accounts() {
                 {addMethod === "rt" ? (
                   <Button
                     onClick={() => void handleAdd()}
-                    disabled={submitting || !addForm.refresh_token.trim()}
+                    disabled={submitting || !addForm.refresh_token?.trim()}
+                  >
+                    {submitting ? t("accounts.adding") : t("accounts.submit")}
+                  </Button>
+                ) : addMethod === "st" ? (
+                  <Button
+                    onClick={() => void handleAdd("st")}
+                    disabled={submitting || !addForm.session_token?.trim()}
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
@@ -3122,10 +3254,10 @@ export default function Accounts() {
             }
           >
             {/* Tab switcher */}
-            <div className="flex gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
               <button
                 onClick={() => setAddMethod("rt")}
-                className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "rt"
                     ? "bg-background shadow-sm text-foreground"
                     : "text-muted-foreground hover:text-foreground"
@@ -3135,8 +3267,19 @@ export default function Accounts() {
                 {t("accounts.addMethodRT")}
               </button>
               <button
+                onClick={() => setAddMethod("st")}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "st"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <Cookie className="size-3.5" />
+                {t("accounts.addMethodSessionToken")}
+              </button>
+              <button
                 onClick={() => setAddMethod("at")}
-                className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "at"
                     ? "bg-background shadow-sm text-foreground"
                     : "text-muted-foreground hover:text-foreground"
@@ -3147,7 +3290,7 @@ export default function Accounts() {
               </button>
               <button
                 onClick={() => setAddMethod("openai")}
-                className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "openai"
                     ? "bg-background shadow-sm text-foreground"
                     : "text-muted-foreground hover:text-foreground"
@@ -3163,7 +3306,7 @@ export default function Accounts() {
                   setOauthSession(null);
                   setOauthCallbackUrl("");
                 }}
-                className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "oauth"
                     ? "bg-background shadow-sm text-foreground"
                     : "text-muted-foreground hover:text-foreground"
@@ -3183,11 +3326,46 @@ export default function Accounts() {
                   <textarea
                     className="w-full min-h-[160px] p-3 border border-input rounded-xl bg-background text-sm resize-y focus:outline-none focus:ring-2 focus:ring-ring"
                     placeholder={t("accounts.refreshTokenPlaceholder")}
-                    value={addForm.refresh_token}
+                    value={addForm.refresh_token ?? ""}
                     onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
                       setAddForm((form) => ({
                         ...form,
                         refresh_token: event.target.value,
+                      }))
+                    }
+                    rows={6}
+                  />
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.proxyUrl")}
+                  </label>
+                  <Input
+                    placeholder={t("accounts.proxyUrlPlaceholder")}
+                    value={addForm.proxy_url}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                      setAddForm((form) => ({
+                        ...form,
+                        proxy_url: event.target.value,
+                      }))
+                    }
+                  />
+                </div>
+              </div>
+            ) : addMethod === "st" ? (
+              <div className="space-y-4">
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.sessionTokenLabel")} *
+                  </label>
+                  <textarea
+                    className="w-full min-h-[160px] p-3 border border-input rounded-xl bg-background text-sm resize-y focus:outline-none focus:ring-2 focus:ring-ring"
+                    placeholder={t("accounts.sessionTokenPlaceholder")}
+                    value={addForm.session_token ?? ""}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                      setAddForm((form) => ({
+                        ...form,
+                        session_token: event.target.value,
                       }))
                     }
                     rows={6}
@@ -3516,6 +3694,23 @@ export default function Accounts() {
                 className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
                 onClick={() => {
                   setShowImportPicker(false);
+                  jsonAtInputRef.current?.click();
+                }}
+              >
+                <FileJson className="size-5 shrink-0 text-muted-foreground" />
+                <div>
+                  <div className="text-sm font-medium">
+                    {t("accounts.importJsonAt")}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {t("accounts.importJsonAtDesc")}
+                  </div>
+                </div>
+              </button>
+              <button
+                className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
+                onClick={() => {
+                  setShowImportPicker(false);
                   atFileInputRef.current?.click();
                 }}
               >
@@ -3548,6 +3743,19 @@ export default function Accounts() {
               </button>
             </div>
           </Modal>
+          <Sub2APIImportModal
+            show={showSub2APIImport}
+            onClose={() => setShowSub2APIImport(false)}
+            onImportStart={async (res) => {
+              setImporting(true);
+              try {
+                await readImportSSE(res);
+              } finally {
+                setImporting(false);
+              }
+            }}
+            onShowToast={(message, kind) => showToast(message, kind ?? "success")}
+          />
 
           <Modal
             show={showExportPicker}
@@ -4590,8 +4798,6 @@ export default function Accounts() {
           </Modal>
 
           {confirmDialog}
-
-          <ToastNotice toast={toast} />
         </>
       </StateShell>
     </div>
@@ -5472,6 +5678,342 @@ function ColumnSettingsMenu({
   );
 }
 
+function AccountMobileCard({
+  account,
+  sequence,
+  selected,
+  allGroups,
+  lazyMode,
+  refreshing,
+  authJsonExporting,
+  t,
+  onToggleSelect,
+  onEdit,
+  onUsage,
+  onTest,
+  onRefresh,
+  onGenerateAuthJson,
+  onToggleEnabled,
+  onToggleLock,
+  onResetStatus,
+  onDelete,
+}: {
+  account: AccountRow;
+  sequence: number;
+  selected: boolean;
+  allGroups: AccountGroup[];
+  lazyMode: boolean;
+  refreshing: boolean;
+  authJsonExporting: boolean;
+  t: ReturnType<typeof useTranslation>["t"];
+  onToggleSelect: () => void;
+  onEdit: () => void;
+  onUsage: () => void;
+  onTest: () => void;
+  onRefresh: () => void;
+  onGenerateAuthJson: () => void;
+  onToggleEnabled: () => void;
+  onToggleLock: () => void;
+  onResetStatus: () => void;
+  onDelete: () => void;
+}) {
+  const displayName = account.openai_responses_api
+    ? formatAccountName(account)
+    : formatCompactEmail(account.email);
+  const fullName = formatAccountName(account);
+  const groups = resolveAccountGroups(account.group_ids ?? [], allGroups);
+  const refreshDisabled =
+    refreshing || account.at_only || account.openai_responses_api;
+  const authJsonDisabled =
+    authJsonExporting || account.at_only || account.openai_responses_api;
+
+  return (
+    <article
+      className={`min-w-0 rounded-lg border bg-card p-3 shadow-sm ${
+        selected ? "border-primary/35 bg-primary/5" : "border-border"
+      }`}
+    >
+      <div className="flex min-w-0 items-start gap-3">
+        <input
+          type="checkbox"
+          className="mt-1 size-4 shrink-0 cursor-pointer accent-primary"
+          checked={selected}
+          onChange={onToggleSelect}
+          aria-label={fullName}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-start justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-mono font-semibold text-muted-foreground">
+                  #{sequence}
+                </span>
+                <PlanBadge planType={account.plan_type} />
+              </div>
+              <div
+                className="mt-1 truncate text-[15px] font-semibold leading-tight text-foreground"
+                title={fullName}
+              >
+                {displayName}
+              </div>
+            </div>
+            <div className="shrink-0">
+              <StatusBadge
+                status={account.status}
+                detail={getAccountRateLimitWindow(account) ?? undefined}
+              />
+            </div>
+          </div>
+
+          <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
+            {account.at_only && (
+              <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
+                AT
+              </span>
+            )}
+            {account.openai_responses_api && (
+              <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
+                Responses API
+              </span>
+            )}
+            {account.enabled === false && (
+              <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
+                <PowerOff className="mr-0.5 size-2.5" />
+                {t("accounts.disabled")}
+              </span>
+            )}
+            {account.locked && (
+              <span className="inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
+                <Lock className="mr-0.5 size-2.5" />
+                {t("accounts.lock")}
+              </span>
+            )}
+            <AccountStatusCountdown account={account} />
+          </div>
+
+          {account.status === "error" && account.error_message && (
+            <div
+              className="mt-2 break-words text-[11px] leading-tight text-red-500"
+              title={account.error_message}
+            >
+              {account.error_message}
+            </div>
+          )}
+          {(account.model_cooldowns?.length ?? 0) > 0 && (
+            <div className="mt-2 text-[11px] leading-tight text-amber-600">
+              model {account.model_cooldowns?.[0]?.model}
+              {(account.model_cooldowns?.length ?? 0) > 1
+                ? ` +${(account.model_cooldowns?.length ?? 1) - 1}`
+                : ""}
+            </div>
+          )}
+          <div className="mt-1 text-[11px] text-muted-foreground">
+            {t("accounts.healthSummary", {
+              health: formatHealthTier(account.health_tier, t),
+              score: Math.round(getDispatchScore(account)),
+              concurrency: account.dynamic_concurrency_limit ?? "-",
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-3 grid min-w-0 grid-cols-2 gap-2 max-[380px]:grid-cols-1">
+        <AccountMobileMetric label={t("accounts.requests")}>
+          <div className="flex items-center gap-2 text-[13px]">
+            <span className="font-medium text-emerald-600">
+              {account.success_requests ?? 0}
+            </span>
+            <span className="text-muted-foreground">/</span>
+            <span className="font-medium text-red-500">
+              {account.error_requests ?? 0}
+            </span>
+          </div>
+          {((account.retry_error_requests ?? 0) > 0 ||
+            (account.rate_limit_attempts ?? 0) > 0) && (
+            <div className="mt-0.5 text-[11px] text-muted-foreground">
+              retry {account.retry_error_requests ?? 0} · 429{" "}
+              {account.rate_limit_attempts ?? 0}
+            </div>
+          )}
+        </AccountMobileMetric>
+        <AccountMobileMetric
+          label={t("accounts.usage")}
+          className="col-span-2 max-[380px]:col-span-1"
+        >
+          <UsageCell account={account} />
+        </AccountMobileMetric>
+        <AccountMobileMetric label={t("accounts.updatedAt")}>
+          {lazyMode ? (
+            <div className="space-y-0.5">
+              <div>
+                <span className="mr-1 text-muted-foreground/70">
+                  {t("accounts.recordUpdatedAtShort")}
+                </span>
+                {formatRelativeTime(account.updated_at)}
+              </div>
+              <div>
+                <span className="mr-1 text-muted-foreground/70">
+                  {t("accounts.usageUpdatedAtShort")}
+                </span>
+                {account.codex_usage_updated_at
+                  ? formatRelativeTime(account.codex_usage_updated_at)
+                  : t("accounts.noUsageUpdatedAt")}
+              </div>
+            </div>
+          ) : (
+            formatRelativeTime(account.updated_at)
+          )}
+        </AccountMobileMetric>
+        <AccountMobileMetric label={t("accounts.importTime")}>
+          {formatBeijingTime(account.created_at)}
+        </AccountMobileMetric>
+      </div>
+
+      {((account.tags ?? []).length > 0 || groups.length > 0) && (
+        <div className="mt-3 space-y-1.5 border-t border-border pt-2">
+          <ChipList items={account.tags ?? []} tone="purple" />
+          <GroupChipList groups={groups} />
+        </div>
+      )}
+
+      <div className="mt-3 grid grid-cols-5 gap-1.5 max-[380px]:grid-cols-4">
+        <AccountMobileActionButton
+          title={t("accounts.editScheduler")}
+          onClick={onEdit}
+          icon={<Pencil className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={t("accounts.usageDetail")}
+          onClick={onUsage}
+          icon={<BarChart3 className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={t("accounts.testConnection")}
+          onClick={onTest}
+          icon={<Zap className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={
+            account.at_only || account.openai_responses_api
+              ? t("accounts.atRefreshDisabled")
+              : t("accounts.refreshAccessToken")
+          }
+          disabled={refreshDisabled}
+          onClick={onRefresh}
+          icon={
+            <RefreshCw
+              className={`size-3.5 ${refreshing ? "animate-spin" : ""}`}
+            />
+          }
+        />
+        <AccountMobileActionButton
+          title={
+            account.at_only || account.openai_responses_api
+              ? t("accounts.authJsonDisabled")
+              : t("accounts.generateAuthJson")
+          }
+          disabled={authJsonDisabled}
+          onClick={onGenerateAuthJson}
+          icon={<FileJson className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={
+            account.enabled === false
+              ? t("accounts.enableHint")
+              : t("accounts.disableHint")
+          }
+          variant={account.enabled === false ? "default" : "outline"}
+          onClick={onToggleEnabled}
+          icon={
+            account.enabled === false ? (
+              <Power className="size-3.5" />
+            ) : (
+              <PowerOff className="size-3.5" />
+            )
+          }
+        />
+        <AccountMobileActionButton
+          title={
+            account.locked ? t("accounts.unlockHint") : t("accounts.lockHint")
+          }
+          variant={account.locked ? "default" : "outline"}
+          onClick={onToggleLock}
+          icon={
+            account.locked ? (
+              <Lock className="size-3.5" />
+            ) : (
+              <Unlock className="size-3.5" />
+            )
+          }
+        />
+        <AccountMobileActionButton
+          title={t("accounts.resetStatusHint")}
+          onClick={onResetStatus}
+          icon={<RotateCcw className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={t("accounts.deleteAccount")}
+          variant="destructive"
+          onClick={onDelete}
+          icon={<Trash2 className="size-3.5" />}
+        />
+      </div>
+    </article>
+  );
+}
+
+function AccountMobileMetric({
+  label,
+  children,
+  className = "",
+}: {
+  label: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={`min-w-0 rounded-lg border border-border bg-muted/20 p-2 ${className}`}
+    >
+      <div className="mb-1 text-[11px] font-bold uppercase text-muted-foreground">
+        {label}
+      </div>
+      <div className="min-w-0 break-words text-[12px] leading-snug text-foreground">
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function AccountMobileActionButton({
+  title,
+  icon,
+  onClick,
+  disabled,
+  variant = "outline",
+}: {
+  title: string;
+  icon: ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  variant?: "default" | "outline" | "destructive";
+}) {
+  return (
+    <Button
+      type="button"
+      variant={variant}
+      size="icon-sm"
+      className="h-9 w-full"
+      disabled={disabled}
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+    >
+      {icon}
+    </Button>
+  );
+}
+
 function formatHealthTier(healthTier?: string, t?: any) {
   if (!t) return "Unknown";
   switch (healthTier) {
@@ -6022,6 +6564,12 @@ function UsageWindowStat({
 }
 
 // 用量列组件
+//
+// 显示策略不再单独依赖 plan_type:
+// 当 plan_type 还停留在按 RT 刷新出来的旧值(例如 "free")、但账号实际已订阅、
+// 后端已经返回 5h 窗口数据时,只看 plan_type 会把 5h 吞掉。
+// 因此这里以"是否真的存在 5h / 7d 数据(含 reset 时间)"作为主判据,
+// plan_type 仅作为 5h 数据缺位时的辅助提示。
 function UsageCell({ account }: { account: AccountRow }) {
   const plan = normalizePlanType(account.plan_type);
   const has7d =
@@ -6030,33 +6578,21 @@ function UsageCell({ account }: { account: AccountRow }) {
     account.usage_percent_5h !== null && account.usage_percent_5h !== undefined;
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail);
   const has5hDetail = hasUsageWindowDetail(account.usage_5h_detail);
+  const has5hReset = !!account.reset_5h_at;
+  const has7dReset = !!account.reset_7d_at;
 
-  if (plan === "free") {
-    if (!has7d && !has7dDetail)
-      return <span className="text-[12px] text-muted-foreground">-</span>;
-    return (
-      <div className="w-48">
-        {has7d ? (
-          <UsageBar
-            label="7d"
-            pct={account.usage_percent_7d!}
-            resetAt={account.reset_7d_at}
-            detail={account.usage_7d_detail}
-          />
-        ) : (
-          <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
-        )}
-      </div>
-    );
-  }
-
-  if (
+  const fiveHourPresent = has5h || has5hDetail || has5hReset;
+  const sevenDayPresent = has7d || has7dDetail || has7dReset;
+  // plan 表明是订阅型时,即使数据暂未拉到也按订阅布局占位,避免抖动
+  const planSuggestsPremium =
     plan === "pro" ||
     plan === "team" ||
     plan === "plus" ||
-    plan === "teamplus"
-  ) {
-    if (!has5h && !has7d && !has5hDetail && !has7dDetail)
+    plan === "teamplus";
+  const showFiveHour = fiveHourPresent || planSuggestsPremium;
+
+  if (showFiveHour) {
+    if (!has5h && !has7d && !has5hDetail && !has7dDetail && !has5hReset && !has7dReset)
       return <span className="text-[12px] text-muted-foreground">-</span>;
     return (
       <div className="w-52 space-y-1.5">
@@ -6084,7 +6620,7 @@ function UsageCell({ account }: { account: AccountRow }) {
     );
   }
 
-  if (has7d || has7dDetail) {
+  if (sevenDayPresent) {
     return (
       <div className="w-48">
         {has7d ? (
@@ -6100,6 +6636,7 @@ function UsageCell({ account }: { account: AccountRow }) {
       </div>
     );
   }
+
   return <span className="text-[13px] text-muted-foreground">-</span>;
 }
 

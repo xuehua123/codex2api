@@ -144,6 +144,7 @@ const (
 	contextAPIKeyID     = "apiKeyID"
 	contextAPIKeyName   = "apiKeyName"
 	contextAPIKeyMasked = "apiKeyMasked"
+	contextAPIKeyRow    = "apiKeyRow"
 )
 
 const slowTTFTLogThresholdMs = 10_000
@@ -1205,6 +1206,7 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		c.Set(contextAPIKeyID, apiKeyRow.ID)
 		c.Set(contextAPIKeyName, strings.TrimSpace(apiKeyRow.Name))
 		c.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKeyRow.Key))
+		c.Set(contextAPIKeyRow, apiKeyRow)
 		c.Set("apiKey", key)
 		c.Next()
 	}
@@ -1850,19 +1852,21 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
+			billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
 			c.Set("x-service-tier", resolvedServiceTier)
 			logInput := &database.UsageLogInput{
-				AccountID:        account.ID(),
-				Endpoint:         "/v1/responses",
-				Model:            model,
-				StatusCode:       outcome.logStatusCode,
-				DurationMs:       totalDuration,
-				FirstTokenMs:     firstTokenMs,
-				ReasoningEffort:  reasoningEffort,
-				InboundEndpoint:  "/v1/responses",
-				UpstreamEndpoint: upstreamEndpoint,
-				Stream:           isStream,
-				ServiceTier:      resolvedServiceTier,
+				AccountID:          account.ID(),
+				Endpoint:           "/v1/responses",
+				Model:              model,
+				StatusCode:         outcome.logStatusCode,
+				DurationMs:         totalDuration,
+				FirstTokenMs:       firstTokenMs,
+				ReasoningEffort:    reasoningEffort,
+				InboundEndpoint:    "/v1/responses",
+				UpstreamEndpoint:   upstreamEndpoint,
+				Stream:             isStream,
+				ServiceTier:        resolvedServiceTier,
+				BillingServiceTier: billingServiceTier,
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
@@ -2350,20 +2354,22 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
+		billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
 		c.Set("x-service-tier", resolvedServiceTier)
 
 		logInput := &database.UsageLogInput{
-			AccountID:        account.ID(),
-			Endpoint:         "/v1/responses",
-			Model:            model,
-			StatusCode:       logStatusCode,
-			DurationMs:       totalDuration,
-			FirstTokenMs:     firstTokenMs,
-			ReasoningEffort:  reasoningEffort,
-			InboundEndpoint:  "/v1/responses",
-			UpstreamEndpoint: "/v1/responses",
-			Stream:           isStream,
-			ServiceTier:      resolvedServiceTier,
+			AccountID:          account.ID(),
+			Endpoint:           "/v1/responses",
+			Model:              model,
+			StatusCode:         logStatusCode,
+			DurationMs:         totalDuration,
+			FirstTokenMs:       firstTokenMs,
+			ReasoningEffort:    reasoningEffort,
+			InboundEndpoint:    "/v1/responses",
+			UpstreamEndpoint:   "/v1/responses",
+			Stream:             isStream,
+			ServiceTier:        resolvedServiceTier,
+			BillingServiceTier: billingServiceTier,
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
@@ -2486,6 +2492,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
+	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
+		return
+	}
 	accountFilter := accountFilterForModel(effectiveModel)
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
@@ -2632,25 +2641,27 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 		actualServiceTier := gjson.GetBytes(respBody, "service_tier").String()
 		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
+		billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
 
 		totalDuration := int(time.Since(start).Milliseconds())
 		h.logUsageForRequest(c, &database.UsageLogInput{
-			AccountID:        account.ID(),
-			Endpoint:         "/v1/responses/compact",
-			Model:            model,
-			StatusCode:       http.StatusOK,
-			DurationMs:       totalDuration,
-			PromptTokens:     promptTokens,
-			CompletionTokens: completionTokens,
-			TotalTokens:      totalTokens,
-			InputTokens:      promptTokens,
-			OutputTokens:     completionTokens,
-			ReasoningTokens:  reasoningTokens,
-			CachedTokens:     cachedTokens,
-			ReasoningEffort:  reasoningEffort,
-			InboundEndpoint:  "/v1/responses/compact",
-			UpstreamEndpoint: "/v1/responses/compact",
-			ServiceTier:      resolvedServiceTier,
+			AccountID:          account.ID(),
+			Endpoint:           "/v1/responses/compact",
+			Model:              model,
+			StatusCode:         http.StatusOK,
+			DurationMs:         totalDuration,
+			PromptTokens:       promptTokens,
+			CompletionTokens:   completionTokens,
+			TotalTokens:        totalTokens,
+			InputTokens:        promptTokens,
+			OutputTokens:       completionTokens,
+			ReasoningTokens:    reasoningTokens,
+			CachedTokens:       cachedTokens,
+			ReasoningEffort:    reasoningEffort,
+			InboundEndpoint:    "/v1/responses/compact",
+			UpstreamEndpoint:   "/v1/responses/compact",
+			ServiceTier:        resolvedServiceTier,
+			BillingServiceTier: billingServiceTier,
 		})
 
 		h.store.Release(account)
@@ -2727,6 +2738,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	trace.EffectiveModel = effectiveModel
 	h.traceRequestEvent(c, trace, "request_validated", requestTraceFields{EffectiveModel: effectiveModel})
+	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
+		return
+	}
 	accountFilter := accountFilterForModel(effectiveModel)
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
@@ -3135,6 +3149,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 		} else {
 			var fullContent strings.Builder
+			var fullReasoning strings.Builder
 			var toolCalls []ToolCallResult
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
@@ -3167,6 +3182,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					delta := parsed.Get("delta").String()
 					deltaCharCount += len(delta)
 					fullContent.WriteString(delta)
+				case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+					fullReasoning.WriteString(parsed.Get("delta").String())
 				case "response.function_call_arguments.delta":
 					deltaCharCount += len(parsed.Get("delta").String())
 				case "response.completed":
@@ -3195,7 +3212,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return true
 			})
 
-			compactResult = BuildCompactResponse(chunkID, model, created, fullContent.String(), toolCalls, usage)
+			compactResult = BuildCompactResponse(chunkID, model, created, fullContent.String(), fullReasoning.String(), toolCalls, usage)
 		}
 
 		// 断流检测 + token 估算
@@ -3262,20 +3279,22 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
+		billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
 		c.Set("x-service-tier", resolvedServiceTier)
 
 		logInput := &database.UsageLogInput{
-			AccountID:        account.ID(),
-			Endpoint:         "/v1/chat/completions",
-			Model:            model,
-			StatusCode:       logStatusCode,
-			DurationMs:       totalDuration,
-			FirstTokenMs:     firstTokenMs,
-			ReasoningEffort:  reasoningEffort,
-			InboundEndpoint:  "/v1/chat/completions",
-			UpstreamEndpoint: "/v1/responses",
-			Stream:           isStream,
-			ServiceTier:      resolvedServiceTier,
+			AccountID:          account.ID(),
+			Endpoint:           "/v1/chat/completions",
+			Model:              model,
+			StatusCode:         logStatusCode,
+			DurationMs:         totalDuration,
+			FirstTokenMs:       firstTokenMs,
+			ReasoningEffort:    reasoningEffort,
+			InboundEndpoint:    "/v1/chat/completions",
+			UpstreamEndpoint:   "/v1/responses",
+			Stream:             isStream,
+			ServiceTier:        resolvedServiceTier,
+			BillingServiceTier: billingServiceTier,
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
@@ -3396,6 +3415,7 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 // handleCompactResponse 处理非流式响应
 func (h *Handler) handleCompactResponse(c *gin.Context, body io.Reader, model, chunkID string, created int64) {
 	var fullContent strings.Builder
+	var fullReasoning strings.Builder
 	var usage *UsageInfo
 
 	_ = ReadSSEStream(body, func(data []byte) bool {
@@ -3404,6 +3424,8 @@ func (h *Handler) handleCompactResponse(c *gin.Context, body io.Reader, model, c
 		case "response.output_text.delta":
 			delta := gjson.GetBytes(data, "delta").String()
 			fullContent.WriteString(delta)
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			fullReasoning.WriteString(gjson.GetBytes(data, "delta").String())
 		case "response.completed":
 			usage = extractUsage(data)
 			return false
@@ -3413,7 +3435,7 @@ func (h *Handler) handleCompactResponse(c *gin.Context, body io.Reader, model, c
 		return true
 	})
 
-	result := BuildCompactResponse(chunkID, model, created, fullContent.String(), nil, usage)
+	result := BuildCompactResponse(chunkID, model, created, fullContent.String(), fullReasoning.String(), nil, usage)
 
 	c.Data(http.StatusOK, "application/json", result)
 }
@@ -3816,6 +3838,9 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 	result := CodexUsageSyncResult{}
 	if account == nil || resp == nil {
 		return result
+	}
+	if store != nil {
+		store.UpdateAccountPlanType(account, resp.Header.Get("x-codex-plan-type"))
 	}
 
 	result.Used5hHeaders = responseHasCodex5hHeaders(resp)

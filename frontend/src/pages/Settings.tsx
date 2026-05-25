@@ -5,7 +5,6 @@ import { api, resetAdminAuthState, setAdminKey } from '../api'
 import { formatBeijingTime, getTimezone, setTimezone } from '../utils/time'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
-import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import type { HealthResponse, ModelInfo, SystemSettings } from '../types'
@@ -350,6 +349,11 @@ export default function Settings() {
     { label: t('settings.schedulerModeRoundRobin'), value: 'round_robin' },
     { label: t('settings.schedulerModeRemainingQuota'), value: 'remaining_quota' },
   ]
+  const affinityModeOptions = [
+    { label: t('settings.affinityModeBounded'), value: 'bounded' },
+    { label: t('settings.affinityModeOff'), value: 'off' },
+    { label: t('settings.affinityModeStrict'), value: 'strict' },
+  ]
   const clientCompatOptions = [
     { label: t('settings.clientCompatPreserve'), value: 'preserve' },
     { label: t('settings.clientCompatAuto'), value: 'auto' },
@@ -368,6 +372,15 @@ export default function Settings() {
     { label: t('settings.imageStorageLocal'), value: 'local' },
     { label: t('settings.imageStorageS3'), value: 's3' },
   ]
+  const normalizeLazySettingsForm = useCallback((settings: SystemSettings): SystemSettings => {
+    if (!settings.lazy_mode) {
+      return settings
+    }
+    return {
+      ...settings,
+      auto_clean_full_usage: false,
+    }
+  }, [])
   const [settingsForm, setSettingsForm] = useState<SystemSettings>({
     site_name: 'CodexProxy',
     site_logo: '',
@@ -377,7 +390,9 @@ export default function Settings() {
     test_concurrency: 50,
     background_refresh_interval_minutes: 2,
     usage_probe_max_age_minutes: 10,
+    usage_probe_concurrency: 16,
     recovery_probe_interval_minutes: 30,
+    lazy_mode: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
@@ -390,6 +405,7 @@ export default function Settings() {
     proxy_pool_enabled: false,
     fast_scheduler_enabled: false,
     scheduler_mode: 'round_robin',
+    affinity_mode: 'bounded',
     max_retries: 2,
     max_rate_limit_retries: 1,
     allow_remote_migration: false,
@@ -438,6 +454,7 @@ export default function Settings() {
     account_alert_recovery_buffer: 10,
     account_alert_recovery_ratio_buffer: 5,
   })
+  const lazyModeActive = settingsForm.lazy_mode
   const [savingSettings, setSavingSettings] = useState(false)
   const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [testingAccountAlert, setTestingAccountAlert] = useState(false)
@@ -452,7 +469,7 @@ export default function Settings() {
 
   const loadSettingsData = useCallback(async () => {
     const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
-    setSettingsForm(settings)
+    setSettingsForm(normalizeLazySettingsForm(settings))
     applyBranding({ site_name: settings.site_name, site_logo: settings.site_logo })
     setLoadedAdminSecret(settings.admin_secret ?? '')
     setModelList(modelsResp.models ?? [])
@@ -462,7 +479,7 @@ export default function Settings() {
     return {
       health,
     }
-  }, [applyBranding])
+  }, [applyBranding, normalizeLazySettingsForm])
 
   const { data, loading, error, reload } = useDataLoader<{
     health: HealthResponse | null
@@ -477,8 +494,8 @@ export default function Settings() {
     setSavingSettings(true)
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
-      const updated = await api.updateSettings(settingsForm)
-      setSettingsForm(updated)
+      const updated = await api.updateSettings(normalizeLazySettingsForm(settingsForm))
+      setSettingsForm(normalizeLazySettingsForm(updated))
       applyBranding({ site_name: updated.site_name, site_logo: updated.site_logo })
       setLoadedAdminSecret(updated.admin_secret ?? '')
       if (updated.admin_auth_source !== 'env') {
@@ -777,9 +794,9 @@ export default function Settings() {
             </div>
           </SettingsCard>
 
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(360px,1.05fr)]">
+          <div className="grid gap-4 xl:grid-cols-3">
             <SettingsCard title={t('settings.trafficProtection')}>
-              <div className="grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-4">
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-4">
                 <SettingField label={t('settings.maxConcurrency')} description={t('settings.maxConcurrencyRange')}>
                   <Input
                     type="number"
@@ -818,14 +835,66 @@ export default function Settings() {
               </div>
             </SettingsCard>
 
-            <SettingsCard title={t('settings.scheduler')}>
-              <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4">
+            <SettingsCard title={t('settings.probeScheduling')}>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-4">
+                <SettingField label={t('settings.backgroundRefreshInterval')} description={t('settings.backgroundRefreshIntervalDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={1440}
+                    value={lazyModeActive ? 0 : settingsForm.background_refresh_interval_minutes}
+                    disabled={lazyModeActive}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_refresh_interval_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.usageProbeMaxAge')} description={t('settings.usageProbeMaxAgeDesc')}>
+                  <Input
+                    type={lazyModeActive ? 'text' : 'number'}
+                    min={1}
+                    max={10080}
+                    value={lazyModeActive ? '∞' : settingsForm.usage_probe_max_age_minutes}
+                    disabled={lazyModeActive}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.usageProbeConcurrency')} description={t('settings.usageProbeConcurrencyDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={128}
+                    value={settingsForm.usage_probe_concurrency}
+                    disabled={lazyModeActive}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_concurrency: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.recoveryProbeInterval')} description={t('settings.recoveryProbeIntervalDesc')}>
+                  <Input
+                    type={lazyModeActive ? 'text' : 'number'}
+                    min={1}
+                    max={10080}
+                    value={lazyModeActive ? '∞' : settingsForm.recovery_probe_interval_minutes}
+                    disabled={lazyModeActive}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, recovery_probe_interval_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.lazyMode')} description={t('settings.lazyModeDesc')}>
+                  <Select
+                    value={settingsForm.lazy_mode ? 'true' : 'false'}
+                    onValueChange={(value) => setSettingsForm((f) => normalizeLazySettingsForm({ ...f, lazy_mode: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </SettingField>
+              </div>
+            </SettingsCard>
+
+            <SettingsCard title={t('settings.schedulingStrategy')}>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-4">
                 <SettingField label={t('settings.testModelLabel')} description={t('settings.testModelHint')}>
-	                  <Select
-	                    value={settingsForm.test_model}
-	                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, test_model: value }))}
-	                    options={textModelOptions}
-	                  />
+                  <Select
+                    value={settingsForm.test_model}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, test_model: value }))}
+                    options={textModelOptions}
+                  />
                 </SettingField>
                 <SettingField label={t('settings.testConcurrency')} description={t('settings.testConcurrencyRange')}>
                   <Input
@@ -834,33 +903,6 @@ export default function Settings() {
                     max={200}
                     value={settingsForm.test_concurrency}
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, test_concurrency: parseInt(e.target.value) || 1 }))}
-                  />
-                </SettingField>
-                <SettingField label={t('settings.backgroundRefreshInterval')} description={t('settings.backgroundRefreshIntervalDesc')}>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={1440}
-                    value={settingsForm.background_refresh_interval_minutes}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_refresh_interval_minutes: parseInt(e.target.value) || 1 }))}
-                  />
-                </SettingField>
-                <SettingField label={t('settings.usageProbeMaxAge')} description={t('settings.usageProbeMaxAgeDesc')}>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={10080}
-                    value={settingsForm.usage_probe_max_age_minutes}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: parseInt(e.target.value) || 1 }))}
-                  />
-                </SettingField>
-                <SettingField label={t('settings.recoveryProbeInterval')} description={t('settings.recoveryProbeIntervalDesc')}>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={10080}
-                    value={settingsForm.recovery_probe_interval_minutes}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, recovery_probe_interval_minutes: parseInt(e.target.value) || 1 }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.fastSchedulerEnabled')} description={t('settings.fastSchedulerEnabledDesc')}>
@@ -875,6 +917,13 @@ export default function Settings() {
                     value={settingsForm.scheduler_mode}
                     onValueChange={(value) => setSettingsForm((f) => ({ ...f, scheduler_mode: value }))}
                     options={schedulerModeOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.affinityMode')} description={t('settings.affinityModeDesc')}>
+                  <Select
+                    value={settingsForm.affinity_mode || 'bounded'}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, affinity_mode: value }))}
+                    options={affinityModeOptions}
                   />
                 </SettingField>
               </div>
@@ -1060,8 +1109,9 @@ export default function Settings() {
               </SettingField>
               <SettingField label={t('settings.autoCleanFullUsage')} description={t('settings.autoCleanFullUsageDesc')}>
                 <Select
-                  value={settingsForm.auto_clean_full_usage ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_full_usage: value === 'true' }))}
+                  value={lazyModeActive ? 'false' : settingsForm.auto_clean_full_usage ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => normalizeLazySettingsForm({ ...f, auto_clean_full_usage: value === 'true' }))}
+                  disabled={lazyModeActive}
                   options={booleanOptions}
                 />
               </SettingField>
@@ -1382,7 +1432,6 @@ export default function Settings() {
           </div>
         </div>
 
-        <ToastNotice toast={toast} />
       </>
     </StateShell>
   )
