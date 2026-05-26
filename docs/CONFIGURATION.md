@@ -44,6 +44,7 @@ Codex2API 采用三层配置架构：
 |------|------|--------|------|
 | `CODEX_PORT` | 否 | 8080 | HTTP 服务端口 |
 | `BIND_HOST` | 否 | `127.0.0.1`（SQLite）/ `0.0.0.0`（PostgreSQL） | Docker 端口发布绑定地址（非进程监听地址，由 `CODEX_BIND` 控制）。SQLite compose 默认 `127.0.0.1` 仅本机访问；标准 compose 默认 `0.0.0.0` 所有网络接口 |
+| `CODEX_MAX_REQUEST_BODY_SIZE_MB` | 否 | 48 | HTTP 请求体上限。后台 MP4 动态壁纸上传最大 40MB，默认值为 multipart 上传预留余量 |
 | `ADMIN_SECRET` | 否 | - | 管理后台登录密钥 |
 | `CODEX_ALLOW_ANONYMOUS` | 否 | `false` | 设为 `true` 时，未配置任何对外 API Key 也允许 `/v1/*` 直接调用（仅限内网测试场景） |
 | `FAST_SCHEDULER_ENABLED` | 否 | `false` | 通过环境变量启用快速调度器（也可在管理后台运行时开启） |
@@ -81,6 +82,7 @@ Codex2API 采用三层配置架构：
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `IMAGE_ASSET_DIR` | 否 | `/data/images` | 管理台生图工作台保存图片文件的服务器目录；Docker 部署建议持久化 `/data` |
+| `BACKGROUND_ASSET_DIR` | 否 | `/data/backgrounds` | 管理台背景图/MP4 上传文件的服务器目录；未配置时优先保存到 `IMAGE_ASSET_DIR` 同级的 `backgrounds` 目录 |
 
 ### 日志目录
 

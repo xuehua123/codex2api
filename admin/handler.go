@@ -13,9 +13,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -204,6 +207,8 @@ func (h *Handler) SetAccountAlertMonitor(monitor *alerting.AccountPoolMonitor) {
 // RegisterRoutes 注册管理 API 路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/p/img/:id", h.GetSignedImageAssetFile)
+	r.GET("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
+	r.HEAD("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
 	r.GET("/api/branding", h.GetBranding)
 
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
@@ -243,9 +248,11 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
 	api.POST("/accounts/usage/probe", h.ForceUsageProbe)
 	api.GET("/usage/stats", h.GetUsageStats)
+	api.GET("/usage/api-keys", h.GetAPIKeyTokenStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
+	api.GET("/setup-hints", h.GetSetupHints)
 	api.GET("/keys", h.ListAPIKeys)
 	api.POST("/keys", h.CreateAPIKey)
 	api.PATCH("/keys/:id", h.UpdateAPIKey)
@@ -255,13 +262,16 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/account-groups/:id", h.UpdateAccountGroup)
 	api.DELETE("/account-groups/:id", h.DeleteAccountGroup)
 	api.GET("/health", h.GetHealth)
+	api.GET("/runtime-status", h.GetRuntimeStatus)
 	api.GET("/ops/overview", h.GetOpsOverview)
+	api.GET("/ops/runtime-status", h.GetRuntimeStatus)
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
 	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/ops/request-traces", h.GetRequestTraceEvents)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.POST("/settings/account-alert/test", h.TestAccountAlertNotification)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
@@ -2820,6 +2830,30 @@ func parseUsageStatsRange(startStr, endStr string) (time.Time, time.Time, error)
 	return start, end, nil
 }
 
+// GetAPIKeyTokenStats 返回按 API Key 聚合的 token 用量列表（issue #162）。
+// 支持可选 query 参数 start/end (RFC3339)；缺省回落到"今日"。
+// 不分页/不限条数：前端做排序、搜索、分页。
+func (h *Handler) GetAPIKeyTokenStats(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+	defer cancel()
+
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	items, err := h.db.ListAPIKeyTokenStats(ctx, rangeStart, rangeEnd)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if items == nil {
+		items = []database.APIKeyTokenStat{}
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
 // GetChartData 返回图表聚合数据（服务端分桶 + 内存缓存）
 func (h *Handler) GetChartData(c *gin.Context) {
 	startStr := c.Query("start")
@@ -3925,6 +3959,11 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 type settingsResponse struct {
 	SiteName                         string `json:"site_name"`
 	SiteLogo                         string `json:"site_logo"`
+	BackgroundImage                  string `json:"background_image"`
+	BackgroundOpacity                int    `json:"background_opacity"`
+	BackgroundBlur                   int    `json:"background_blur"`
+	BackgroundGlassOpacity           int    `json:"background_glass_opacity"`
+	BackgroundGlassBlur              int    `json:"background_glass_blur"`
 	MaxConcurrency                   int    `json:"max_concurrency"`
 	GlobalRPM                        int    `json:"global_rpm"`
 	TestModel                        string `json:"test_model"`
@@ -4001,6 +4040,11 @@ type settingsResponse struct {
 type updateSettingsReq struct {
 	SiteName                         *string `json:"site_name"`
 	SiteLogo                         *string `json:"site_logo"`
+	BackgroundImage                  *string `json:"background_image"`
+	BackgroundOpacity                *int    `json:"background_opacity"`
+	BackgroundBlur                   *int    `json:"background_blur"`
+	BackgroundGlassOpacity           *int    `json:"background_glass_opacity"`
+	BackgroundGlassBlur              *int    `json:"background_glass_blur"`
 	MaxConcurrency                   *int    `json:"max_concurrency"`
 	GlobalRPM                        *int    `json:"global_rpm"`
 	TestModel                        *string `json:"test_model"`
@@ -4100,12 +4144,45 @@ func applyAccountAlertResponse(dst *settingsResponse, cfg alerting.AccountPoolCo
 }
 
 type brandingResponse struct {
-	SiteName string `json:"site_name"`
-	SiteLogo string `json:"site_logo"`
+	SiteName               string `json:"site_name"`
+	SiteLogo               string `json:"site_logo"`
+	BackgroundImage        string `json:"background_image"`
+	BackgroundOpacity      int    `json:"background_opacity"`
+	BackgroundBlur         int    `json:"background_blur"`
+	BackgroundGlassOpacity int    `json:"background_glass_opacity"`
+	BackgroundGlassBlur    int    `json:"background_glass_blur"`
 }
 
 const maxSiteLogoBytes = 600 * 1024
+const maxBackgroundImageBytes = 2 * 1024 * 1024
+const maxBackgroundVideoBytes = 40 * 1024 * 1024
+const maxBackgroundImageAssetUploadBytes = 20 * 1024 * 1024
+const maxBackgroundVideoAssetUploadBytes = 40 * 1024 * 1024
+const maxBackgroundAssetUploadBytes = maxBackgroundVideoAssetUploadBytes
 const maxSiteLogoURLChars = 4096
+const maxBackgroundImageURLChars = 20000
+const defaultBackgroundOpacity = 18
+const maxBackgroundBlur = 24
+const defaultBackgroundGlassOpacity = 58
+const defaultBackgroundGlassBlur = 5
+const maxBackgroundGlassBlur = 20
+const defaultBackgroundAssetDir = "/data/backgrounds"
+const backgroundAssetURLPrefix = "/p/backgrounds/"
+
+type brandingBackgroundConfig struct {
+	Image        string `json:"image"`
+	Opacity      int    `json:"opacity"`
+	Blur         int    `json:"blur"`
+	GlassOpacity int    `json:"glass_opacity"`
+	GlassBlur    int    `json:"glass_blur"`
+}
+
+type backgroundAssetUploadResponse struct {
+	URL      string `json:"url"`
+	Filename string `json:"filename"`
+	MimeType string `json:"mime_type"`
+	Bytes    int    `json:"bytes"`
+}
 
 func normalizeSiteLogo(value string) (string, error) {
 	value = strings.TrimSpace(value)
@@ -4142,13 +4219,376 @@ func normalizeSiteLogo(value string) (string, error) {
 	}
 }
 
+func normalizeBackgroundImage(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	lower := strings.ToLower(value)
+	switch {
+	case strings.HasPrefix(lower, "data:image/") && strings.Contains(lower, ";base64,"):
+		commaIndex := strings.Index(value, ",")
+		if commaIndex < 0 {
+			return "", fmt.Errorf("背景图 data URL 格式无效")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[commaIndex+1:]))
+		if err != nil {
+			return "", fmt.Errorf("背景图 base64 数据无效")
+		}
+		if len(decoded) > maxBackgroundImageBytes {
+			return "", fmt.Errorf("背景图不能超过 2MB")
+		}
+		return value, nil
+	case strings.HasPrefix(lower, "data:video/mp4") && strings.Contains(lower, ";base64,"):
+		commaIndex := strings.Index(value, ",")
+		if commaIndex < 0 {
+			return "", fmt.Errorf("动态壁纸 data URL 格式无效")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[commaIndex+1:]))
+		if err != nil {
+			return "", fmt.Errorf("动态壁纸 base64 数据无效")
+		}
+		if len(decoded) > maxBackgroundVideoBytes {
+			return "", fmt.Errorf("动态壁纸不能超过 40MB")
+		}
+		return value, nil
+	case strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://"):
+		if len(value) > maxBackgroundImageURLChars {
+			return "", fmt.Errorf("背景图 URL 过长")
+		}
+		return value, nil
+	case strings.HasPrefix(value, "/") && !strings.HasPrefix(value, "//"):
+		if len(value) > maxBackgroundImageURLChars {
+			return "", fmt.Errorf("背景图路径过长")
+		}
+		return value, nil
+	default:
+		return "", fmt.Errorf("背景仅支持 http(s) URL、站内路径、data:image base64 或 data:video/mp4 base64")
+	}
+}
+
+func backgroundAssetDir() string {
+	if dir := strings.TrimSpace(os.Getenv("BACKGROUND_ASSET_DIR")); dir != "" {
+		return dir
+	}
+	if dir := strings.TrimSpace(os.Getenv("IMAGE_ASSET_DIR")); dir != "" {
+		clean := filepath.Clean(dir)
+		parent := filepath.Dir(clean)
+		if parent != "." && parent != string(os.PathSeparator) {
+			return filepath.Join(parent, "backgrounds")
+		}
+		return filepath.Join(clean, "backgrounds")
+	}
+	if dbPath := strings.TrimSpace(os.Getenv("DATABASE_PATH")); dbPath != "" {
+		return filepath.Join(filepath.Dir(dbPath), "backgrounds")
+	}
+	return defaultBackgroundAssetDir
+}
+
+func backgroundAssetPath(filename string) (string, bool) {
+	name := filepath.Base(strings.TrimSpace(filename))
+	if name == "" || name == "." || name != strings.TrimSpace(filename) {
+		return "", false
+	}
+	dir, err := filepath.Abs(backgroundAssetDir())
+	if err != nil {
+		return "", false
+	}
+	full, err := filepath.Abs(filepath.Join(dir, name))
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(dir, full)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return full, true
+}
+
+func backgroundAssetURL(filename string) string {
+	return backgroundAssetURLPrefix + filename
+}
+
+func randomBackgroundAssetFilename(ext string) string {
+	ext = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(ext)), ".")
+	if ext == "" {
+		ext = "bin"
+	}
+	b := make([]byte, 10)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d.%s", time.Now().UnixNano(), ext)
+	}
+	return fmt.Sprintf("%d-%s.%s", time.Now().UnixNano(), hex.EncodeToString(b), ext)
+}
+
+func declaredBackgroundMediaType(filename, contentType string) string {
+	contentType = strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	switch contentType {
+	case "image/png", "image/jpeg", "image/jpg", "image/webp", "image/svg+xml", "video/mp4":
+		if contentType == "image/jpg" {
+			return "image/jpeg"
+		}
+		return contentType
+	}
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".mp4":
+		return "video/mp4"
+	default:
+		if byExt := mime.TypeByExtension(strings.ToLower(filepath.Ext(filename))); byExt != "" {
+			return strings.ToLower(strings.TrimSpace(strings.Split(byExt, ";")[0]))
+		}
+		return ""
+	}
+}
+
+func looksLikeSVG(data []byte) bool {
+	sample := strings.ToLower(string(data))
+	return strings.Contains(sample, "<svg") && !strings.Contains(sample, "<script")
+}
+
+func looksLikeWebP(data []byte) bool {
+	return len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP"
+}
+
+func looksLikeMP4(data []byte) bool {
+	return len(data) >= 12 && string(data[4:8]) == "ftyp"
+}
+
+func normalizeBackgroundUploadMedia(filename, contentType string, data []byte) (string, string, error) {
+	if len(data) == 0 {
+		return "", "", fmt.Errorf("背景文件为空")
+	}
+	declared := declaredBackgroundMediaType(filename, contentType)
+	detected := strings.ToLower(strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0]))
+	switch detected {
+	case "image/png":
+		return "image/png", "png", nil
+	case "image/jpeg":
+		return "image/jpeg", "jpg", nil
+	case "image/webp":
+		return "image/webp", "webp", nil
+	}
+	switch declared {
+	case "image/webp":
+		if looksLikeWebP(data) {
+			return "image/webp", "webp", nil
+		}
+	case "image/svg+xml":
+		if looksLikeSVG(data) {
+			return "image/svg+xml", "svg", nil
+		}
+	case "video/mp4":
+		if looksLikeMP4(data) {
+			return "video/mp4", "mp4", nil
+		}
+	}
+	return "", "", fmt.Errorf("背景仅支持 PNG、JPG、WebP、SVG 或 MP4")
+}
+
+func backgroundUploadLimitBytes(mimeType string) int {
+	if mimeType == "video/mp4" {
+		return maxBackgroundVideoAssetUploadBytes
+	}
+	return maxBackgroundImageAssetUploadBytes
+}
+
+func backgroundUploadTooLargeMessage(mimeType string) string {
+	if mimeType == "video/mp4" {
+		return "MP4 动态壁纸不能超过 40MB"
+	}
+	return "背景图片不能超过 20MB"
+}
+
+func (h *Handler) UploadBackgroundAsset(c *gin.Context) {
+	fh, err := c.FormFile("file")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "请选择背景文件")
+		return
+	}
+	if fh.Size <= 0 {
+		writeError(c, http.StatusBadRequest, "背景文件为空")
+		return
+	}
+	if fh.Size > maxBackgroundAssetUploadBytes {
+		writeError(c, http.StatusBadRequest, "背景文件不能超过 40MB")
+		return
+	}
+	file, err := fh.Open()
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxBackgroundAssetUploadBytes+1))
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if len(data) > maxBackgroundAssetUploadBytes {
+		writeError(c, http.StatusBadRequest, "背景文件不能超过 40MB")
+		return
+	}
+	mimeType, ext, err := normalizeBackgroundUploadMedia(fh.Filename, fh.Header.Get("Content-Type"), data)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(data) > backgroundUploadLimitBytes(mimeType) {
+		writeError(c, http.StatusBadRequest, backgroundUploadTooLargeMessage(mimeType))
+		return
+	}
+
+	if err := os.MkdirAll(backgroundAssetDir(), 0o755); err != nil {
+		writeInternalError(c, fmt.Errorf("创建背景目录失败: %w", err))
+		return
+	}
+	filename := randomBackgroundAssetFilename(ext)
+	fullPath, ok := backgroundAssetPath(filename)
+	if !ok {
+		writeInternalError(c, fmt.Errorf("背景文件路径无效"))
+		return
+	}
+	if err := os.WriteFile(fullPath, data, 0o644); err != nil {
+		writeInternalError(c, fmt.Errorf("保存背景文件失败: %w", err))
+		return
+	}
+
+	c.JSON(http.StatusOK, backgroundAssetUploadResponse{
+		URL:      backgroundAssetURL(filename),
+		Filename: filename,
+		MimeType: mimeType,
+		Bytes:    len(data),
+	})
+}
+
+func (h *Handler) GetBackgroundAssetFile(c *gin.Context) {
+	fullPath, ok := backgroundAssetPath(c.Param("filename"))
+	if !ok {
+		writeError(c, http.StatusNotFound, "背景文件不存在")
+		return
+	}
+	info, err := os.Stat(fullPath)
+	if err != nil || info.IsDir() {
+		writeError(c, http.StatusNotFound, "背景文件不存在")
+		return
+	}
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.File(fullPath)
+}
+
+func normalizeBackgroundOpacity(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
+}
+
+func normalizeBackgroundBlur(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > maxBackgroundBlur {
+		return maxBackgroundBlur
+	}
+	return value
+}
+
+func normalizeBackgroundGlassOpacity(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
+}
+
+func normalizeBackgroundGlassBlur(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > maxBackgroundGlassBlur {
+		return maxBackgroundGlassBlur
+	}
+	return value
+}
+
+func normalizeBackgroundConfig(cfg brandingBackgroundConfig) brandingBackgroundConfig {
+	image, err := normalizeBackgroundImage(cfg.Image)
+	if err != nil {
+		image = ""
+	}
+	opacity := normalizeBackgroundOpacity(cfg.Opacity)
+	if opacity == 0 && strings.TrimSpace(image) != "" && cfg.Opacity == 0 {
+		opacity = 0
+	}
+	return brandingBackgroundConfig{
+		Image:        image,
+		Opacity:      opacity,
+		Blur:         normalizeBackgroundBlur(cfg.Blur),
+		GlassOpacity: normalizeBackgroundGlassOpacity(cfg.GlassOpacity),
+		GlassBlur:    normalizeBackgroundGlassBlur(cfg.GlassBlur),
+	}
+}
+
+func defaultBackgroundConfig() brandingBackgroundConfig {
+	return brandingBackgroundConfig{
+		Opacity:      defaultBackgroundOpacity,
+		GlassOpacity: defaultBackgroundGlassOpacity,
+		GlassBlur:    defaultBackgroundGlassBlur,
+	}
+}
+
+func decodeBackgroundConfig(raw string) brandingBackgroundConfig {
+	cfg := defaultBackgroundConfig()
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return cfg
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return defaultBackgroundConfig()
+	}
+	return normalizeBackgroundConfig(cfg)
+}
+
+func encodeBackgroundConfig(cfg brandingBackgroundConfig) string {
+	cfg = normalizeBackgroundConfig(cfg)
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
 func brandingFromSettings(settings *database.SystemSettings) brandingResponse {
 	resp := brandingResponse{SiteName: database.DefaultSiteName}
+	bg := defaultBackgroundConfig()
 	if settings == nil {
+		resp.BackgroundOpacity = bg.Opacity
+		resp.BackgroundGlassOpacity = bg.GlassOpacity
+		resp.BackgroundGlassBlur = bg.GlassBlur
 		return resp
 	}
 	resp.SiteName = database.NormalizeSiteName(settings.SiteName)
 	resp.SiteLogo = strings.TrimSpace(settings.SiteLogo)
+	bg = decodeBackgroundConfig(settings.BackgroundConfig)
+	resp.BackgroundImage = bg.Image
+	resp.BackgroundOpacity = bg.Opacity
+	resp.BackgroundBlur = bg.Blur
+	resp.BackgroundGlassOpacity = bg.GlassOpacity
+	resp.BackgroundGlassBlur = bg.GlassBlur
 	return resp
 }
 
@@ -4187,9 +4627,18 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	imgCfg := imagestore.CurrentConfig()
 	imgPrefix := strings.TrimSuffix(imgCfg.Prefix, "/")
+	bgCfg := defaultBackgroundConfig()
+	if dbSettings != nil {
+		bgCfg = decodeBackgroundConfig(dbSettings.BackgroundConfig)
+	}
 	resp := settingsResponse{
 		SiteName:                         branding.SiteName,
 		SiteLogo:                         branding.SiteLogo,
+		BackgroundImage:                  bgCfg.Image,
+		BackgroundOpacity:                bgCfg.Opacity,
+		BackgroundBlur:                   bgCfg.Blur,
+		BackgroundGlassOpacity:           bgCfg.GlassOpacity,
+		BackgroundGlassBlur:              bgCfg.GlassBlur,
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
@@ -4266,12 +4715,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	accountAlertCfg := alerting.DefaultAccountPoolConfig()
 	siteName := database.DefaultSiteName
 	siteLogo := ""
+	bgCfg := defaultBackgroundConfig()
 	existingSettings, err := h.db.GetSystemSettings(c.Request.Context())
 	if err == nil && existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
 		accountAlertCfg = alerting.AccountPoolConfigFromJSON(existingSettings.AccountAlertConfig)
 		siteName = database.NormalizeSiteName(existingSettings.SiteName)
 		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
+		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -4293,6 +4744,31 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		siteLogo = normalized
 		log.Printf("设置已更新: site_logo (长度=%d)", len(siteLogo))
+	}
+	if req.BackgroundImage != nil {
+		normalized, err := normalizeBackgroundImage(*req.BackgroundImage)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		bgCfg.Image = normalized
+		log.Printf("设置已更新: background_image (长度=%d)", len(bgCfg.Image))
+	}
+	if req.BackgroundOpacity != nil {
+		bgCfg.Opacity = normalizeBackgroundOpacity(*req.BackgroundOpacity)
+		log.Printf("设置已更新: background_opacity = %d", bgCfg.Opacity)
+	}
+	if req.BackgroundBlur != nil {
+		bgCfg.Blur = normalizeBackgroundBlur(*req.BackgroundBlur)
+		log.Printf("设置已更新: background_blur = %d", bgCfg.Blur)
+	}
+	if req.BackgroundGlassOpacity != nil {
+		bgCfg.GlassOpacity = normalizeBackgroundGlassOpacity(*req.BackgroundGlassOpacity)
+		log.Printf("设置已更新: background_glass_opacity = %d", bgCfg.GlassOpacity)
+	}
+	if req.BackgroundGlassBlur != nil {
+		bgCfg.GlassBlur = normalizeBackgroundGlassBlur(*req.BackgroundGlassBlur)
+		log.Printf("设置已更新: background_glass_blur = %d", bgCfg.GlassBlur)
 	}
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
 	runtimeCfg := proxy.CurrentRuntimeSettings()
@@ -4817,6 +5293,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		StreamKeepaliveIntervalSeconds:   runtimeCfg.StreamKeepaliveIntervalSeconds,
 		ImageStorageConfig:               imgConfigJSON,
 		AccountAlertConfig:               accountAlertConfigJSON,
+		BackgroundConfig:                 encodeBackgroundConfig(bgCfg),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -4844,6 +5321,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	resp := settingsResponse{
 		SiteName:                         siteName,
 		SiteLogo:                         siteLogo,
+		BackgroundImage:                  bgCfg.Image,
+		BackgroundOpacity:                bgCfg.Opacity,
+		BackgroundBlur:                   bgCfg.Blur,
+		BackgroundGlassOpacity:           bgCfg.GlassOpacity,
+		BackgroundGlassBlur:              bgCfg.GlassBlur,
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
@@ -5188,6 +5670,11 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 		if rt == "" && at == "" {
 			continue
 		}
+		// account_id 在凭据中存储为 chatgpt_account_id（新字段）或 account_id（历史字段）
+		accountID := row.GetCredential("chatgpt_account_id")
+		if accountID == "" {
+			accountID = row.GetCredential("account_id")
+		}
 		entries = append(entries, cpaExportEntry{
 			Type:                "codex",
 			Email:               row.GetCredential("email"),
@@ -5199,7 +5686,7 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 			CodexUsageUpdatedAt: row.GetCredential("codex_usage_updated_at"),
 			Expired:             row.GetCredential("expires_at"),
 			IDToken:             row.GetCredential("id_token"),
-			AccountID:           row.GetCredential("account_id"),
+			AccountID:           accountID,
 			AccessToken:         at,
 			LastRefresh:         row.UpdatedAt.Format(time.RFC3339),
 			RefreshToken:        rt,

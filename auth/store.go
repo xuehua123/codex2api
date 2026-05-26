@@ -2304,6 +2304,14 @@ func (s *Store) GetUsageProbeConcurrency() int {
 	return n
 }
 
+// UsageProbeRunning reports whether a batch usage probe is currently active.
+func (s *Store) UsageProbeRunning() bool {
+	if s == nil {
+		return false
+	}
+	return s.usageProbeBatch.Load()
+}
+
 // SetRecoveryProbeInterval 设置恢复探测最小间隔。
 func (s *Store) SetRecoveryProbeInterval(d time.Duration) {
 	if d <= 0 {
@@ -2319,6 +2327,22 @@ func (s *Store) GetRecoveryProbeInterval() time.Duration {
 		return defaultRecoveryProbeInterval
 	}
 	return d
+}
+
+// RecoveryProbeRunning reports whether a batch recovery probe is currently active.
+func (s *Store) RecoveryProbeRunning() bool {
+	if s == nil {
+		return false
+	}
+	return s.recoveryProbeBatch.Load()
+}
+
+// AutoCleanupRunning reports whether an automatic cleanup pass is currently active.
+func (s *Store) AutoCleanupRunning() bool {
+	if s == nil {
+		return false
+	}
+	return s.autoCleanupBatch.Load()
 }
 
 // CleanExpiredNow 立即执行一次过期清理，返回清理数量
@@ -2984,9 +3008,9 @@ func (s *Store) NextForSession(key string, apiKeyID int64, exclude map[int64]boo
 // affinity_mode 决定粘性强度:
 //   - off:     永不读绑定,每次都走完整挑号策略
 //   - bounded (默认): 绑定有效但被以下任一条件解除
-//     • 累计请求超过 defaultMaxAffinityRequests (50)
-//     • 绑定时长超过 defaultMaxAffinityDuration (5min)
-//     • 绑定账号当前已不属于 healthy 桶 (warm/risky/banned)
+//   - 累计请求超过 defaultMaxAffinityRequests (50)
+//   - 绑定时长超过 defaultMaxAffinityDuration (5min)
+//   - 绑定账号当前已不属于 healthy 桶 (warm/risky/banned)
 //   - strict:  完全沿用旧行为,只在 TTL 过期或显式 Unbind 时换号
 //
 // 解除发生时绕过 binding 走完整挑号策略(NextExcludingWithFilter),后续 BindSessionAffinity

@@ -219,6 +219,18 @@ export interface HealthResponse {
 export interface SiteBranding {
   site_name: string
   site_logo: string
+  background_image: string
+  background_opacity: number
+  background_blur: number
+  background_glass_opacity: number
+  background_glass_blur: number
+}
+
+export interface BackgroundUploadResponse {
+  url: string
+  filename: string
+  mime_type: string
+  bytes: number
 }
 
 export interface AccountEventTrendPoint {
@@ -285,9 +297,109 @@ export interface OpsOverviewResponse {
   }
 }
 
+export type RuntimeHealthStatus = 'ok' | 'degraded' | 'error' | string
+
+export interface RuntimeCheck {
+  component: string
+  status: RuntimeHealthStatus
+  code: string
+  message: string
+}
+
+export interface RuntimeStatusResponse {
+  updated_at: ISODateString
+  status: RuntimeHealthStatus
+  service: {
+    status: RuntimeHealthStatus
+    service_url: string
+    admin_url: string
+    api_base_url: string
+    uptime_seconds: number
+    goroutines: number
+    go_version: string
+    os: string
+    arch: string
+    pid: number
+  }
+  database: {
+    status: RuntimeHealthStatus
+    driver: string
+    label: string
+    location: string
+    healthy: boolean
+    error?: string
+    open: number
+    in_use: number
+    idle: number
+    max_open: number
+    wait_count: number
+    usage_percent: number
+  }
+  cache: {
+    status: RuntimeHealthStatus
+    driver: string
+    label: string
+    healthy: boolean
+    error?: string
+    total_conns: number
+    idle_conns: number
+    stale_conns: number
+    pool_size: number
+    usage_percent: number
+  }
+  usage_log: {
+    status: RuntimeHealthStatus
+    mode: string
+    enabled: boolean
+    batch_size: number
+    flush_interval_seconds: number
+    buffer_length: number
+    buffer_capacity: number
+  }
+  probes: {
+    status: RuntimeHealthStatus
+    lazy_mode: boolean
+    background_refresh_interval_minutes: number
+    usage_probe_max_age_minutes: number
+    usage_probe_concurrency: number
+    recovery_probe_interval_minutes: number
+    usage_probe_running: boolean
+    recovery_probe_running: boolean
+    auto_cleanup_running: boolean
+  }
+  accounts: {
+    status: RuntimeHealthStatus
+    total: number
+    available: number
+    active_requests: number
+    total_requests: number
+    status_counts: Record<string, number>
+  }
+  image_storage: {
+    status: RuntimeHealthStatus
+    backend: string
+    local_dir?: string
+    bucket?: string
+    prefix?: string
+    healthy: boolean
+    error?: string
+  }
+  admin_auth: {
+    status: RuntimeHealthStatus
+    source: string
+    configured: boolean
+  }
+  checks: RuntimeCheck[]
+}
+
 export interface SystemSettings {
   site_name: string
   site_logo: string
+  background_image: string
+  background_opacity: number
+  background_blur: number
+  background_glass_opacity: number
+  background_glass_blur: number
   max_concurrency: number
   global_rpm: number
   test_model: string
@@ -361,6 +473,30 @@ export interface SystemSettings {
   account_alert_cooldown_minutes: number
   account_alert_recovery_buffer: number
   account_alert_recovery_ratio_buffer: number
+}
+
+export interface SetupHintsResponse {
+  service_url?: string
+  admin_url?: string
+  api_base_url?: string
+  database?: {
+    driver?: string
+    label?: string
+    location?: string
+  }
+  cache?: {
+    driver?: string
+    label?: string
+  }
+  data?: {
+    image_local_dir?: string
+    image_storage_backend?: string
+  }
+  usage?: {
+    log_mode?: string
+    batch_size?: number
+    flush_interval_seconds?: number
+  }
 }
 
 export interface PromptFilterMatch {
@@ -537,6 +673,22 @@ export interface UsageAPIKeyStat {
   label: string
   requests: number
   tokens: number
+  error_count: number
+  user_billed: number
+}
+
+// APIKeyTokenStat 是 /usage/api-keys 端点返回项，比 UsageAPIKeyStat 字段更细
+// （分列 input/output/cached token），且不限条数。
+export interface APIKeyTokenStat {
+  api_key_id: number
+  api_key_name: string
+  api_key_masked: string
+  label: string
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  total_tokens: number
   error_count: number
   user_billed: number
 }

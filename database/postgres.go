@@ -435,6 +435,41 @@ func (db *DB) GetUsageLogFlushIntervalSeconds() int {
 	return NormalizeUsageLogFlushIntervalSeconds(int(d / time.Second))
 }
 
+// UsageLogRuntimeStats 描述 usage_logs 写入器当前的运行态。
+type UsageLogRuntimeStats struct {
+	Mode                 string
+	Enabled              bool
+	BatchSize            int
+	FlushIntervalSeconds int
+	BufferLength         int
+	BufferCapacity       int
+}
+
+// GetUsageLogRuntimeStats 返回 usage_logs 配置和当前内存缓冲长度。
+func (db *DB) GetUsageLogRuntimeStats() UsageLogRuntimeStats {
+	stats := UsageLogRuntimeStats{
+		Mode:                 defaultUsageLogMode,
+		Enabled:              true,
+		BatchSize:            defaultUsageLogBatchSize,
+		FlushIntervalSeconds: defaultUsageLogFlushIntervalSeconds,
+	}
+	if db == nil {
+		return stats
+	}
+
+	stats.Mode = db.GetUsageLogMode()
+	stats.Enabled = stats.Mode != UsageLogModeOff
+	stats.BatchSize = db.GetUsageLogBatchSize()
+	stats.FlushIntervalSeconds = db.GetUsageLogFlushIntervalSeconds()
+
+	db.logMu.Lock()
+	stats.BufferLength = len(db.logBuf)
+	stats.BufferCapacity = cap(db.logBuf)
+	db.logMu.Unlock()
+
+	return stats
+}
+
 func (db *DB) getUsageLogFlushInterval() time.Duration {
 	if db == nil {
 		return time.Duration(defaultUsageLogFlushIntervalSeconds) * time.Second
@@ -631,6 +666,7 @@ func (db *DB) migrate(ctx context.Context) error {
 				id                 INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 				site_name          TEXT DEFAULT 'CodexProxy',
 				site_logo          TEXT DEFAULT '',
+				background_config  TEXT DEFAULT '{}',
 				max_concurrency    INT DEFAULT 2,
 			global_rpm         INT DEFAULT 0,
 			test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
@@ -657,6 +693,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'CodexProxy';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_logo TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_unauthorized BOOLEAN DEFAULT FALSE;
@@ -1191,6 +1228,7 @@ func NormalizeSiteName(value string) string {
 type SystemSettings struct {
 	SiteName                         string
 	SiteLogo                         string
+	BackgroundConfig                 string // JSON: {"image":"...","opacity":18,"blur":0}
 	MaxConcurrency                   int
 	GlobalRPM                        int
 	TestModel                        string
@@ -1284,7 +1322,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(stream_idle_timeout_seconds, 120),
 		       COALESCE(stream_keepalive_interval_seconds, 10),
 		       COALESCE(image_storage_config, '{}'),
-		       COALESCE(account_alert_config, '{}')
+		       COALESCE(account_alert_config, '{}'),
+		       COALESCE(background_config, '{}')
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1302,6 +1341,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ClientCompatMode, &s.CodexMinCLIVersion, &s.UsageLogMode, &s.UsageLogBatchSize,
 		&s.UsageLogFlushIntervalSeconds, &s.StreamFlushPolicy, &s.StreamFlushIntervalMS,
 		&s.StreamIdleTimeoutSeconds, &s.StreamKeepaliveIntervalSeconds, &s.ImageStorageConfig, &s.AccountAlertConfig,
+		&s.BackgroundConfig,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1328,9 +1368,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				stream_idle_timeout_seconds, stream_keepalive_interval_seconds,
 				image_storage_config, account_alert_config,
 				scheduler_mode,
-				affinity_mode
+				affinity_mode,
+				background_config
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51)
 			ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1381,7 +1422,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				image_storage_config = EXCLUDED.image_storage_config,
 				account_alert_config = EXCLUDED.account_alert_config,
 				scheduler_mode = EXCLUDED.scheduler_mode,
-				affinity_mode = EXCLUDED.affinity_mode
+				affinity_mode = EXCLUDED.affinity_mode,
+				background_config = EXCLUDED.background_config
 		`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1394,7 +1436,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.ClientCompatMode, s.CodexMinCLIVersion, s.UsageLogMode, s.UsageLogBatchSize,
 		s.UsageLogFlushIntervalSeconds, s.StreamFlushPolicy, s.StreamFlushIntervalMS,
 		s.StreamIdleTimeoutSeconds, s.StreamKeepaliveIntervalSeconds, s.ImageStorageConfig, s.AccountAlertConfig,
-		s.SchedulerMode, normalizeAffinityMode(s.AffinityMode))
+		s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.BackgroundConfig)
 	return err
 }
 
