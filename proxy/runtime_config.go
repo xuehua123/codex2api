@@ -27,6 +27,8 @@ const (
 	defaultStreamKeepaliveIntervalSeconds = 10
 	maxStreamIdleTimeoutSeconds           = 3600
 	maxStreamKeepaliveIntervalSeconds     = 300
+	defaultFirstTokenTimeoutSec           = 0
+	maxFirstTokenTimeoutSec               = 600
 )
 
 type RuntimeSettings struct {
@@ -36,6 +38,7 @@ type RuntimeSettings struct {
 	StreamFlushIntervalMS          int
 	StreamIdleTimeoutSeconds       int
 	StreamKeepaliveIntervalSeconds int
+	FirstTokenTimeoutSec           int
 }
 
 var runtimeSettings atomic.Value // stores RuntimeSettings
@@ -52,6 +55,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		StreamFlushIntervalMS:          defaultStreamFlushIntervalMS,
 		StreamIdleTimeoutSeconds:       defaultStreamIdleTimeoutSeconds,
 		StreamKeepaliveIntervalSeconds: defaultStreamKeepaliveIntervalSeconds,
+		FirstTokenTimeoutSec:           defaultFirstTokenTimeoutSec,
 	}
 }
 
@@ -106,6 +110,12 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.StreamKeepaliveIntervalSeconds > maxStreamKeepaliveIntervalSeconds {
 		settings.StreamKeepaliveIntervalSeconds = maxStreamKeepaliveIntervalSeconds
 	}
+	if settings.FirstTokenTimeoutSec < 0 {
+		settings.FirstTokenTimeoutSec = defaultFirstTokenTimeoutSec
+	}
+	if settings.FirstTokenTimeoutSec > maxFirstTokenTimeoutSec {
+		settings.FirstTokenTimeoutSec = maxFirstTokenTimeoutSec
+	}
 	return settings
 }
 
@@ -118,6 +128,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.StreamFlushIntervalMS = settings.StreamFlushIntervalMS
 		next.StreamIdleTimeoutSeconds = settings.StreamIdleTimeoutSeconds
 		next.StreamKeepaliveIntervalSeconds = settings.StreamKeepaliveIntervalSeconds
+		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
 	}
 	next = NormalizeRuntimeSettings(next)
 	runtimeSettings.Store(next)
@@ -155,6 +166,14 @@ func currentStreamIdleTimeout() time.Duration {
 
 func currentStreamKeepaliveInterval() time.Duration {
 	seconds := CurrentRuntimeSettings().StreamKeepaliveIntervalSeconds
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func currentFirstTokenTimeout() time.Duration {
+	seconds := CurrentRuntimeSettings().FirstTokenTimeoutSec
 	if seconds <= 0 {
 		return 0
 	}

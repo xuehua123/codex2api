@@ -11,6 +11,7 @@ export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refresh
 export interface StatsResponse {
   total: number
   available: number
+  rate_limited: number
   error: number
   today_requests: number
 }
@@ -27,6 +28,7 @@ export interface AccountRow {
   name: string
   email: string
   plan_type: string
+  subscription_expires_at?: string
   status: AccountStatus
   error_message?: string
   at_only?: boolean
@@ -41,6 +43,7 @@ export interface AccountRow {
   score_bias_effective?: number
   base_concurrency_override?: number | null
   base_concurrency_effective?: number
+  skip_warm_tier?: boolean
   dynamic_concurrency_limit?: number
   allowed_api_key_ids?: number[]
   tags?: string[]
@@ -146,6 +149,7 @@ export interface FetchOpenAIResponsesModelsResponse {
 export interface UpdateAccountSchedulerRequest {
   score_bias_override?: number | null
   base_concurrency_override?: number | null
+  skip_warm_tier?: boolean
   allowed_api_key_ids?: number[] | null
   proxy_url?: string | null
   tags?: string[] | null
@@ -392,6 +396,108 @@ export interface RuntimeStatusResponse {
   checks: RuntimeCheck[]
 }
 
+export interface ResetRadarResponse {
+  source_name: string
+  source_url: string
+  rss_url: string
+  current_status_url: string
+  fetched_at: ISODateString
+  cached: boolean
+  schema_version: string
+  status: string
+  window_open: boolean
+  message: string
+  recommended_action: string
+  checked_at: ISODateString
+  monitored_at: ISODateString
+  current_window: {
+    state: string
+    message: string
+    opened_at?: ISODateString | null
+    source?: string | null
+  }
+  last_window: {
+    id: string
+    title: string
+    status: string
+    opened_at: ISODateString
+    closed_at: ISODateString
+    window_minutes: number
+    window_human: string
+    scope: string
+    summary: string
+    sources?: Array<{
+      type: string
+      url: string
+    }>
+  }
+  metrics: {
+    last_3_months_window_minutes: number
+    last_3_months_window_human: string
+  }
+  prediction: {
+    level: string
+    probability_24h: number
+    probability_48h: number
+    expected_window: string
+    reasoning_summary: string
+    should_notify: boolean
+    updated_at: ISODateString
+    source: string
+    signal_summary_24h: {
+      total: number
+      counts: {
+        openai_status: number
+        official_x: number
+        community_x: number
+        x_reply: number
+        market_x: number
+      }
+      top_signals?: Array<{
+        source: string
+        score: number
+        text: string
+        url: string
+      }>
+    }
+  }
+  feed: {
+    title: string
+    description: string
+    last_build_date: string
+    ttl: number
+    error?: string
+    items: Array<{
+      title: string
+      link: string
+      guid: string
+      pub_date: string
+      published_at: ISODateString
+      summary: string
+      event: 'open' | 'close' | 'info' | string
+    }>
+  }
+  hook: {
+    signal_detected: boolean
+    signal_id?: string
+    signal_type?: 'close' | string
+    triggered: boolean
+    running: boolean
+    last_triggered_signal_id?: string
+    last_triggered_at?: ISODateString
+    last_completed_at?: ISODateString
+    message: string
+    last_result?: {
+      total: number
+      success: number
+      failed: number
+      banned: number
+      rate_limited: number
+      error?: string
+    } | null
+  }
+}
+
 export interface SystemSettings {
   site_name: string
   site_logo: string
@@ -453,6 +559,8 @@ export interface SystemSettings {
   stream_flush_interval_ms: number
   stream_idle_timeout_seconds: number
   stream_keepalive_interval_seconds: number
+  first_token_timeout_seconds: number
+  show_full_usage_numbers: boolean
   image_storage_backend: 'local' | 's3' | string
   image_s3_endpoint: string
   image_s3_region: string
@@ -735,6 +843,8 @@ export interface UsageLog {
   output_price_per_mtoken: number
   cache_read_price_per_mtoken: number
   rate_multiplier: number
+  long_context?: boolean
+  long_context_threshold?: number
   is_retry_attempt: boolean
   attempt_index: number
   upstream_error_kind: string

@@ -1,6 +1,7 @@
 import { type CSSProperties, type PropsWithChildren, type ReactNode, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, Palette, Sun, Moon, LogOut } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, Palette, Sun, Moon, LogOut, Radar } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { resetAdminAuthState } from '../api'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, useBranding } from '../branding'
@@ -25,6 +26,7 @@ const navDefs: NavDef[] = [
   { to: '/prompt-filter/overview', labelKey: 'nav.promptFilter', icon: <ShieldAlert className="size-[18px]" />, activePrefix: '/prompt-filter' },
   { to: '/ops/overview', labelKey: 'nav.ops', icon: <Server className="size-[18px]" />, activePrefix: '/ops' },
   { to: '/usage', labelKey: 'nav.usage', icon: <Activity className="size-[18px]" /> },
+  { to: '/subscriptions', labelKey: 'nav.subscriptions', icon: <Radar className="size-[18px]" /> },
   { to: '/theme', labelKey: 'nav.theme', icon: <Palette className="size-[18px]" /> },
   { to: '/settings', labelKey: 'nav.settings', icon: <Settings className="size-[18px]" /> },
   { to: '/docs', labelKey: 'nav2.docs', icon: <BookOpen className="size-[18px]" /> },
@@ -61,6 +63,8 @@ export default function Layout({ children }: PropsWithChildren) {
     })
   }
   const versionPopoverRef = useRef<HTMLDivElement | null>(null)
+  const versionButtonRef = useRef<HTMLButtonElement | null>(null)
+  const [versionPopoverPos, setVersionPopoverPos] = useState<{ top: number; left: number } | null>(null)
   const releaseURL = latestVersion
     ? `https://github.com/james-6-23/codex2api/releases/tag/${encodeURIComponent(latestVersion)}`
     : undefined
@@ -68,9 +72,17 @@ export default function Layout({ children }: PropsWithChildren) {
   useEffect(() => {
     if (!showVersionPopover) return
 
+    const updatePosition = () => {
+      const rect = versionButtonRef.current?.getBoundingClientRect()
+      if (!rect) return
+      setVersionPopoverPos({ top: rect.bottom + 8, left: rect.left })
+    }
+    updatePosition()
+
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target instanceof Node ? event.target : null
       if (target && versionPopoverRef.current?.contains(target)) return
+      if (target && versionButtonRef.current?.contains(target)) return
       setShowVersionPopover(false)
     }
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -79,9 +91,13 @@ export default function Layout({ children }: PropsWithChildren) {
 
     document.addEventListener('pointerdown', handlePointerDown)
     document.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
     return () => {
       document.removeEventListener('pointerdown', handlePointerDown)
       document.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('resize', updatePosition)
+      window.removeEventListener('scroll', updatePosition, true)
     }
   }, [showVersionPopover])
 
@@ -231,42 +247,53 @@ export default function Layout({ children }: PropsWithChildren) {
                     </h1>
                     <div ref={versionPopoverRef} className="relative w-fit">
                       <button
+                        ref={versionButtonRef}
                         type="button"
-                        className={`relative inline-flex items-center rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold text-primary ring-1 ring-primary/10 transition-colors ${releaseURL ? 'cursor-pointer hover:bg-primary/15' : 'cursor-default'}`}
+                        className="relative inline-flex cursor-pointer items-center rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold text-primary ring-1 ring-primary/10 transition-colors hover:bg-primary/15"
                         title={hasUpdate && latestVersion ? t('common.newVersionAvailable', { version: latestVersion }) : undefined}
                         tabIndex={sidebarCollapsed ? -1 : 0}
-                        onClick={() => {
-                          if (!releaseURL) return
-                          setShowVersionPopover((current) => !current)
-                        }}
+                        onClick={() => setShowVersionPopover((current) => !current)}
                       >
                         {__APP_VERSION__}
                         {hasUpdate && (
                           <span className="absolute -top-1.5 left-1/2 size-2.5 -translate-x-1/2 rounded-full bg-red-500 shadow-sm ring-2 ring-[hsl(var(--sidebar-background))] animate-pulse" />
                         )}
                       </button>
-                      {showVersionPopover && releaseURL && latestVersion && (
-                        <div className="absolute left-0 top-[calc(100%+8px)] z-50 w-[240px] rounded-lg border border-border bg-popover p-3 text-left shadow-xl">
+                      {showVersionPopover && versionPopoverPos && createPortal(
+                        <div
+                          ref={versionPopoverRef}
+                          style={{ position: 'fixed', top: versionPopoverPos.top, left: versionPopoverPos.left }}
+                          className="z-[100] w-[240px] rounded-lg border border-border bg-popover p-3 text-left shadow-xl"
+                        >
                           <div className="text-[13px] font-semibold text-foreground">
-                            {hasUpdate ? t('common.newVersionAvailable', { version: latestVersion }) : t('common.versionLatest')}
+                            {latestVersion
+                              ? hasUpdate
+                                ? t('common.newVersionAvailable', { version: latestVersion })
+                                : t('common.versionLatest')
+                              : t('common.versionChecking')}
                           </div>
                           <div className="mt-1 text-[11px] text-muted-foreground">
                             {t('common.currentVersion', { version: __APP_VERSION__ })}
                           </div>
-                          <div className="mt-1 text-[11px] text-muted-foreground">
-                            {t('common.latestVersion', { version: latestVersion })}
-                          </div>
-                          <a
-                            href={releaseURL}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-md border border-primary/20 bg-primary/10 px-2.5 py-1.5 text-[12px] font-semibold text-primary transition-colors hover:bg-primary/15"
-                            onClick={() => setShowVersionPopover(false)}
-                          >
-                            {t('common.viewReleaseNotes')}
-                            <ExternalLink className="size-3.5" />
-                          </a>
-                        </div>
+                          {latestVersion && (
+                            <div className="mt-1 text-[11px] text-muted-foreground">
+                              {t('common.latestVersion', { version: latestVersion })}
+                            </div>
+                          )}
+                          {releaseURL && (
+                            <a
+                              href={releaseURL}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-md border border-primary/20 bg-primary/10 px-2.5 py-1.5 text-[12px] font-semibold text-primary transition-colors hover:bg-primary/15"
+                              onClick={() => setShowVersionPopover(false)}
+                            >
+                              {t('common.viewReleaseNotes')}
+                              <ExternalLink className="size-3.5" />
+                            </a>
+                          )}
+                        </div>,
+                        document.body,
                       )}
                     </div>
                   </div>
@@ -440,7 +467,7 @@ export default function Layout({ children }: PropsWithChildren) {
         </main>
 
         {/* Mobile bottom nav */}
-        <nav data-slot="admin-mobile-nav" className="fixed left-3 right-3 bottom-3 z-40 hidden max-lg:flex gap-1 overflow-x-auto rounded-xl border border-border bg-card/95 p-1.5 shadow-lg backdrop-blur-[20px] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" aria-label="Mobile navigation">
+        <nav data-slot="admin-mobile-nav" className="fixed left-3 right-3 bottom-3 z-40 hidden max-lg:flex gap-1 overflow-x-auto rounded-xl border border-border bg-card/95 p-1.5 shadow-lg backdrop-blur-[20px] [contain:layout_paint] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" aria-label="Mobile navigation">
           {navDefs.map((item) => {
             const active = isNavActive(item)
             return (

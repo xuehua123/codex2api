@@ -312,6 +312,79 @@ func TestRefreshAccountReturnsRefreshFailure(t *testing.T) {
 	}
 }
 
+func TestBatchRefreshAccountsReportsCounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := &Handler{
+		refreshAccount: func(_ context.Context, id int64) error {
+			if id == 8 {
+				return errors.New("upstream unavailable")
+			}
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/batch-refresh", strings.NewReader(`{"ids":[7,8,7,0]}`))
+
+	handler.BatchRefreshAccounts(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["success"]; got != float64(1) {
+		t.Fatalf("success = %v, want 1", got)
+	}
+	if got := payload["failed"]; got != float64(1) {
+		t.Fatalf("failed = %v, want 1", got)
+	}
+}
+
+func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := &Handler{
+		refreshAccount: func(_ context.Context, id int64) error {
+			if id == 8 {
+				return errors.New("账号 8 不存在")
+			}
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/batch-refresh?stream=true", strings.NewReader(`{"ids":[7,8]}`))
+
+	handler.BatchRefreshAccounts(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("content-type = %q, want event-stream", got)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`"type":"start"`,
+		`"type":"progress"`,
+		`"type":"complete"`,
+		`"action":"batch_refresh"`,
+		`"success":1`,
+		`"failed":1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream body missing %s:\n%s", want, body)
+		}
+	}
+}
+
 func TestResetAccountStatusSyncsPlanMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -768,6 +841,26 @@ func TestUpdateAccountSchedulerRejectsInvalidBody(t *testing.T) {
 	assertErrorMessage(t, recorder, "score_bias_override 必须是整数或 null")
 }
 
+func TestUpdateAccountSchedulerRejectsInvalidSkipWarmTier(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"skip_warm_tier":"yes"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	assertErrorMessage(t, recorder, "skip_warm_tier 必须是布尔值或 null")
+}
+
 func TestUpdateAccountSchedulerRejectsInvalidAllowedAPIKeyIDs(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -862,7 +955,7 @@ func TestUpdateAccountSchedulerPersistsOverrides(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"score_bias_override":88,"base_concurrency_override":7}`))
+	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"score_bias_override":88,"base_concurrency_override":7,"skip_warm_tier":true}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
 	handler.UpdateAccountScheduler(ctx)
@@ -883,6 +976,9 @@ func TestUpdateAccountSchedulerPersistsOverrides(t *testing.T) {
 	}
 	if !rows[0].BaseConcurrencyOverride.Valid || rows[0].BaseConcurrencyOverride.Int64 != 7 {
 		t.Fatalf("base_concurrency_override = %+v, want 7", rows[0].BaseConcurrencyOverride)
+	}
+	if !rows[0].SkipWarmTier {
+		t.Fatal("skip_warm_tier = false, want true")
 	}
 }
 
@@ -1106,7 +1202,7 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"allowed_api_key_ids":[%d,%d]}`, keyID2, keyID1)))
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"skip_warm_tier":true,"allowed_api_key_ids":[%d,%d]}`, keyID2, keyID1)))
 	ginCtx.Request.Header.Set("Content-Type", "application/json")
 
 	handler.UpdateAccountScheduler(ginCtx)
@@ -1122,6 +1218,9 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	baseConcurrency, ok := runtimeAccount.GetBaseConcurrencyOverride()
 	if !ok || baseConcurrency != 5 {
 		t.Fatalf("runtime base_concurrency_override = (%d, %t), want (5, true)", baseConcurrency, ok)
+	}
+	if !runtimeAccount.SkipWarmTier {
+		t.Fatal("runtime skip_warm_tier = false, want true")
 	}
 	if got := runtimeAccount.GetAllowedAPIKeyIDs(); len(got) != 2 || got[0] != keyID1 || got[1] != keyID2 {
 		t.Fatalf("runtime allowed_api_key_ids = %v, want [%d %d]", got, keyID1, keyID2)

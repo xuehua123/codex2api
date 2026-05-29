@@ -364,6 +364,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		StreamIdleTimeoutSeconds:         120,
 		StreamKeepaliveIntervalSeconds:   10,
 		AccountAlertConfig:               alerting.AccountPoolConfigToJSON(alerting.DefaultAccountPoolConfig()),
+		FirstTokenTimeoutSeconds:         0,
 		AffinityMode:                     "bounded",
 	}
 }

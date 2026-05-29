@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -146,6 +148,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)
+	serviceTier := extractServiceTier(codexBody)
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
@@ -157,51 +160,44 @@ func (h *Handler) Messages(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
-	excludeAccounts := make(map[int64]bool)
+	retryExclusions := newRetryAccountExclusions()
+
+	var lastUpstreamCancel context.CancelFunc
+	defer func() {
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+	}()
 
 	for attempt := 0; ; attempt++ {
 		h.traceRequestEvent(c, trace, "attempt_start", requestTraceFields{
 			Attempt:        attempt + 1,
 			EffectiveModel: effectiveModel,
 		})
-		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
-			h.traceRequestEvent(c, trace, "queue_wait_start", requestTraceFields{
-				Attempt:        attempt + 1,
-				EffectiveModel: effectiveModel,
-				Message:        "no account immediately available; waiting up to 30s",
-			})
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
-			if account == nil {
-				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-					traceTerminal = true
-					h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
-						Attempt:        attempt + 1,
-						StatusCode:     http.StatusTooManyRequests,
-						ErrorKind:      "rate_limit",
-						EffectiveModel: effectiveModel,
-						Message:        "no account became available after upstream rate limit retries",
-					})
-					sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
-					return
-				}
+			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				traceTerminal = true
 				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
 					Attempt:        attempt + 1,
-					StatusCode:     http.StatusServiceUnavailable,
-					ErrorKind:      ErrorCodeNoAvailableAccount,
+					StatusCode:     http.StatusTooManyRequests,
+					ErrorKind:      "rate_limit",
 					EffectiveModel: effectiveModel,
-					Message:        "no account became available after queue wait",
+					Message:        "no account became available after upstream rate limit retries",
 				})
-				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel))
+				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
 				return
 			}
-			h.traceRequestEvent(c, trace, "queue_wait_end", requestTraceFields{
-				AccountID:      account.ID(),
+			traceTerminal = true
+			h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
 				Attempt:        attempt + 1,
+				StatusCode:     http.StatusServiceUnavailable,
+				ErrorKind:      ErrorCodeNoAvailableAccount,
 				EffectiveModel: effectiveModel,
-				Message:        "account became available",
+				Message:        "no account became available after queue wait",
 			})
+			sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel))
+			return
 		}
 
 		start := time.Now()
@@ -234,32 +230,56 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		downstreamHeaders := c.Request.Header.Clone()
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		lastUpstreamCancel = upstreamCancel
+		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		h.traceRequestEvent(c, trace, "upstream_start", requestTraceFields{
 			AccountID:      account.ID(),
 			Attempt:        attempt + 1,
 			EffectiveModel: effectiveModel,
 			Message:        fmt.Sprintf("sending request via codex account websocket=%t", useWebsocket),
 		})
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			timedOut := ttftGuard.TimedOut()
+			ttftGuard.Stop()
+			if timedOut {
+				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
+			}
+			kind := classifyTransportFailure(reqErr)
+			retryable := IsRetryableError(reqErr) || kind != ""
+			shouldRetry := false
+			if retryable {
+				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+			}
 			h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
 				AccountID:      account.ID(),
 				Attempt:        attempt + 1,
 				StatusCode:     http.StatusBadGateway,
-				ErrorKind:      classifyTransportFailure(reqErr),
+				ErrorKind:      kind,
 				EffectiveModel: effectiveModel,
 				Message:        reqErr.Error(),
 			})
-			if kind := classifyTransportFailure(reqErr); kind != "" {
+			if kind != "" && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			excludeAccounts[account.ID()] = true
+			if timedOut && shouldRetry {
+				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+				log.Printf("上游首字超时，断开并重试 (attempt %d/%d, account %d, /v1/messages): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+				continue
+			}
+			if !timedOut {
+				retryExclusions.MarkHard(account.ID())
+			}
 
-			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+			if !retryable {
 				traceTerminal = true
 				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
 					AccountID:      account.ID(),
@@ -274,11 +294,11 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 
 			log.Printf("上游请求失败 (attempt %d, /v1/messages): %v", attempt+1, reqErr)
-			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+			if shouldRetry {
 				h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
 					AccountID:      account.ID(),
 					Attempt:        attempt + 1,
-					ErrorKind:      classifyTransportFailure(reqErr),
+					ErrorKind:      kind,
 					EffectiveModel: effectiveModel,
 					Message:        "retrying after request error",
 				})
@@ -305,6 +325,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		})
 
 		if resp.StatusCode != http.StatusOK {
+			ttftGuard.Stop()
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -315,7 +336,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			excludeAccounts[account.ID()] = true
+			retryExclusions.MarkHard(account.ID())
 
 			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
@@ -342,6 +363,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				InboundEndpoint:   "/v1/messages",
 				UpstreamEndpoint:  "/v1/responses",
 				Stream:            isStream,
+				ServiceTier:       resolveServiceTier("", serviceTier),
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
 				UpstreamErrorKind: errorKind,
@@ -391,6 +413,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		var firstTokenMs int
 		var usage *UsageInfo
+		var actualServiceTier string
 		ttftRecorded := false
 		gotTerminal := false
 		deltaCharCount := 0
@@ -410,6 +433,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			flusher, ok := c.Writer.(http.Flusher)
 			if !ok {
+				ttftGuard.Stop()
 				sendAnthropicError(c, http.StatusInternalServerError, "api_error", "Streaming not supported")
 				resp.Body.Close()
 				h.store.Release(account)
@@ -419,6 +443,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			translator := newAnthropicStreamTranslator(originalModel)
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
 			stopKeepalive := startStreamKeepalive(c.Request.Context(), streamWriter)
+			var pendingFirstTokenEvents bytes.Buffer
 
 			readErr = ReadSSEStreamWithIdleTimeout(resp.Body, currentStreamIdleTimeout(), func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
@@ -434,9 +459,11 @@ func (h *Handler) Messages(c *gin.Context) {
 				}
 
 				// TTFT 跟踪
-				if !ttftRecorded && isFirstTokenEvent(eventType) {
+				isFirstToken := isFirstTokenEvent(eventType)
+				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+					ttftGuard.MarkEvent(eventType)
 				}
 				if !firstContentTraced && isFirstTokenEvent(eventType) {
 					firstContentTraced = true
@@ -456,6 +483,9 @@ func (h *Handler) Messages(c *gin.Context) {
 				// 提取 usage
 				if eventType == "response.completed" {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
+					if tier := parsed.Get("response.service_tier").String(); tier != "" {
+						actualServiceTier = tier
+					}
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -487,9 +517,25 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				// 翻译并写入
 				events := translator.translateEvent(data)
-				for _, evt := range events {
-					sse := anthropicEventToSSE(evt)
-					if err := streamWriter.WriteString(sse); err != nil {
+				if len(events) > 0 {
+					var payload bytes.Buffer
+					for _, evt := range events {
+						payload.WriteString(anthropicEventToSSE(evt))
+					}
+					payloadString := payload.String()
+					shouldDefer := !ttftRecorded && !gotTerminal && !isFirstToken
+					if shouldDefer {
+						pendingFirstTokenEvents.WriteString(payloadString)
+						if pendingFirstTokenEvents.Len() <= 1024*1024 {
+							return eventType != "response.completed" && eventType != "response.failed"
+						}
+						payloadString = pendingFirstTokenEvents.String()
+						pendingFirstTokenEvents.Reset()
+					} else if pendingFirstTokenEvents.Len() > 0 {
+						payloadString = pendingFirstTokenEvents.String() + payloadString
+						pendingFirstTokenEvents.Reset()
+					}
+					if err := streamWriter.WriteString(payloadString); err != nil {
 						writeErr = err
 						return false
 					}
@@ -505,11 +551,9 @@ func (h *Handler) Messages(c *gin.Context) {
 				writeErr = streamWriter.Flush()
 			}
 
-			if !gotTerminal && writeErr == nil && (attempt >= maxRetries || wroteAnyBody) {
+			if !gotTerminal && writeErr == nil && readErr != nil && (attempt >= maxRetries || wroteAnyBody) {
 				message := "上游流提前结束，未收到 response.completed 或 response.failed"
-				if readErr != nil {
-					message = fmt.Sprintf("上游流读取失败: %v", readErr)
-				}
+				message = fmt.Sprintf("上游流读取失败: %v", readErr)
 				if err := streamWriter.WriteString(anthropicStreamErrorSSE("api_error", message)); err != nil {
 					writeErr = err
 				} else {
@@ -520,26 +564,25 @@ func (h *Handler) Messages(c *gin.Context) {
 				writeErr = streamWriter.Flush()
 			}
 
-			// 流正常 EOF 时补齐事件；异常断流不能假装正常完成。
-			if writeErr == nil && readErr == nil {
+			// 流结束后补齐事件
+			if writeErr == nil && readErr == nil && !gotTerminal && ttftRecorded {
 				finalEvents := translator.finalize()
-				// 仅在 message_stop 未发送过时输出
-				if !gotTerminal {
-					for _, evt := range finalEvents {
-						sse := anthropicEventToSSE(evt)
-						if err := streamWriter.WriteString(sse); err != nil {
-							writeErr = err
-							break
-						}
+				for _, evt := range finalEvents {
+					sse := anthropicEventToSSE(evt)
+					if err := streamWriter.WriteString(sse); err != nil {
+						writeErr = err
+						break
 					}
-					if writeErr == nil {
-						writeErr = streamWriter.Flush()
-					}
+				}
+				if writeErr == nil {
+					writeErr = streamWriter.Flush()
 				}
 			}
 		} else {
 			// 非流式：缓冲所有事件后构建完整 JSON 响应
 			var lastCompletedData []byte
+			translator := newAnthropicStreamTranslator(originalModel)
+			accumulator := newAnthropicResponseAccumulator(originalModel)
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
@@ -553,10 +596,12 @@ func (h *Handler) Messages(c *gin.Context) {
 						Message:        eventType,
 					})
 				}
+				accumulator.apply(translator.translateEvent(data))
 
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+					ttftGuard.MarkEvent(eventType)
 				}
 				if !firstContentTraced && isFirstTokenEvent(eventType) {
 					firstContentTraced = true
@@ -572,6 +617,9 @@ func (h *Handler) Messages(c *gin.Context) {
 				}
 				if eventType == "response.completed" {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
+					if tier := parsed.Get("response.service_tier").String(); tier != "" {
+						actualServiceTier = tier
+					}
 					lastCompletedData = data
 					gotTerminal = true
 					return false
@@ -594,7 +642,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			})
 
 			if lastCompletedData != nil {
-				anthropicResp := buildAnthropicResponseFromCompleted(lastCompletedData, originalModel)
+				anthropicResp := accumulator.build(lastCompletedData)
 				c.JSON(http.StatusOK, anthropicResp)
 			} else {
 				sendAnthropicError(c, http.StatusBadGateway, "api_error", "No complete response received from upstream")
@@ -604,6 +652,10 @@ func (h *Handler) Messages(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
+			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
+		}
+		ttftGuard.Stop()
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 		}
@@ -622,7 +674,11 @@ func (h *Handler) Messages(c *gin.Context) {
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
 			}
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			if isFirstTokenTimeoutOutcome(outcome) {
+				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+			} else {
+				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			}
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -656,6 +712,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 		}
 
+		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
+		c.Set("x-service-tier", resolvedServiceTier)
+
 		logInput := &database.UsageLogInput{
 			AccountID:        account.ID(),
 			Endpoint:         "/v1/messages",
@@ -668,6 +727,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			InboundEndpoint:  "/v1/messages",
 			UpstreamEndpoint: "/v1/responses",
 			Stream:           isStream,
+			ServiceTier:      resolvedServiceTier,
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))

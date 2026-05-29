@@ -68,6 +68,10 @@ type Handler struct {
 	reqCountMu        sync.RWMutex
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
+
+	resetRadarHookMu     sync.Mutex
+	resetRadarHookState  resetRadarHookState
+	resetRadarHookRunner func(context.Context, string) resetRadarHookResult
 }
 
 type chartCacheEntry struct {
@@ -76,14 +80,15 @@ type chartCacheEntry struct {
 }
 
 const (
-	adminUsageStatsCacheNamespace = "admin:usage-stats"
-	adminChartCacheNamespace      = "admin:chart-data"
-	adminAPIKeyCacheNamespace     = "api-key"
-	adminAPIKeyCountNamespace     = "api-key-count"
-	adminUsageStatsCacheTTL       = 60 * time.Second
-	adminChartCacheTTL            = 10 * time.Second
-	importFileSizeLimitBytes      = 20 * 1024 * 1024
-	importFileSizeLimitLabel      = "20MB"
+	adminUsageStatsCacheNamespace  = "admin:usage-stats"
+	adminChartCacheNamespace       = "admin:chart-data"
+	adminAPIKeyCacheNamespace      = "api-key"
+	adminAPIKeyCountNamespace      = "api-key-count"
+	adminUsageStatsCacheTTL        = 60 * time.Second
+	adminChartCacheTTL             = 10 * time.Second
+	importFileSizeLimitBytes       = 20 * 1024 * 1024
+	importFileSizeLimitLabel       = "20MB"
+	accountRefreshBatchConcurrency = 4
 )
 
 func (h *Handler) getRuntimeJSON(ctx context.Context, namespace, key string, dest interface{}) bool {
@@ -185,6 +190,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
+	handler.resetRadarHookRunner = handler.runResetRadarSignalHook
 	if db != nil {
 		if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
 			log.Printf("标记中断生图任务失败: %v", err)
@@ -239,6 +245,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/:id/auth-json", h.GetAccountAuthJSON)
 	api.PATCH("/accounts/:id/credit", h.UpdateAccountCredit)
 	api.POST("/accounts/batch-test", h.BatchTest)
+	api.POST("/accounts/batch-refresh", h.BatchRefreshAccounts)
+	api.POST("/accounts/batch-delete", h.BatchDeleteAccounts)
 	api.POST("/accounts/batch-reset-status", h.BatchResetStatus)
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
@@ -269,6 +277,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/ops/request-traces", h.GetRequestTraceEvents)
+	api.GET("/reset-radar", h.GetResetRadar)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
@@ -394,6 +403,16 @@ func (h *Handler) GetStats(c *gin.Context) {
 
 	total := len(accounts)
 	available := h.store.AvailableCount()
+	rateLimitedCount := 0
+	for _, acc := range h.store.Accounts() {
+		if acc == nil {
+			continue
+		}
+		switch acc.RuntimeStatus() {
+		case "rate_limited", "usage_exhausted":
+			rateLimitedCount++
+		}
+	}
 	errCount := 0
 	for _, acc := range accounts {
 		if acc.Status == "error" {
@@ -410,6 +429,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 	c.JSON(http.StatusOK, statsResponse{
 		Total:         total,
 		Available:     available,
+		RateLimited:   rateLimitedCount,
 		Error:         errCount,
 		TodayRequests: todayReqs,
 	})
@@ -422,11 +442,13 @@ type accountResponse struct {
 	Name                     string                     `json:"name"`
 	Email                    string                     `json:"email"`
 	PlanType                 string                     `json:"plan_type"`
+	SubscriptionExpiresAt    string                     `json:"subscription_expires_at,omitempty"`
 	Status                   string                     `json:"status"`
 	ErrorMessage             string                     `json:"error_message,omitempty"`
 	ATOnly                   bool                       `json:"at_only"`
 	CreditEnabled            bool                       `json:"credit_enabled"`
 	CreditSkipUsageWindow    bool                       `json:"credit_skip_usage_window"`
+	SkipWarmTier             bool                       `json:"skip_warm_tier"`
 	AccountType              string                     `json:"account_type,omitempty"`
 	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
 	BaseURL                  string                     `json:"base_url,omitempty"`
@@ -502,6 +524,7 @@ type schedulerBreakdownResponse struct {
 	UsagePenalty7d      float64 `json:"usage_penalty_7d"`
 	UsageUrgencyBonus5h float64 `json:"usage_urgency_bonus_5h"`
 	UsageUrgencyBonus7d float64 `json:"usage_urgency_bonus_7d"`
+	ExpiryUrgencyBonus  float64 `json:"expiry_urgency_bonus"`
 	LatencyPenalty      float64 `json:"latency_penalty"`
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
@@ -547,11 +570,13 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Name:                     row.Name,
 			Email:                    email,
 			PlanType:                 planType,
+			SubscriptionExpiresAt:    row.GetCredential("subscription_expires_at"),
 			Status:                   row.Status,
 			ErrorMessage:             row.ErrorMessage,
 			ATOnly:                   !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			CreditEnabled:            row.CreditEnabled,
 			CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
+			SkipWarmTier:             row.SkipWarmTier,
 			AccountType:              row.Type,
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
 			BaseURL:                  baseURL,
@@ -598,6 +623,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				UsagePenalty7d:      debug.Breakdown.UsagePenalty7d,
 				UsageUrgencyBonus5h: debug.Breakdown.UsageUrgencyBonus5h,
 				UsageUrgencyBonus7d: debug.Breakdown.UsageUrgencyBonus7d,
+				ExpiryUrgencyBonus:  debug.Breakdown.ExpiryUrgencyBonus,
 				LatencyPenalty:      debug.Breakdown.LatencyPenalty,
 				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
 			}
@@ -703,6 +729,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
+	SkipWarmTier            json.RawMessage `json:"skip_warm_tier"`
 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
 	Tags                    json.RawMessage `json:"tags"`
 	GroupIDs                json.RawMessage `json:"group_ids"`
@@ -774,6 +801,11 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	allowedAPIKeyIDs, err := parseOptionalIntegerSliceField(req.AllowedAPIKeyIDs, "allowed_api_key_ids")
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -828,7 +860,7 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	if req.ProxyURL != nil {
 		proxyURL = database.OptionalString{Set: true, Value: *req.ProxyURL}
 	}
-	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, scoreBiasOverride, baseConcurrencyOverride, allowedAPIKeyIDs, database.OptionalStringSlice{Set: tags.Set, Values: tags.Values}, groupIDs, proxyURL); err != nil {
+	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, scoreBiasOverride, baseConcurrencyOverride, skipWarmTier, allowedAPIKeyIDs, database.OptionalStringSlice{Set: tags.Set, Values: tags.Values}, groupIDs, proxyURL); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
@@ -837,10 +869,11 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
-		if scoreBiasOverride.Set || baseConcurrencyOverride.Set {
+		if scoreBiasOverride.Set || baseConcurrencyOverride.Set || skipWarmTier.Set {
 			current := h.store.FindByID(id)
 			var score *int64
 			var concurrency *int64
+			var skipWarm *bool
 			if current != nil {
 				current.Mu().RLock()
 				if current.ScoreBiasOverride != nil {
@@ -851,6 +884,8 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 					value := *current.BaseConcurrencyOverride
 					concurrency = &value
 				}
+				skipValue := current.SkipWarmTier
+				skipWarm = &skipValue
 				current.Mu().RUnlock()
 			}
 			if scoreBiasOverride.Set {
@@ -859,7 +894,10 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			if baseConcurrencyOverride.Set {
 				concurrency = nullableInt64Pointer(baseConcurrencyOverride.Value)
 			}
-			h.store.ApplyAccountSchedulerOverrides(id, score, concurrency)
+			if skipWarmTier.Set {
+				skipWarm = &skipWarmTier.Value
+			}
+			h.store.ApplyAccountSchedulerOverrides(id, score, concurrency, skipWarm)
 		}
 		if allowedAPIKeyIDs.Set {
 			h.store.ApplyAccountAllowedAPIKeys(id, allowedAPIKeyIDs.Values)
@@ -937,6 +975,21 @@ func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxV
 		return database.OptionalNullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
 	}
 	return database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: value, Valid: true}}, nil
+}
+
+func parseOptionalBoolField(raw json.RawMessage, field string) (database.OptionalBool, error) {
+	if len(raw) == 0 {
+		return database.OptionalBool{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalBool{Set: true, Value: false}, nil
+	}
+
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return database.OptionalBool{}, fmt.Errorf("%s 必须是布尔值或 null", field)
+	}
+	return database.OptionalBool{Set: true, Value: value}, nil
 }
 
 func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {
@@ -1382,6 +1435,9 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			if !atInfo.ExpiresAt.IsZero() {
 				newAcc.ExpiresAt = atInfo.ExpiresAt
 			}
+			if !atInfo.SubscriptionExpiresAt.IsZero() {
+				newAcc.SubscriptionExpiresAt = atInfo.SubscriptionExpiresAt
+			}
 		}
 		h.store.AddAccount(newAcc)
 
@@ -1392,6 +1448,9 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 				"account_id": atInfo.ChatGPTAccountID,
 				"plan_type":  atInfo.PlanType,
 				"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
+			}
+			if !atInfo.SubscriptionExpiresAt.IsZero() {
+				creds["subscription_expires_at"] = atInfo.SubscriptionExpiresAt.Format(time.RFC3339)
 			}
 			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
 				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
@@ -2157,9 +2216,7 @@ type importEvent struct {
 }
 
 func sendImportEvent(c *gin.Context, e importEvent) {
-	data, _ := json.Marshal(e)
-	fmt.Fprintf(c.Writer, "data: %s\n\n", data)
-	c.Writer.Flush()
+	sendSSEJSON(c, e)
 }
 
 func setupSSE(c *gin.Context) {
@@ -2167,6 +2224,19 @@ func setupSSE(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
+	c.Writer.Flush()
+}
+
+func sendSSEJSON(c *gin.Context, event any) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("序列化 SSE 事件失败: %v", err)
+		return
+	}
+	if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
+		log.Printf("写入 SSE 事件失败: %v", err)
+		return
+	}
 	c.Writer.Flush()
 }
 
@@ -2546,6 +2616,10 @@ func (h *Handler) GetAccountUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, detail)
 }
 
+type batchAccountIDsRequest struct {
+	IDs []int64 `json:"ids"`
+}
+
 // DeleteAccount 删除账号
 func (h *Handler) DeleteAccount(c *gin.Context) {
 	idStr := c.Param("id")
@@ -2559,7 +2633,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 	defer cancel()
 
 	// 软删除：保留账号数据与事件记录，但从运行时池和 active 列表中移除。
-	if err := h.db.SoftDeleteAccount(ctx, id); err != nil {
+	if err := h.deleteAccountByID(ctx, id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
@@ -2568,11 +2642,123 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 		return
 	}
 
-	// 从内存池移除
+	writeMessage(c, http.StatusOK, "账号已删除")
+}
+
+func (h *Handler) deleteAccountByID(ctx context.Context, id int64) error {
+	if err := h.db.SoftDeleteAccount(ctx, id); err != nil {
+		return err
+	}
 	h.store.RemoveAccount(id)
 	h.db.InsertAccountEventAsync(id, "deleted", "manual")
+	return nil
+}
 
-	writeMessage(c, http.StatusOK, "账号已删除")
+// BatchDeleteAccounts 批量删除账号；stream=true 时以 SSE 返回实时进度。
+// POST /api/admin/accounts/batch-delete
+func (h *Handler) BatchDeleteAccounts(c *gin.Context) {
+	var req batchAccountIDsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	ids := uniqueAccountIDs(req.IDs)
+	if len(ids) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要删除的账号 ID 列表")
+		return
+	}
+
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamBatchDeleteAccounts(c, ids)
+		return
+	}
+
+	success, fail := h.runBatchDeleteAccounts(c.Request.Context(), ids, nil)
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已删除 %d 个账号，失败 %d 个", success, fail),
+		"deleted": success,
+		"success": success,
+		"failed":  fail,
+	})
+}
+
+func uniqueAccountIDs(ids []int64) []int64 {
+	seen := make(map[int64]struct{}, len(ids))
+	result := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
+}
+
+func (h *Handler) streamBatchDeleteAccounts(c *gin.Context, ids []int64) {
+	setupSSE(c)
+	total := len(ids)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "batch_delete", Total: total})
+	if total == 0 {
+		sendSSEJSON(c, batchOperationEvent{Type: "complete", Action: "batch_delete"})
+		return
+	}
+
+	success, fail := h.runBatchDeleteAccounts(c.Request.Context(), ids, func(event batchOperationEvent) {
+		sendSSEJSON(c, event)
+	})
+	sendSSEJSON(c, batchOperationEvent{
+		Type:    "complete",
+		Action:  "batch_delete",
+		Current: total,
+		Total:   total,
+		Success: success,
+		Failed:  fail,
+		Deleted: success,
+	})
+}
+
+func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onProgress func(batchOperationEvent)) (int64, int64) {
+	total := len(ids)
+	var success int64
+	var fail int64
+
+	for i, id := range ids {
+		if ctx.Err() != nil {
+			fail += int64(total - i)
+			break
+		}
+
+		err := h.deleteAccountByID(ctx, id)
+		event := batchOperationEvent{
+			Type:      "progress",
+			Action:    "batch_delete",
+			Current:   i + 1,
+			Total:     total,
+			AccountID: id,
+		}
+		if err != nil {
+			fail++
+			event.Error = err.Error()
+			if errors.Is(err, sql.ErrNoRows) {
+				event.Error = "账号不存在"
+			}
+		} else {
+			success++
+			event.Deleted = success
+			event.Message = "账号已删除"
+		}
+		event.Success = success
+		event.Failed = fail
+		if onProgress != nil {
+			onProgress(event)
+		}
+	}
+
+	return success, fail
 }
 
 // RefreshAccount 手动刷新账号 AT
@@ -2584,14 +2770,7 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	refreshFn := h.refreshAccount
-	if refreshFn == nil {
-		refreshFn = h.refreshSingleAccount
-	}
-	if err := refreshFn(ctx, id); err != nil {
+	if err := h.refreshAccountByID(c.Request.Context(), id); err != nil {
 		if strings.Contains(err.Error(), "不存在") {
 			writeError(c, http.StatusNotFound, err.Error())
 			return
@@ -2601,6 +2780,150 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 	}
 
 	writeMessage(c, http.StatusOK, "账号刷新成功")
+}
+
+// BatchRefreshAccounts 批量刷新账号 AT；stream=true 时以 SSE 返回实时进度。
+// POST /api/admin/accounts/batch-refresh
+func (h *Handler) BatchRefreshAccounts(c *gin.Context) {
+	var req batchAccountIDsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	ids := uniqueAccountIDs(req.IDs)
+	if len(ids) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要刷新的账号 ID 列表")
+		return
+	}
+
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamBatchRefreshAccounts(c, ids)
+		return
+	}
+
+	success, fail := h.runBatchRefreshAccounts(c.Request.Context(), ids, nil)
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已刷新 %d 个账号，失败 %d 个", success, fail),
+		"success": success,
+		"failed":  fail,
+	})
+}
+
+func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
+	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	refreshFn := h.refreshAccount
+	if refreshFn == nil {
+		refreshFn = h.refreshSingleAccount
+	}
+	return refreshFn(refreshCtx, id)
+}
+
+func (h *Handler) streamBatchRefreshAccounts(c *gin.Context, ids []int64) {
+	setupSSE(c)
+	total := len(ids)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "batch_refresh", Total: total})
+	if total == 0 {
+		sendSSEJSON(c, batchOperationEvent{Type: "complete", Action: "batch_refresh"})
+		return
+	}
+
+	events := make(chan batchOperationEvent, len(ids)+1)
+	ctx := c.Request.Context()
+	go func() {
+		success, fail := h.runBatchRefreshAccounts(ctx, ids, func(event batchOperationEvent) {
+			select {
+			case events <- event:
+			case <-ctx.Done():
+			}
+		})
+		select {
+		case events <- batchOperationEvent{
+			Type:    "complete",
+			Action:  "batch_refresh",
+			Current: total,
+			Total:   total,
+			Success: success,
+			Failed:  fail,
+		}:
+		case <-ctx.Done():
+		}
+		close(events)
+	}()
+
+	for event := range events {
+		sendSSEJSON(c, event)
+	}
+}
+
+func (h *Handler) runBatchRefreshAccounts(ctx context.Context, ids []int64, onProgress func(batchOperationEvent)) (int64, int64) {
+	total := len(ids)
+	var (
+		success   int64
+		fail      int64
+		completed int64
+		wg        sync.WaitGroup
+		sem       = make(chan struct{}, accountRefreshBatchConcurrency)
+	)
+
+	for _, id := range ids {
+		id := id
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				atomic.AddInt64(&fail, 1)
+				emitBatchRefreshProgress(onProgress, id, total, &completed, &success, &fail, "刷新已取消", true)
+				return
+			}
+			defer func() { <-sem }()
+
+			if err := h.refreshAccountByID(ctx, id); err != nil {
+				atomic.AddInt64(&fail, 1)
+				emitBatchRefreshProgress(onProgress, id, total, &completed, &success, &fail, err.Error(), true)
+				return
+			}
+
+			atomic.AddInt64(&success, 1)
+			emitBatchRefreshProgress(onProgress, id, total, &completed, &success, &fail, "账号刷新成功", false)
+		}()
+	}
+
+	wg.Wait()
+	return atomic.LoadInt64(&success), atomic.LoadInt64(&fail)
+}
+
+func emitBatchRefreshProgress(
+	onProgress func(batchOperationEvent),
+	accountID int64,
+	total int,
+	completedCount *int64,
+	successCount *int64,
+	failedCount *int64,
+	message string,
+	failed bool,
+) {
+	if onProgress == nil {
+		return
+	}
+	current := int(atomic.AddInt64(completedCount, 1))
+	event := batchOperationEvent{
+		Type:      "progress",
+		Action:    "batch_refresh",
+		Current:   current,
+		Total:     total,
+		Success:   atomic.LoadInt64(successCount),
+		Failed:    atomic.LoadInt64(failedCount),
+		AccountID: accountID,
+		Message:   message,
+	}
+	if failed {
+		event.Error = message
+	}
+	onProgress(event)
 }
 
 // ToggleAccountEnabled 切换账号是否参与调度选择
@@ -4016,6 +4339,8 @@ type settingsResponse struct {
 	StreamFlushIntervalMS            int    `json:"stream_flush_interval_ms"`
 	StreamIdleTimeoutSeconds         int    `json:"stream_idle_timeout_seconds"`
 	StreamKeepaliveIntervalSeconds   int    `json:"stream_keepalive_interval_seconds"`
+	FirstTokenTimeoutSeconds         int    `json:"first_token_timeout_seconds"`
+	ShowFullUsageNumbers             bool   `json:"show_full_usage_numbers"`
 	ImageStorageBackend              string `json:"image_storage_backend"`
 	ImageS3Endpoint                  string `json:"image_s3_endpoint"`
 	ImageS3Region                    string `json:"image_s3_region"`
@@ -4091,6 +4416,8 @@ type updateSettingsReq struct {
 	StreamFlushIntervalMS            *int    `json:"stream_flush_interval_ms"`
 	StreamIdleTimeoutSeconds         *int    `json:"stream_idle_timeout_seconds"`
 	StreamKeepaliveIntervalSeconds   *int    `json:"stream_keepalive_interval_seconds"`
+	FirstTokenTimeoutSeconds         *int    `json:"first_token_timeout_seconds"`
+	ShowFullUsageNumbers             *bool   `json:"show_full_usage_numbers"`
 	ImageStorageBackend              *string `json:"image_storage_backend"`
 	ImageS3Endpoint                  *string `json:"image_s3_endpoint"`
 	ImageS3Region                    *string `json:"image_s3_region"`
@@ -4615,6 +4942,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	var resinURL, resinPlatformName string
 	accountAlertCfg := alerting.DefaultAccountPoolConfig()
 	branding := brandingFromSettings(dbSettings)
+	showFullUsageNumbers := false
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
@@ -4622,6 +4950,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
 		accountAlertCfg = alerting.AccountPoolConfigFromJSON(dbSettings.AccountAlertConfig)
+		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	runtimeCfg := proxy.CurrentRuntimeSettings()
@@ -4690,6 +5019,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
 		StreamIdleTimeoutSeconds:         runtimeCfg.StreamIdleTimeoutSeconds,
 		StreamKeepaliveIntervalSeconds:   runtimeCfg.StreamKeepaliveIntervalSeconds,
+		FirstTokenTimeoutSeconds:         runtimeCfg.FirstTokenTimeoutSec,
+		ShowFullUsageNumbers:             showFullUsageNumbers,
 		ImageStorageBackend:              imgCfg.Backend,
 		ImageS3Endpoint:                  imgCfg.Endpoint,
 		ImageS3Region:                    imgCfg.Region,
@@ -4716,6 +5047,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	siteName := database.DefaultSiteName
 	siteLogo := ""
 	bgCfg := defaultBackgroundConfig()
+	showFullUsageNumbers := false
 	existingSettings, err := h.db.GetSystemSettings(c.Request.Context())
 	if err == nil && existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
@@ -4723,6 +5055,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		siteName = database.NormalizeSiteName(existingSettings.SiteName)
 		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
+		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -5018,6 +5351,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.StreamKeepaliveIntervalSeconds = *req.StreamKeepaliveIntervalSeconds
 		log.Printf("设置已更新: stream_keepalive_interval_seconds = %d", runtimeCfg.StreamKeepaliveIntervalSeconds)
 	}
+	if req.FirstTokenTimeoutSeconds != nil {
+		runtimeCfg.FirstTokenTimeoutSec = *req.FirstTokenTimeoutSeconds
+		log.Printf("设置已更新: first_token_timeout_seconds = %d", runtimeCfg.FirstTokenTimeoutSec)
+	}
+	if req.ShowFullUsageNumbers != nil {
+		showFullUsageNumbers = *req.ShowFullUsageNumbers
+		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
+	}
 	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
 
 	usageLogChanged := false
@@ -5291,6 +5632,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
 		StreamIdleTimeoutSeconds:         runtimeCfg.StreamIdleTimeoutSeconds,
 		StreamKeepaliveIntervalSeconds:   runtimeCfg.StreamKeepaliveIntervalSeconds,
+		FirstTokenTimeoutSeconds:         runtimeCfg.FirstTokenTimeoutSec,
+		ShowFullUsageNumbers:             showFullUsageNumbers,
 		ImageStorageConfig:               imgConfigJSON,
 		AccountAlertConfig:               accountAlertConfigJSON,
 		BackgroundConfig:                 encodeBackgroundConfig(bgCfg),
@@ -5378,6 +5721,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
 		StreamIdleTimeoutSeconds:         runtimeCfg.StreamIdleTimeoutSeconds,
 		StreamKeepaliveIntervalSeconds:   runtimeCfg.StreamKeepaliveIntervalSeconds,
+		FirstTokenTimeoutSeconds:         runtimeCfg.FirstTokenTimeoutSec,
+		ShowFullUsageNumbers:             showFullUsageNumbers,
 		ImageStorageBackend:              imgCfg.Backend,
 		ImageS3Endpoint:                  imgCfg.Endpoint,
 		ImageS3Region:                    imgCfg.Region,

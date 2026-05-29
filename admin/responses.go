@@ -20,6 +20,7 @@ type messageResponse struct {
 type statsResponse struct {
 	Total         int   `json:"total"`
 	Available     int   `json:"available"`
+	RateLimited   int   `json:"rate_limited"`
 	Error         int   `json:"error"`
 	TodayRequests int64 `json:"today_requests"`
 }

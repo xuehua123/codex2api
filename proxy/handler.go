@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -1100,6 +1101,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.Use(auth)
 	v1.POST("/chat/completions", h.ChatCompletions)
 	v1.POST("/responses", h.Responses)
+	v1.GET("/responses", h.ResponsesWebSocket)
 	v1.POST("/responses/compact", h.ResponsesCompact)
 	v1.POST("/images/generations", h.ImagesGenerations)
 	v1.POST("/images/edits", h.ImagesEdits)
@@ -1109,6 +1111,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	// 无前缀路由（兼容 base_url 已包含 /v1 的客户端）
 	r.POST("/chat/completions", auth, h.ChatCompletions)
 	r.POST("/responses", auth, h.Responses)
+	r.GET("/responses", auth, h.ResponsesWebSocket)
 	r.POST("/responses/compact", auth, h.ResponsesCompact)
 	r.POST("/images/generations", auth, h.ImagesGenerations)
 	r.POST("/images/edits", auth, h.ImagesEdits)
@@ -1118,6 +1121,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	codexDirect := r.Group("/backend-api/codex")
 	codexDirect.Use(auth)
 	codexDirect.POST("/responses", h.Responses)
+	codexDirect.GET("/responses", h.ResponsesWebSocket)
 	codexDirect.POST("/responses/*subpath", func(c *gin.Context) {
 		subpath := strings.TrimSpace(c.Param("subpath"))
 		if subpath == "/compact" || strings.HasPrefix(subpath, "/compact/") {
@@ -1420,7 +1424,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
-	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
+	retryExclusions := newRetryAccountExclusions()
 	invalidEncryptedContentRetried := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
@@ -1439,48 +1443,31 @@ func (h *Handler) Responses(c *gin.Context) {
 		})
 		accountSelectStart := time.Now()
 		queueWaitMs := int64(0)
-		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
-			// 排队等待可用账号（最多 30s）
-			h.traceRequestEvent(c, trace, "queue_wait_start", requestTraceFields{
-				Attempt:        attempt + 1,
-				EffectiveModel: effectiveModel,
-				Message:        "no account immediately available; waiting up to 30s",
-			})
-			queueWaitStart := time.Now()
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
-			queueWaitMs = time.Since(queueWaitStart).Milliseconds()
-			if account == nil {
-				recordUpstreamAttemptTiming(c, time.Now(), attempt, time.Since(accountSelectStart).Milliseconds(), queueWaitMs)
-				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-					traceTerminal = true
-					h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
-						Attempt:        attempt + 1,
-						StatusCode:     lastStatusCode,
-						ErrorKind:      "rate_limit",
-						EffectiveModel: effectiveModel,
-						Message:        "no account became available after upstream rate limit retries",
-					})
-					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
-					return
-				}
+			recordUpstreamAttemptTiming(c, time.Now(), attempt, time.Since(accountSelectStart).Milliseconds(), queueWaitMs)
+			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				traceTerminal = true
 				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
 					Attempt:        attempt + 1,
-					StatusCode:     http.StatusServiceUnavailable,
-					ErrorKind:      ErrorCodeNoAvailableAccount,
+					StatusCode:     lastStatusCode,
+					ErrorKind:      "rate_limit",
 					EffectiveModel: effectiveModel,
-					Message:        "no account became available after queue wait",
+					Message:        "no account became available after upstream rate limit retries",
 				})
-				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
-			h.traceRequestEvent(c, trace, "queue_wait_end", requestTraceFields{
-				AccountID:      account.ID(),
+			traceTerminal = true
+			h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
 				Attempt:        attempt + 1,
+				StatusCode:     http.StatusServiceUnavailable,
+				ErrorKind:      ErrorCodeNoAvailableAccount,
 				EffectiveModel: effectiveModel,
-				Message:        fmt.Sprintf("account became available queue_wait_ms=%d", queueWaitMs),
+				Message:        "no account became available after queue wait",
 			})
+			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+			return
 		}
 
 		start := time.Now()
@@ -1517,6 +1504,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 			lastUpstreamCancel = upstreamCancel
+			ttftGuard := (*firstTokenTimeoutGuard)(nil)
+			if isStream {
+				ttftGuard = newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
+			}
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
 			h.traceRequestEvent(c, trace, "upstream_start", requestTraceFields{
@@ -1529,22 +1520,40 @@ func (h *Handler) Responses(c *gin.Context) {
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
+				timedOut := ttftGuard.TimedOut()
+				ttftGuard.Stop()
+				if timedOut {
+					reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
+				}
+				kind := classifyTransportFailure(reqErr)
+				retryable := IsRetryableError(reqErr) || kind != ""
+				shouldRetry := false
+				if retryable {
+					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+				}
 				h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
 					AccountID:      account.ID(),
 					Attempt:        attempt + 1,
 					StatusCode:     http.StatusBadGateway,
-					ErrorKind:      classifyTransportFailure(reqErr),
+					ErrorKind:      kind,
 					EffectiveModel: effectiveModel,
 					Message:        reqErr.Error(),
 				})
-				if kind := classifyTransportFailure(reqErr); kind != "" {
+				if kind != "" && !(timedOut && shouldRetry) {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
-				excludeAccounts[account.ID()] = true
+				if timedOut && shouldRetry {
+					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+					log.Printf("OpenAI Responses 上游首字超时，断开并重试 (attempt %d/%d, account %d): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+					continue
+				}
+				if !timedOut {
+					retryExclusions.MarkHard(account.ID())
+				}
 
-				if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+				if !retryable {
 					traceTerminal = true
 					h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
 						AccountID:      account.ID(),
@@ -1559,11 +1568,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 
 				log.Printf("OpenAI Responses 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
-				if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				if shouldRetry {
 					h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
 						AccountID:      account.ID(),
 						Attempt:        attempt + 1,
-						ErrorKind:      classifyTransportFailure(reqErr),
+						ErrorKind:      kind,
 						EffectiveModel: effectiveModel,
 						Message:        "retrying after request error",
 					})
@@ -1588,8 +1597,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				EffectiveModel: effectiveModel,
 				Message:        fmt.Sprintf("upstream responded in %dms", durationMs),
 			})
+			if !isStream {
+				ttftGuard.Stop()
+			}
 
 			if resp.StatusCode != http.StatusOK {
+				ttftGuard.Stop()
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 
@@ -1618,7 +1631,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
-				excludeAccounts[account.ID()] = true
+				retryExclusions.MarkHard(account.ID())
 
 				log.Printf("OpenAI Responses 上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 				logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
@@ -1705,6 +1718,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 				flusher, ok := c.Writer.(http.Flusher)
 				if !ok {
+					ttftGuard.Stop()
 					c.JSON(http.StatusInternalServerError, gin.H{
 						"error": gin.H{"message": "streaming not supported", "type": "server_error"},
 					})
@@ -1719,6 +1733,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				readErr = ReadSSEStreamWithIdleTimeout(resp.Body, currentStreamIdleTimeout(), func(data []byte) bool {
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
+					isFirstToken := isFirstTokenEvent(eventType)
 					if !firstSSETraced {
 						firstSSETraced = true
 						h.traceRequestEvent(c, trace, "first_sse", requestTraceFields{
@@ -1728,9 +1743,10 @@ func (h *Handler) Responses(c *gin.Context) {
 							Message:        eventType,
 						})
 					}
-					if !ttftRecorded && isFirstTokenEvent(eventType) {
+					if !ttftRecorded && isFirstToken {
 						firstTokenMs = int(time.Since(start).Milliseconds())
 						ttftRecorded = true
+						ttftGuard.MarkEvent(eventType)
 					}
 					if !firstContentTraced && isFirstTokenEvent(eventType) {
 						firstContentTraced = true
@@ -1803,6 +1819,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			totalDuration := int(time.Since(start).Milliseconds())
 			outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+			if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
+				outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
+			}
+			ttftGuard.Stop()
 			if len(terminalFailurePayload) > 0 {
 				outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 			}
@@ -1817,7 +1837,11 @@ func (h *Handler) Responses(c *gin.Context) {
 					Message:        outcome.failureMessage,
 				})
 				recyclePooledClient(account, proxyURL)
-				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				if isFirstTokenTimeoutOutcome(outcome) {
+					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+				} else {
+					h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				}
 				resp.Body.Close()
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -1926,6 +1950,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 		lastUpstreamCancel = upstreamCancel
+		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		h.traceRequestEvent(c, trace, "upstream_start", requestTraceFields{
 			AccountID:      account.ID(),
 			Attempt:        attempt + 1,
@@ -1936,23 +1961,41 @@ func (h *Handler) Responses(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			timedOut := ttftGuard.TimedOut()
+			ttftGuard.Stop()
+			if timedOut {
+				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
+			}
+			kind := classifyTransportFailure(reqErr)
+			retryable := IsRetryableError(reqErr) || kind != ""
+			shouldRetry := false
+			if retryable {
+				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+			}
 			h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
 				AccountID:      account.ID(),
 				Attempt:        attempt + 1,
 				StatusCode:     http.StatusBadGateway,
-				ErrorKind:      classifyTransportFailure(reqErr),
+				ErrorKind:      kind,
 				EffectiveModel: effectiveModel,
 				Message:        reqErr.Error(),
 			})
-			if kind := classifyTransportFailure(reqErr); kind != "" {
+			if kind != "" && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			excludeAccounts[account.ID()] = true
+			if timedOut && shouldRetry {
+				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+				log.Printf("上游首字超时，断开并重试 (attempt %d/%d, account %d, /v1/responses): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+				continue
+			}
+			if !timedOut {
+				retryExclusions.MarkHard(account.ID())
+			}
 
 			// 不可重试的结构化错误直接返回
-			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+			if !retryable {
 				traceTerminal = true
 				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
 					AccountID:      account.ID(),
@@ -1967,11 +2010,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
-			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+			if shouldRetry {
 				h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
 					AccountID:      account.ID(),
 					Attempt:        attempt + 1,
-					ErrorKind:      classifyTransportFailure(reqErr),
+					ErrorKind:      kind,
 					EffectiveModel: effectiveModel,
 					Message:        "retrying after request error",
 				})
@@ -1998,6 +2041,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		})
 
 		if resp.StatusCode != http.StatusOK {
+			ttftGuard.Stop()
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
@@ -2027,7 +2071,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			excludeAccounts[account.ID()] = true
+			retryExclusions.MarkHard(account.ID())
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
@@ -2119,6 +2163,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			flusher, ok := c.Writer.(http.Flusher)
 			if !ok {
+				ttftGuard.Stop()
 				c.JSON(http.StatusInternalServerError, gin.H{
 					"error": gin.H{"message": "streaming not supported", "type": "server_error"},
 				})
@@ -2148,9 +2193,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				ttftTrace.observe(start, eventType)
 
 				// TTFT: 记录第一个 output_text.delta 事件的时间
-				if !ttftRecorded && isFirstTokenEvent(eventType) {
+				isFirstToken := isFirstTokenEvent(eventType)
+				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+					ttftGuard.MarkEvent(eventType)
 				}
 				if !firstContentTraced && isFirstTokenEvent(eventType) {
 					firstContentTraced = true
@@ -2236,6 +2283,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+					ttftGuard.MarkEvent(eventType)
 				}
 				if !firstContentTraced && isFirstTokenEvent(eventType) {
 					firstContentTraced = true
@@ -2293,6 +2341,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
+			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
+		}
+		ttftGuard.Stop()
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 		}
@@ -2308,7 +2360,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			})
 			recyclePooledClient(account, proxyURL)
 			SyncCodexUsageState(h.store, account, resp)
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			if isFirstTokenTimeoutOutcome(outcome) {
+				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+			} else {
+				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			}
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -2755,7 +2811,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
-	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
+	retryExclusions := newRetryAccountExclusions()
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -2773,48 +2829,31 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		})
 		accountSelectStart := time.Now()
 		queueWaitMs := int64(0)
-		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
-			// 排队等待可用账号（最多 30s）
-			h.traceRequestEvent(c, trace, "queue_wait_start", requestTraceFields{
-				Attempt:        attempt + 1,
-				EffectiveModel: effectiveModel,
-				Message:        "no account immediately available; waiting up to 30s",
-			})
-			queueWaitStart := time.Now()
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
-			queueWaitMs = time.Since(queueWaitStart).Milliseconds()
-			if account == nil {
-				recordUpstreamAttemptTiming(c, time.Now(), attempt, time.Since(accountSelectStart).Milliseconds(), queueWaitMs)
-				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-					traceTerminal = true
-					h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
-						Attempt:        attempt + 1,
-						StatusCode:     lastStatusCode,
-						ErrorKind:      "rate_limit",
-						EffectiveModel: effectiveModel,
-						Message:        "no account became available after upstream rate limit retries",
-					})
-					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
-					return
-				}
+			recordUpstreamAttemptTiming(c, time.Now(), attempt, time.Since(accountSelectStart).Milliseconds(), queueWaitMs)
+			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				traceTerminal = true
 				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
 					Attempt:        attempt + 1,
-					StatusCode:     http.StatusServiceUnavailable,
-					ErrorKind:      ErrorCodeNoAvailableAccount,
+					StatusCode:     lastStatusCode,
+					ErrorKind:      "rate_limit",
 					EffectiveModel: effectiveModel,
-					Message:        "no account became available after queue wait",
+					Message:        "no account became available after upstream rate limit retries",
 				})
-				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
-			h.traceRequestEvent(c, trace, "queue_wait_end", requestTraceFields{
-				AccountID:      account.ID(),
+			traceTerminal = true
+			h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
 				Attempt:        attempt + 1,
+				StatusCode:     http.StatusServiceUnavailable,
+				ErrorKind:      ErrorCodeNoAvailableAccount,
 				EffectiveModel: effectiveModel,
-				Message:        fmt.Sprintf("account became available queue_wait_ms=%d", queueWaitMs),
+				Message:        "no account became available after queue wait",
 			})
+			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+			return
 		}
 
 		start := time.Now()
@@ -2855,6 +2894,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 		lastUpstreamCancel = upstreamCancel
+		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		h.traceRequestEvent(c, trace, "upstream_start", requestTraceFields{
 			AccountID:      account.ID(),
 			Attempt:        attempt + 1,
@@ -2865,23 +2905,41 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			timedOut := ttftGuard.TimedOut()
+			ttftGuard.Stop()
+			if timedOut {
+				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
+			}
+			kind := classifyTransportFailure(reqErr)
+			retryable := IsRetryableError(reqErr) || kind != ""
+			shouldRetry := false
+			if retryable {
+				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+			}
 			h.traceRequestEvent(c, trace, "upstream_error", requestTraceFields{
 				AccountID:      account.ID(),
 				Attempt:        attempt + 1,
 				StatusCode:     http.StatusBadGateway,
-				ErrorKind:      classifyTransportFailure(reqErr),
+				ErrorKind:      kind,
 				EffectiveModel: effectiveModel,
 				Message:        reqErr.Error(),
 			})
-			if kind := classifyTransportFailure(reqErr); kind != "" {
+			if kind != "" && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			excludeAccounts[account.ID()] = true
+			if timedOut && shouldRetry {
+				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+				log.Printf("上游首字超时，断开并重试 (attempt %d/%d, account %d, /v1/chat/completions): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+				continue
+			}
+			if !timedOut {
+				retryExclusions.MarkHard(account.ID())
+			}
 
 			// 不可重试的结构化错误直接返回
-			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+			if !retryable {
 				traceTerminal = true
 				h.traceRequestEvent(c, trace, "request_failed", requestTraceFields{
 					AccountID:      account.ID(),
@@ -2896,11 +2954,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
-			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+			if shouldRetry {
 				h.traceRequestEvent(c, trace, "retry_scheduled", requestTraceFields{
 					AccountID:      account.ID(),
 					Attempt:        attempt + 1,
-					ErrorKind:      classifyTransportFailure(reqErr),
+					ErrorKind:      kind,
 					EffectiveModel: effectiveModel,
 					Message:        "retrying after request error",
 				})
@@ -2927,6 +2985,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		})
 
 		if resp.StatusCode != http.StatusOK {
+			ttftGuard.Stop()
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -2935,7 +2994,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			excludeAccounts[account.ID()] = true
+			retryExclusions.MarkHard(account.ID())
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
@@ -3028,6 +3087,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			flusher, ok := c.Writer.(http.Flusher)
 			if !ok {
+				ttftGuard.Stop()
 				c.JSON(http.StatusInternalServerError, gin.H{
 					"error": gin.H{"message": "streaming not supported", "type": "server_error"},
 				})
@@ -3041,9 +3101,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
 			clientGone := false
+			var pendingFirstTokenChunks bytes.Buffer
 			readErr = ReadSSEStreamWithIdleTimeout(resp.Body, currentStreamIdleTimeout(), func(data []byte) bool {
+				chunk, done := streamTranslator.Translate(data)
+
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				isFirstToken := isFirstTokenEvent(eventType)
 				if !firstSSETraced {
 					firstSSETraced = true
 					h.traceRequestEvent(c, trace, "first_sse", requestTraceFields{
@@ -3053,9 +3117,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 						Message:        eventType,
 					})
 				}
-				if !ttftRecorded && isFirstTokenEvent(eventType) {
+				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+					ttftGuard.MarkEvent(eventType)
 				}
 				if !firstContentTraced && isFirstTokenEvent(eventType) {
 					firstContentTraced = true
@@ -3094,9 +3159,21 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					}
 				}
 
-				chunk, done := streamTranslator.Translate(data)
 				if !clientGone && chunk != nil {
-					if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", chunk)); err != nil {
+					payload := fmt.Sprintf("data: %s\n\n", chunk)
+					shouldDefer := !ttftRecorded && !gotTerminal && !isFirstToken
+					if shouldDefer {
+						pendingFirstTokenChunks.WriteString(payload)
+						if pendingFirstTokenChunks.Len() <= 1024*1024 {
+							return eventType != "response.completed" && eventType != "response.failed"
+						}
+						payload = pendingFirstTokenChunks.String()
+						pendingFirstTokenChunks.Reset()
+					} else if pendingFirstTokenChunks.Len() > 0 {
+						payload = pendingFirstTokenChunks.String() + payload
+						pendingFirstTokenChunks.Reset()
+					}
+					if err := streamWriter.WriteString(payload); err != nil {
 						writeErr = err
 						clientGone = true
 					} else {
@@ -3104,7 +3181,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					}
 				}
 				if !clientGone && done {
-					if err := streamWriter.WriteString("data: [DONE]\n\n"); err != nil {
+					payload := "data: [DONE]\n\n"
+					if pendingFirstTokenChunks.Len() > 0 {
+						payload = pendingFirstTokenChunks.String() + payload
+						pendingFirstTokenChunks.Reset()
+					}
+					if err := streamWriter.WriteString(payload); err != nil {
 						writeErr = err
 						clientGone = true
 					} else if err := streamWriter.Flush(); err != nil {
@@ -3167,6 +3249,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+					ttftGuard.MarkEvent(eventType)
 				}
 				if !firstContentTraced && isFirstTokenEvent(eventType) {
 					firstContentTraced = true
@@ -3218,6 +3301,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
+			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
+		}
+		ttftGuard.Stop()
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 		}
@@ -3233,7 +3320,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			})
 			recyclePooledClient(account, proxyURL)
 			SyncCodexUsageState(h.store, account, resp)
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			if isFirstTokenTimeoutOutcome(outcome) {
+				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+			} else {
+				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			}
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())

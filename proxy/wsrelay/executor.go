@@ -458,20 +458,16 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 		return nil, err
 	}
 
-	// 检查 HTTP 握手响应状态。WebSocket 握手成功返回 101，
-	// 但下游 HTTP handler 期望模拟响应保持 200 才会继续读取 Body。
-	statusCode := http.StatusOK
-	if wsResp.HTTPResponse() != nil {
-		handshakeStatus := wsResp.HTTPResponse().StatusCode
-		// 如果握手失败（非 101/2xx），返回错误响应
-		if handshakeStatus != http.StatusSwitchingProtocols && (handshakeStatus < 200 || handshakeStatus >= 300) {
-			wsResp.Close()
-			return &http.Response{
-				StatusCode: handshakeStatus,
-				Header:     wsResp.HTTPResponse().Header.Clone(),
-				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", handshakeStatus))),
-			}, nil
-		}
+	// 检查 HTTP 握手响应状态。WebSocket 握手成功的标准状态是 101，
+	// 但这里要包装成现有 handler 可消费的 SSE HTTP 200 响应。
+	statusCode, handshakeHeader, handshakeFailed := normalizeWebsocketHandshakeResponse(wsResp.HTTPResponse())
+	if handshakeFailed {
+		wsResp.Close()
+		return &http.Response{
+			StatusCode: statusCode,
+			Header:     handshakeHeader.Clone(),
+			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", statusCode))),
+		}, nil
 	}
 
 	// 将 WebSocket 响应包装为 http.Response
@@ -516,4 +512,17 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 	}()
 
 	return resp, nil
+}
+
+func normalizeWebsocketHandshakeResponse(handshakeResp *http.Response) (statusCode int, header http.Header, failed bool) {
+	if handshakeResp == nil {
+		return http.StatusOK, http.Header{}, false
+	}
+
+	statusCode = handshakeResp.StatusCode
+	header = handshakeResp.Header
+	if statusCode == http.StatusSwitchingProtocols || (statusCode >= 200 && statusCode < 300) {
+		return http.StatusOK, header, false
+	}
+	return statusCode, header, true
 }
