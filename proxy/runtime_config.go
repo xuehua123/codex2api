@@ -44,6 +44,7 @@ type RuntimeSettings struct {
 	StreamKeepaliveIntervalSeconds int
 	FirstTokenTimeoutSec           int
 	BillingTierPolicy              string
+	CodexForceWebsocket            bool // 强制 Codex 上游走 WebSocket（默认 false）
 }
 
 var runtimeSettings atomic.Value // stores RuntimeSettings
@@ -148,6 +149,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.StreamKeepaliveIntervalSeconds = settings.StreamKeepaliveIntervalSeconds
 		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
 		next.BillingTierPolicy = settings.BillingTierPolicy
+		next.CodexForceWebsocket = settings.CodexForceWebsocket
 	}
 	next = NormalizeRuntimeSettings(next)
 	runtimeSettings.Store(next)

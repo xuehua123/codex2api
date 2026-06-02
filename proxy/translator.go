@@ -1670,6 +1670,8 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 
 	// 7. 删除 Codex 不支持的字段
+	// 注意：prompt_cache_retention 上游(HTTP 与 WS 路径)均不接受，会返回
+	// 400 Unsupported parameter，因此在此一并剥离，executor / wsrelay 层也各自兜底删除。
 	for _, field := range []string{
 		"max_output_tokens", "max_tokens", "max_completion_tokens",
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",

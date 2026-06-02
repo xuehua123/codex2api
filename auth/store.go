@@ -1541,6 +1541,7 @@ func (a *Account) GetLastUsedAt() time.Time {
 type Store struct {
 	mu                        sync.RWMutex
 	accounts                  []*Account
+	accountsByID              map[int64]*Account // DBID -> Account 索引，与 accounts 同步维护，供 O(1) 查找
 	globalProxy               string
 	maxConcurrency            int64        // 每账号最大并发数
 	testConcurrency           int64        // 批量测试并发数
@@ -1581,6 +1582,11 @@ type Store struct {
 	// Fast scheduler POC（默认关闭，通过环境变量启用）
 	fastScheduler        atomic.Pointer[FastScheduler]
 	fastSchedulerEnabled atomic.Bool
+
+	// Codex 上游 WebSocket 相关（默认全部关闭，不影响现有 HTTP 路径）
+	codexForceWebsocket         atomic.Bool  // 强制 Codex 上游走 WebSocket（复用连接池）
+	codexWSKeepaliveEnabled     atomic.Bool  // 启用上游 WS 空闲连接保活（仅 Ping）
+	codexWSKeepaliveIntervalSec atomic.Int64 // WS 保活 Ping 间隔（秒），默认 60
 
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
@@ -2069,6 +2075,11 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		log.Printf("快速调度器已启用（请求热路径将优先走本地内存调度器）")
 	}
 
+	// Codex 上游 WebSocket 相关设置（默认关闭，不影响现有路径）
+	s.codexForceWebsocket.Store(settings.CodexForceWebsocket)
+	s.codexWSKeepaliveEnabled.Store(settings.CodexWSKeepaliveEnabled)
+	s.codexWSKeepaliveIntervalSec.Store(normalizeWSKeepaliveInterval(settings.CodexWSKeepaliveIntervalSec))
+
 	// 加载代理池
 	if settings.ProxyPoolEnabled {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2159,6 +2170,66 @@ func (s *Store) FastSchedulerEnabled() bool {
 		return false
 	}
 	return s.fastSchedulerEnabled.Load()
+}
+
+// normalizeWSKeepaliveInterval 把 WS 保活间隔(秒)归一,非正值 → 默认 60。
+func normalizeWSKeepaliveInterval(sec int) int64 {
+	if sec <= 0 {
+		return 60
+	}
+	return int64(sec)
+}
+
+// SetCodexForceWebsocket 设置"强制 Codex 上游走 WebSocket"开关（运行时热更新）。
+func (s *Store) SetCodexForceWebsocket(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexForceWebsocket.Store(enabled)
+}
+
+// CodexForceWebsocket 返回是否强制 Codex 上游走 WebSocket。
+func (s *Store) CodexForceWebsocket() bool {
+	if s == nil {
+		return false
+	}
+	return s.codexForceWebsocket.Load()
+}
+
+// SetCodexWSKeepaliveEnabled 设置上游 WS 空闲连接保活开关（运行时热更新）。
+func (s *Store) SetCodexWSKeepaliveEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexWSKeepaliveEnabled.Store(enabled)
+}
+
+// CodexWSKeepaliveEnabled 返回是否启用上游 WS 连接保活。
+func (s *Store) CodexWSKeepaliveEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.codexWSKeepaliveEnabled.Load()
+}
+
+// SetCodexWSKeepaliveIntervalSec 设置 WS 保活 Ping 间隔（秒）。
+func (s *Store) SetCodexWSKeepaliveIntervalSec(sec int) {
+	if s == nil {
+		return
+	}
+	s.codexWSKeepaliveIntervalSec.Store(normalizeWSKeepaliveInterval(sec))
+}
+
+// CodexWSKeepaliveIntervalSec 返回 WS 保活 Ping 间隔（秒），最小 60。
+func (s *Store) CodexWSKeepaliveIntervalSec() int {
+	if s == nil {
+		return 60
+	}
+	v := s.codexWSKeepaliveIntervalSec.Load()
+	if v <= 0 {
+		return 60
+	}
+	return int(v)
 }
 
 // GetProxyURL 获取全局代理地址
@@ -2610,6 +2681,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		s.accounts = append(s.accounts, account)
 	}
 
+	s.rebuildAccountIndex()
 	log.Printf("从数据库加载了 %d 个账号", len(s.accounts))
 	if memberships, err := s.db.ListAccountGroupMemberships(ctx); err == nil {
 		s.ApplyAccountGroupMemberships(memberships)
@@ -3191,13 +3263,7 @@ func (s *Store) affinityAccountStillHealthy(accountID int64) bool {
 		return false
 	}
 	s.mu.RLock()
-	var target *Account
-	for _, acc := range s.accounts {
-		if acc != nil && acc.DBID == accountID {
-			target = acc
-			break
-		}
-	}
+	target := s.lookupByIDLocked(accountID)
 	s.mu.RUnlock()
 	if target == nil {
 		return false
@@ -3244,13 +3310,7 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 	}
 
 	s.mu.RLock()
-	var target *Account
-	for _, acc := range s.accounts {
-		if acc != nil && acc.DBID == id {
-			target = acc
-			break
-		}
-	}
+	target := s.lookupByIDLocked(id)
 	s.mu.RUnlock()
 	if target == nil {
 		return nil
@@ -3622,6 +3682,7 @@ func (s *Store) AddAccount(acc *Account) {
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.accounts = append(s.accounts, acc)
+	s.rebuildAccountIndex()
 	s.fastSchedulerUpdate(acc)
 }
 
@@ -3633,6 +3694,7 @@ func (s *Store) RemoveAccount(dbID int64) {
 	for i, acc := range s.accounts {
 		if acc.DBID == dbID {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
+			s.rebuildAccountIndex()
 			s.fastSchedulerRemove(dbID)
 			// 清理 RefreshScheduler 中可能残留的任务
 			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
@@ -3647,12 +3709,33 @@ func (s *Store) RemoveAccount(dbID int64) {
 func (s *Store) FindByID(dbID int64) *Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.lookupByIDLocked(dbID)
+}
+
+// lookupByIDLocked 通过索引 O(1) 查找账号；索引缺失时回退到线性扫描。
+// 调用方必须持有 s.mu(读或写锁)。
+func (s *Store) lookupByIDLocked(dbID int64) *Account {
+	if s.accountsByID != nil {
+		return s.accountsByID[dbID]
+	}
 	for _, acc := range s.accounts {
 		if acc.DBID == dbID {
 			return acc
 		}
 	}
 	return nil
+}
+
+// rebuildAccountIndex 根据当前 s.accounts 重建 DBID 索引。
+// 调用方必须持有 s.mu 写锁；在任何修改 s.accounts 的地方调用以保持同步。
+func (s *Store) rebuildAccountIndex() {
+	idx := make(map[int64]*Account, len(s.accounts))
+	for _, acc := range s.accounts {
+		if acc != nil {
+			idx[acc.DBID] = acc
+		}
+	}
+	s.accountsByID = idx
 }
 
 // ApplyAccountSchedulerOverrides 更新运行时账号的调度 override 并立即重算。
@@ -4626,6 +4709,7 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 		}
 	}
 	s.accounts = kept
+	s.rebuildAccountIndex()
 	s.mu.Unlock()
 }
 

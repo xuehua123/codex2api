@@ -1257,6 +1257,15 @@ export default function Usage() {
                         </TableCell>}
                         {visibleColumns.model && <TableCell>
                           <div className="flex items-center gap-1.5 flex-wrap">
+                            {log.via_websocket && (
+                              <Badge
+                                variant="outline"
+                                title="WebSocket"
+                                className="text-[11px] font-semibold uppercase border-transparent bg-cyan-500/12 text-cyan-600 dark:bg-cyan-500/20 dark:text-cyan-400"
+                              >
+                                ws
+                              </Badge>
+                            )}
                             <Badge variant="outline" className={usageTableBadgeClass}>
                               {log.model || '-'}
                             </Badge>

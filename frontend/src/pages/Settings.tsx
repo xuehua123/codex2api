@@ -642,6 +642,9 @@ export default function Settings() {
     auto_clean_full_usage: false,
     proxy_pool_enabled: false,
     fast_scheduler_enabled: false,
+    codex_force_websocket: false,
+    codex_ws_keepalive_enabled: false,
+    codex_ws_keepalive_interval_sec: 60,
     scheduler_mode: 'round_robin',
     affinity_mode: 'bounded',
     max_retries: 2,
@@ -1267,6 +1270,34 @@ export default function Settings() {
               </div>
             </SettingsCard>
           </div>
+
+          <SettingsCard title={t('settings.codexWebsocket')} description={t('settings.codexWebsocketDesc')}>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">
+              <SettingField label={t('settings.codexForceWebsocket')} description={t('settings.codexForceWebsocketDesc')}>
+                <Select
+                  value={settingsForm.codex_force_websocket ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, codex_force_websocket: value === 'true' }))}
+                  options={booleanOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexWSKeepaliveEnabled')} description={t('settings.codexWSKeepaliveEnabledDesc')}>
+                <Select
+                  value={settingsForm.codex_ws_keepalive_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, codex_ws_keepalive_enabled: value === 'true' }))}
+                  options={booleanOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexWSKeepaliveInterval')} description={t('settings.codexWSKeepaliveIntervalDesc')}>
+                <Input
+                  type="number"
+                  min={10}
+                  max={600}
+                  value={settingsForm.codex_ws_keepalive_interval_sec}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_ws_keepalive_interval_sec: parseInt(e.target.value) || 60 }))}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
 
           <SettingsCard title={t('settings.runtimeOptimization')} description={t('settings.runtimeOptimizationDesc')}>
             <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">

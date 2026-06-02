@@ -4451,6 +4451,9 @@ type settingsResponse struct {
 	AutoCleanExpired                 bool   `json:"auto_clean_expired"`
 	ProxyPoolEnabled                 bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled             bool   `json:"fast_scheduler_enabled"`
+	CodexForceWebsocket              bool   `json:"codex_force_websocket"`
+	CodexWSKeepaliveEnabled          bool   `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec      int    `json:"codex_ws_keepalive_interval_sec"`
 	SchedulerMode                    string `json:"scheduler_mode"`
 	AffinityMode                     string `json:"affinity_mode"`
 	MaxRetries                       int    `json:"max_retries"`
@@ -4536,6 +4539,9 @@ type updateSettingsReq struct {
 	AutoCleanExpired                 *bool   `json:"auto_clean_expired"`
 	ProxyPoolEnabled                 *bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled             *bool   `json:"fast_scheduler_enabled"`
+	CodexForceWebsocket              *bool   `json:"codex_force_websocket"`
+	CodexWSKeepaliveEnabled          *bool   `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec      *int    `json:"codex_ws_keepalive_interval_sec"`
 	SchedulerMode                    *string `json:"scheduler_mode"`
 	AffinityMode                     *string `json:"affinity_mode"`
 	MaxRetries                       *int    `json:"max_retries"`
@@ -5138,6 +5144,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		CodexForceWebsocket:              h.store.CodexForceWebsocket(),
+		CodexWSKeepaliveEnabled:          h.store.CodexWSKeepaliveEnabled(),
+		CodexWSKeepaliveIntervalSec:      h.store.CodexWSKeepaliveIntervalSec(),
 		SchedulerMode:                    h.store.GetSchedulerMode(),
 		AffinityMode:                     h.store.GetAffinityMode(),
 		MaxRetries:                       h.store.GetMaxRetries(),
@@ -5427,6 +5436,22 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.FastSchedulerEnabled != nil {
 		h.store.SetFastSchedulerEnabled(*req.FastSchedulerEnabled)
 		log.Printf("设置已更新: fast_scheduler_enabled = %t", *req.FastSchedulerEnabled)
+	}
+
+	if req.CodexForceWebsocket != nil {
+		h.store.SetCodexForceWebsocket(*req.CodexForceWebsocket)
+		runtimeCfg.CodexForceWebsocket = *req.CodexForceWebsocket
+		log.Printf("设置已更新: codex_force_websocket = %t", *req.CodexForceWebsocket)
+	}
+
+	if req.CodexWSKeepaliveEnabled != nil {
+		h.store.SetCodexWSKeepaliveEnabled(*req.CodexWSKeepaliveEnabled)
+		log.Printf("设置已更新: codex_ws_keepalive_enabled = %t", *req.CodexWSKeepaliveEnabled)
+	}
+
+	if req.CodexWSKeepaliveIntervalSec != nil {
+		h.store.SetCodexWSKeepaliveIntervalSec(*req.CodexWSKeepaliveIntervalSec)
+		log.Printf("设置已更新: codex_ws_keepalive_interval_sec = %d", *req.CodexWSKeepaliveIntervalSec)
 	}
 
 	if req.SchedulerMode != nil {
@@ -5775,6 +5800,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		CodexForceWebsocket:              h.store.CodexForceWebsocket(),
+		CodexWSKeepaliveEnabled:          h.store.CodexWSKeepaliveEnabled(),
+		CodexWSKeepaliveIntervalSec:      h.store.CodexWSKeepaliveIntervalSec(),
 		SchedulerMode:                    h.store.GetSchedulerMode(),
 		AffinityMode:                     h.store.GetAffinityMode(),
 		MaxRetries:                       h.store.GetMaxRetries(),
@@ -5862,6 +5890,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
+		CodexForceWebsocket:              h.store.CodexForceWebsocket(),
+		CodexWSKeepaliveEnabled:          h.store.CodexWSKeepaliveEnabled(),
+		CodexWSKeepaliveIntervalSec:      h.store.CodexWSKeepaliveIntervalSec(),
 		SchedulerMode:                    h.store.GetSchedulerMode(),
 		AffinityMode:                     h.store.GetAffinityMode(),
 		MaxRetries:                       h.store.GetMaxRetries(),

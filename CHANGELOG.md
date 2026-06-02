@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.2.6 - 2026-06-03
+
+### Features
+
+- **Codex upstream WebSocket mode.** Added an opt-in `codex_force_websocket` system setting that routes Codex upstream traffic over a persistent WebSocket long-connection (reusing the `wsrelay` connection pool), reducing per-request TLS/handshake overhead to better match the official CLI. Disabled by default; when off, requests keep using the existing HTTP path. A downstream `https://.../v1/responses` (or `/v1/chat/completions`) HTTP POST is transparently forwarded as a `wss://` upstream connection.
+- **Idle WS keepalive.** Added `codex_ws_keepalive_enabled` and `codex_ws_keepalive_interval_sec` (default 60s) to keep idle upstream WebSocket connections alive with background Ping frames. Keepalive never opens new connections and never sends business frames, so it consumes zero account quota. Disabled by default.
+- **WS request badge.** The Usage log now shows a `ws` badge between the status code and model for requests that went over WebSocket.
+- **Dedicated WebSocket settings card.** WS-related settings are split out of the crowded scheduling card into their own full-width "WebSocket (Codex Upstream)" card in the admin UI.
+- **Bundled Codex CLI bump.** Updated the bundled Codex CLI version from `0.128.0` to `0.136.0` for a more faithful fingerprint and access to newer models.
+
+### Fixes
+
+- **WS upstream error passthrough.** Upstream WebSocket error frames are now relayed to the client as a `response.failed` SSE event preserving the original error, instead of being turned into a low-level read error that surfaced as a mysterious empty response / 32-90s hang. Any upstream error (rate limit, unsupported model, invalid parameter) is now visible to the client.
+- **WS transport robustness.** Fixed the `wsrelay` dialer copy dropping `NetDialContext` (TCP KeepAlive never took effect); added 64KB read/write buffers with a shared write-buffer pool for large 48-91KB upstream frames; replaced the fixed 10ms busy-connection spin with exponential backoff plus a max-wait timeout; raised the read timeout from 60s to 120s so long-reasoning turns are not falsely disconnected; and log a warning when a WS path silently falls back to HTTP.
+- **TLS session resumption.** Standard and uTLS transports now share a `ClientSessionCache`, so reconnects use TLS resumption (1-RTT) to cut cold-connection cost. Bumped `MaxIdleConnsPerHost` and `IdleConnTimeout`, and switched the HTTP server to explicit `ReadHeaderTimeout`/`IdleTimeout` with graceful shutdown (keeping `WriteTimeout` at 0 so streaming responses are never cut off).
+- **Account lookup O(N) → O(1).** The store now keeps a `DBID → account` index, so session-affinity hot paths and all `FindByID` lookups no longer scan the account slice linearly.
+
 ## v2.2.5 - 2026-06-02
 
 ### Features

@@ -124,6 +124,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			upstream_endpoint TEXT DEFAULT '',
 				stream INTEGER DEFAULT 0,
 				compact INTEGER DEFAULT 0,
+				via_websocket INTEGER DEFAULT 0,
 				cached_tokens INTEGER DEFAULT 0,
 				service_tier TEXT DEFAULT '',
 				requested_service_tier TEXT DEFAULT '',
@@ -234,7 +235,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				account_alert_config TEXT DEFAULT '{}',
 				show_full_usage_numbers INTEGER DEFAULT 0,
 				scheduler_mode TEXT DEFAULT 'round_robin',
-				affinity_mode TEXT DEFAULT 'bounded'
+				affinity_mode TEXT DEFAULT 'bounded',
+				codex_force_websocket INTEGER DEFAULT 0,
+				codex_ws_keepalive_enabled INTEGER DEFAULT 0,
+				codex_ws_keepalive_interval_sec INTEGER DEFAULT 60
 			);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -362,6 +366,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "inbound_endpoint", "TEXT DEFAULT ''"},
 		{"usage_logs", "upstream_endpoint", "TEXT DEFAULT ''"},
 		{"usage_logs", "stream", "INTEGER DEFAULT 0"},
+		{"usage_logs", "via_websocket", "INTEGER DEFAULT 0"},
 		{"usage_logs", "compact", "INTEGER DEFAULT 0"},
 		{"usage_logs", "cached_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "service_tier", "TEXT DEFAULT ''"},
@@ -411,6 +416,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "lazy_mode", "INTEGER DEFAULT 0"},
 		{"system_settings", "proxy_pool_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "fast_scheduler_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_force_websocket", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_ws_keepalive_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_ws_keepalive_interval_sec", "INTEGER DEFAULT 60"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},

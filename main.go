@@ -281,6 +281,14 @@ func main() {
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
 
+	// 上游 WS 空闲连接保活常驻任务（默认关闭：goroutine 常驻但仅在运行时开关开启时才发送 Ping）
+	wsKeepalive := wsrelay.NewKeepaliveTask(
+		wsrelay.GetManager(),
+		store.CodexWSKeepaliveEnabled,
+		store.CodexWSKeepaliveIntervalSec,
+	)
+	wsKeepalive.Start()
+
 	r.Use(rateLimiter.Middleware())
 	if settings.GlobalRPM > 0 {
 		log.Printf("全局限流已生效: %d RPM", settings.GlobalRPM)
@@ -360,8 +368,16 @@ func main() {
 	log.Println("==========================================")
 
 	// 优雅关闭
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: r,
+		// ReadHeaderTimeout 防 Slowloris 慢速攻击；IdleTimeout 回收空闲 keep-alive 连接。
+		// 注意：WriteTimeout 必须保持 0 —— LLM 流式响应可持续数分钟，任何固定写超时都会中途切断长回答。
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
-		if err := r.Run(addr); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP 服务启动失败: %v", err)
 		}
 	}()
@@ -371,6 +387,12 @@ func main() {
 	<-quit
 
 	log.Println("正在关闭...")
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP 服务优雅关闭超时: %v", err)
+	}
+	wsKeepalive.Stop()
 	store.Stop()
 	wsrelay.ShutdownExecutor()
 	proxy.CloseErrorLogger()
