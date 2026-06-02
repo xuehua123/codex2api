@@ -4,14 +4,75 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"sort"
+	"strings"
 	"time"
 )
 
+const (
+	defaultSQLiteMaxOpenConns = 8
+	maxSQLiteOpenConns        = 16
+	sqliteBusyTimeoutMillis   = 15000
+)
+
+func sqliteConnectDSN(dsn string) string {
+	dsn = strings.TrimSpace(dsn)
+	if dsn == "" || dsn == ":memory:" {
+		return dsn
+	}
+
+	q := url.Values{}
+	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMillis))
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "synchronous(NORMAL)")
+
+	if strings.HasPrefix(strings.ToLower(dsn), "file:") {
+		sep := "?"
+		if strings.Contains(dsn, "?") {
+			sep = "&"
+		}
+		return dsn + sep + q.Encode()
+	}
+
+	return "file:" + dsn + "?" + q.Encode()
+}
+
+func applySQLiteConnLimits(conn *sql.DB, n int) {
+	if conn == nil {
+		return
+	}
+	if n <= 0 {
+		n = defaultSQLiteMaxOpenConns
+	}
+	if n > maxSQLiteOpenConns {
+		n = maxSQLiteOpenConns
+	}
+	if n < 2 {
+		n = 2
+	}
+	conn.SetMaxOpenConns(n)
+	conn.SetMaxIdleConns(n)
+	conn.SetConnMaxLifetime(0)
+}
+
+func (db *DB) withSQLiteWriteLock(ctx context.Context, fn func() error) error {
+	if !db.isSQLite() || db.sqliteWriteSem == nil {
+		return fn()
+	}
+	select {
+	case db.sqliteWriteSem <- struct{}{}:
+		defer func() { <-db.sqliteWriteSem }()
+		return fn()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (db *DB) configureSQLite(ctx context.Context) error {
 	pragmas := []string{
+		fmt.Sprintf(`PRAGMA busy_timeout=%d;`, sqliteBusyTimeoutMillis),
 		`PRAGMA journal_mode=WAL;`,
-		`PRAGMA busy_timeout=15000;`,
 		`PRAGMA synchronous=NORMAL;`,
 	}
 	for _, pragma := range pragmas {
@@ -61,10 +122,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			effective_model TEXT DEFAULT '',
 			inbound_endpoint TEXT DEFAULT '',
 			upstream_endpoint TEXT DEFAULT '',
-			stream INTEGER DEFAULT 0,
-			cached_tokens INTEGER DEFAULT 0,
-			service_tier TEXT DEFAULT '',
-			api_key_id INTEGER DEFAULT 0,
+				stream INTEGER DEFAULT 0,
+				compact INTEGER DEFAULT 0,
+				cached_tokens INTEGER DEFAULT 0,
+				service_tier TEXT DEFAULT '',
+				requested_service_tier TEXT DEFAULT '',
+				actual_service_tier TEXT DEFAULT '',
+				billing_service_tier TEXT DEFAULT '',
+				api_key_id INTEGER DEFAULT 0,
 			api_key_name TEXT DEFAULT '',
 			api_key_masked TEXT DEFAULT '',
 			image_count INTEGER DEFAULT 0,
@@ -153,6 +218,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				fast_scheduler_enabled INTEGER DEFAULT 0,
 				max_retries INTEGER DEFAULT 2,
 				max_rate_limit_retries INTEGER DEFAULT 1,
+				reasoning_effort_models TEXT DEFAULT '[]',
 				allow_remote_migration INTEGER DEFAULT 0,
 				client_compat_mode TEXT DEFAULT 'preserve',
 				codex_min_cli_version TEXT DEFAULT '0.118.0',
@@ -296,8 +362,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "inbound_endpoint", "TEXT DEFAULT ''"},
 		{"usage_logs", "upstream_endpoint", "TEXT DEFAULT ''"},
 		{"usage_logs", "stream", "INTEGER DEFAULT 0"},
+		{"usage_logs", "compact", "INTEGER DEFAULT 0"},
 		{"usage_logs", "cached_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "service_tier", "TEXT DEFAULT ''"},
+		{"usage_logs", "requested_service_tier", "TEXT DEFAULT ''"},
+		{"usage_logs", "actual_service_tier", "TEXT DEFAULT ''"},
+		{"usage_logs", "billing_service_tier", "TEXT DEFAULT ''"},
 		{"usage_logs", "api_key_id", "INTEGER DEFAULT 0"},
 		{"usage_logs", "api_key_name", "TEXT DEFAULT ''"},
 		{"usage_logs", "api_key_masked", "TEXT DEFAULT ''"},
@@ -345,6 +415,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
 		{"system_settings", "model_mapping", "TEXT DEFAULT '{}'"},
+		{"system_settings", "codex_model_mapping", "TEXT DEFAULT '{}'"},
+		{"system_settings", "reasoning_effort_models", "TEXT DEFAULT '[]'"},
 		{"system_settings", "resin_url", "TEXT DEFAULT ''"},
 		{"system_settings", "resin_platform_name", "TEXT DEFAULT ''"},
 		{"system_settings", "prompt_filter_enabled", "INTEGER DEFAULT 0"},
@@ -366,6 +438,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "stream_idle_timeout_seconds", "INTEGER DEFAULT 120"},
 		{"system_settings", "stream_keepalive_interval_seconds", "INTEGER DEFAULT 10"},
 		{"system_settings", "first_token_timeout_seconds", "INTEGER DEFAULT 0"},
+		{"system_settings", "billing_tier_policy", "TEXT DEFAULT 'actual'"},
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "account_alert_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "show_full_usage_numbers", "INTEGER DEFAULT 0"},

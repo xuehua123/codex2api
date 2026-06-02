@@ -653,7 +653,65 @@ func populateAPIKeyMetaFromContext(c *gin.Context, input *database.UsageLogInput
 
 func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInput) {
 	populateAPIKeyMetaFromContext(c, input)
+	populateCompactUsageMetaFromRequest(c, input)
 	h.logUsage(input)
+}
+
+func populateCompactUsageMetaFromRequest(c *gin.Context, input *database.UsageLogInput) {
+	if input == nil || input.Compact {
+		return
+	}
+	if isCompactUsageEndpoint(input.Endpoint) || isCompactUsageEndpoint(input.InboundEndpoint) || isCompactUsageEndpoint(input.UpstreamEndpoint) {
+		input.Compact = true
+		return
+	}
+	if c == nil {
+		return
+	}
+	if body, ok := rawRequestBodyFromContext(c); ok && requestBodyHasCompactionInput(body) {
+		input.Compact = true
+	}
+}
+
+func isCompactUsageEndpoint(endpoint string) bool {
+	return strings.TrimSpace(endpoint) == "/v1/responses/compact"
+}
+
+func rawRequestBodyFromContext(c *gin.Context) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+	v, exists := c.Get("raw_body")
+	if !exists || v == nil {
+		return nil, false
+	}
+	switch body := v.(type) {
+	case []byte:
+		if len(body) == 0 {
+			return nil, false
+		}
+		return body, true
+	case string:
+		if body == "" {
+			return nil, false
+		}
+		return []byte(body), true
+	default:
+		return nil, false
+	}
+}
+
+func requestBodyHasCompactionInput(body []byte) bool {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return false
+	}
+	for _, item := range input.Array() {
+		if strings.EqualFold(strings.TrimSpace(item.Get("type").String()), "compaction") {
+			return true
+		}
+	}
+	return false
 }
 
 // extractReasoningEffort 从请求体提取推理强度
@@ -1353,10 +1411,14 @@ func (h *Handler) Responses(c *gin.Context) {
 		Message: fmt.Sprintf("body_bytes=%d stream=%t", len(rawBody), trace.Stream),
 	})
 
+	supportedModels := h.supportedModelIDs(c.Request.Context())
+	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	c.Set("raw_body", rawBody)
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
-	rules := api.ResponsesAPIValidationRulesForModel(gjson.GetBytes(rawBody, "model").String())
-	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
+	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
+	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1371,7 +1433,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 
-	model := gjson.GetBytes(rawBody, "model").String()
+	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	logModel := requestModel
+	if logModel == "" {
+		logModel = model
+	}
 
 	// 验证 model 参数
 	if err := security.ValidateModelName(model); err != nil {
@@ -1401,7 +1467,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
-		c.Set("x-service-tier", serviceTier)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
 
 	// 2. 准备上游请求体（Unmarshal→map→Marshal，一次序列化）
@@ -1414,6 +1480,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	trace.EffectiveModel = effectiveModel
 	h.traceRequestEvent(c, trace, "request_validated", requestTraceFields{EffectiveModel: effectiveModel})
+	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
+	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
+		return
+	}
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
@@ -1634,8 +1704,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				retryExclusions.MarkHard(account.ID())
 
 				log.Printf("OpenAI Responses 上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
-				logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
-				h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
+				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
+				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				errorKind := upstreamErrorKind(resp.StatusCode, errBody, decision)
@@ -1647,21 +1717,26 @@ func (h *Handler) Responses(c *gin.Context) {
 					EffectiveModel: effectiveModel,
 					Message:        usageLogErrorMessage(resp.StatusCode, errBody),
 				})
+				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
-					AccountID:         account.ID(),
-					Endpoint:          "/v1/responses",
-					Model:             model,
-					StatusCode:        resp.StatusCode,
-					DurationMs:        durationMs,
-					ReasoningEffort:   reasoningEffort,
-					InboundEndpoint:   "/v1/responses",
-					UpstreamEndpoint:  upstreamEndpoint,
-					Stream:            isStream,
-					ServiceTier:       serviceTier,
-					IsRetryAttempt:    shouldRetry,
-					AttemptIndex:      attempt + 1,
-					UpstreamErrorKind: errorKind,
-					ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       logEffectiveModel,
+					StatusCode:           resp.StatusCode,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					InboundEndpoint:      "/v1/responses",
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ServiceTier:          usageTiers.ServiceTier,
+					RequestedServiceTier: usageTiers.RequestedServiceTier,
+					ActualServiceTier:    usageTiers.ActualServiceTier,
+					BillingServiceTier:   usageTiers.BillingServiceTier,
+					IsRetryAttempt:       shouldRetry,
+					AttemptIndex:         attempt + 1,
+					UpstreamErrorKind:    errorKind,
+					ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 				})
 
 				if shouldRetry {
@@ -1693,7 +1768,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			c.Set("x-account-email", baseURL)
 			c.Set("x-account-proxy", proxyURL)
-			c.Set("x-model", model)
+			c.Set("x-model", logModel)
 			c.Set("x-reasoning-effort", reasoningEffort)
 
 			var firstTokenMs int
@@ -1782,7 +1857,7 @@ func (h *Handler) Responses(c *gin.Context) {
 							return false
 						}
 					}
-					if image, ok := extractImageFromOutputItemDone(data, model); ok {
+					if image, ok := extractImageFromOutputItemDone(data, logModel); ok {
 						imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 					}
 					if !clientGone {
@@ -1875,22 +1950,24 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 
-			resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
-			billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
-			c.Set("x-service-tier", resolvedServiceTier)
+			usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
+			c.Set("x-service-tier", usageTiers.ServiceTier)
 			logInput := &database.UsageLogInput{
-				AccountID:          account.ID(),
-				Endpoint:           "/v1/responses",
-				Model:              model,
-				StatusCode:         outcome.logStatusCode,
-				DurationMs:         totalDuration,
-				FirstTokenMs:       firstTokenMs,
-				ReasoningEffort:    reasoningEffort,
-				InboundEndpoint:    "/v1/responses",
-				UpstreamEndpoint:   upstreamEndpoint,
-				Stream:             isStream,
-				ServiceTier:        resolvedServiceTier,
-				BillingServiceTier: billingServiceTier,
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				StatusCode:           outcome.logStatusCode,
+				DurationMs:           totalDuration,
+				FirstTokenMs:         firstTokenMs,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/responses",
+				UpstreamEndpoint:     upstreamEndpoint,
+				Stream:               isStream,
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
@@ -2074,8 +2151,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			retryExclusions.MarkHard(account.ID())
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
-			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
+			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			errorKind := upstreamErrorKind(resp.StatusCode, errBody, decision)
@@ -2087,21 +2164,26 @@ func (h *Handler) Responses(c *gin.Context) {
 				EffectiveModel: effectiveModel,
 				Message:        usageLogErrorMessage(resp.StatusCode, errBody),
 			})
+			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          "/v1/responses",
-				Model:             model,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				ReasoningEffort:   reasoningEffort,
-				InboundEndpoint:   "/v1/responses",
-				UpstreamEndpoint:  "/v1/responses",
-				Stream:            isStream,
-				ServiceTier:       serviceTier,
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: errorKind,
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				StatusCode:           resp.StatusCode,
+				DurationMs:           durationMs,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/responses",
+				UpstreamEndpoint:     "/v1/responses",
+				Stream:               isStream,
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
+				IsRetryAttempt:       shouldRetry,
+				AttemptIndex:         attempt + 1,
+				UpstreamErrorKind:    errorKind,
+				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -2136,7 +2218,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
-		c.Set("x-model", model)
+		c.Set("x-model", logModel)
 		c.Set("x-reasoning-effort", reasoningEffort)
 		var firstTokenMs int
 		ttftTrace := responseTTFTTrace{upstreamHeadersMs: durationMs}
@@ -2213,7 +2295,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if eventType == "response.output_text.delta" {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
-				if image, ok := extractImageFromOutputItemDone(data, model); ok {
+				if image, ok := extractImageFromOutputItemDone(data, logModel); ok {
 					imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 				}
 
@@ -2409,23 +2491,25 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 
-		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
-		billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
-		c.Set("x-service-tier", resolvedServiceTier)
+		usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
+		c.Set("x-service-tier", usageTiers.ServiceTier)
 
 		logInput := &database.UsageLogInput{
-			AccountID:          account.ID(),
-			Endpoint:           "/v1/responses",
-			Model:              model,
-			StatusCode:         logStatusCode,
-			DurationMs:         totalDuration,
-			FirstTokenMs:       firstTokenMs,
-			ReasoningEffort:    reasoningEffort,
-			InboundEndpoint:    "/v1/responses",
-			UpstreamEndpoint:   "/v1/responses",
-			Stream:             isStream,
-			ServiceTier:        resolvedServiceTier,
-			BillingServiceTier: billingServiceTier,
+			AccountID:            account.ID(),
+			Endpoint:             "/v1/responses",
+			Model:                logModel,
+			EffectiveModel:       logEffectiveModel,
+			StatusCode:           logStatusCode,
+			DurationMs:           totalDuration,
+			FirstTokenMs:         firstTokenMs,
+			ReasoningEffort:      reasoningEffort,
+			InboundEndpoint:      "/v1/responses",
+			UpstreamEndpoint:     "/v1/responses",
+			Stream:               isStream,
+			ServiceTier:          usageTiers.ServiceTier,
+			RequestedServiceTier: usageTiers.RequestedServiceTier,
+			ActualServiceTier:    usageTiers.ActualServiceTier,
+			BillingServiceTier:   usageTiers.BillingServiceTier,
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
@@ -2488,10 +2572,14 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 
+	supportedModels := h.supportedModelIDs(c.Request.Context())
+	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	c.Set("raw_body", rawBody)
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
-	rules := api.ResponsesAPIValidationRulesForModel(gjson.GetBytes(rawBody, "model").String())
-	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
+	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
+	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -2505,7 +2593,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 
-	model := gjson.GetBytes(rawBody, "model").String()
+	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	logModel := requestModel
+	if logModel == "" {
+		logModel = model
+	}
 	if err := security.ValidateModelName(model); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": gin.H{"message": "model 参数无效", "type": "invalid_request_error"},
@@ -2535,7 +2627,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
-		c.Set("x-service-tier", serviceTier)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
 
 	// compact 强制非流式
@@ -2548,6 +2640,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
+	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
 		return
 	}
@@ -2651,24 +2744,29 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
-			logUpstreamError("/v1/responses/compact", resp.StatusCode, model, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", model, errBody)
+			logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          "/v1/responses/compact",
-				Model:             model,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				ReasoningEffort:   reasoningEffort,
-				InboundEndpoint:   "/v1/responses/compact",
-				UpstreamEndpoint:  "/v1/responses/compact",
-				ServiceTier:       serviceTier,
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses/compact",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				StatusCode:           resp.StatusCode,
+				DurationMs:           durationMs,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/responses/compact",
+				UpstreamEndpoint:     "/v1/responses/compact",
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
+				IsRetryAttempt:       shouldRetry,
+				AttemptIndex:         attempt + 1,
+				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -2696,28 +2794,30 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		cachedTokens := int(gjson.GetBytes(respBody, "usage.input_tokens_details.cached_tokens").Int())
 
 		actualServiceTier := gjson.GetBytes(respBody, "service_tier").String()
-		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
-		billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
+		usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
 
 		totalDuration := int(time.Since(start).Milliseconds())
 		h.logUsageForRequest(c, &database.UsageLogInput{
-			AccountID:          account.ID(),
-			Endpoint:           "/v1/responses/compact",
-			Model:              model,
-			StatusCode:         http.StatusOK,
-			DurationMs:         totalDuration,
-			PromptTokens:       promptTokens,
-			CompletionTokens:   completionTokens,
-			TotalTokens:        totalTokens,
-			InputTokens:        promptTokens,
-			OutputTokens:       completionTokens,
-			ReasoningTokens:    reasoningTokens,
-			CachedTokens:       cachedTokens,
-			ReasoningEffort:    reasoningEffort,
-			InboundEndpoint:    "/v1/responses/compact",
-			UpstreamEndpoint:   "/v1/responses/compact",
-			ServiceTier:        resolvedServiceTier,
-			BillingServiceTier: billingServiceTier,
+			AccountID:            account.ID(),
+			Endpoint:             "/v1/responses/compact",
+			Model:                logModel,
+			EffectiveModel:       logEffectiveModel,
+			StatusCode:           http.StatusOK,
+			DurationMs:           totalDuration,
+			PromptTokens:         promptTokens,
+			CompletionTokens:     completionTokens,
+			TotalTokens:          totalTokens,
+			InputTokens:          promptTokens,
+			OutputTokens:         completionTokens,
+			ReasoningTokens:      reasoningTokens,
+			CachedTokens:         cachedTokens,
+			ReasoningEffort:      reasoningEffort,
+			InboundEndpoint:      "/v1/responses/compact",
+			UpstreamEndpoint:     "/v1/responses/compact",
+			ServiceTier:          usageTiers.ServiceTier,
+			RequestedServiceTier: usageTiers.RequestedServiceTier,
+			ActualServiceTier:    usageTiers.ActualServiceTier,
+			BillingServiceTier:   usageTiers.BillingServiceTier,
 		})
 
 		h.store.Release(account)
@@ -2740,10 +2840,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		Message: fmt.Sprintf("body_bytes=%d stream=%t", len(rawBody), trace.Stream),
 	})
 
+	supportedModels := h.supportedModelIDs(c.Request.Context())
+	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ChatCompletionValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
+	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -2758,9 +2861,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
-	model := gjson.GetBytes(rawBody, "model").String()
+	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	if mappedModel != "" {
+		model = mappedModel
+	}
+	logModel := requestModel
+	if logModel == "" {
+		logModel = model
+	}
+	responseModel := logModel
 	if model == "" {
 		model = "gpt-5.4"
+		logModel = model
+		responseModel = model
 	}
 	if isImageOnlyModel(model) {
 		sendImageOnlyModelError(c, model)
@@ -2782,7 +2895,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
-		c.Set("x-service-tier", serviceTier)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
 
 	// 2. 翻译请求：OpenAI Chat → Codex Responses
@@ -2794,6 +2907,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	trace.EffectiveModel = effectiveModel
 	h.traceRequestEvent(c, trace, "request_validated", requestTraceFields{EffectiveModel: effectiveModel})
+	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
 		return
 	}
@@ -2997,8 +3111,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			retryExclusions.MarkHard(account.ID())
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
-			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", model, errBody)
+			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			errorKind := upstreamErrorKind(resp.StatusCode, errBody, decision)
@@ -3010,21 +3124,26 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				EffectiveModel: effectiveModel,
 				Message:        usageLogErrorMessage(resp.StatusCode, errBody),
 			})
+			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          "/v1/chat/completions",
-				Model:             model,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				ReasoningEffort:   reasoningEffort,
-				InboundEndpoint:   "/v1/chat/completions",
-				UpstreamEndpoint:  "/v1/responses",
-				Stream:            isStream,
-				ServiceTier:       serviceTier,
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: errorKind,
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/chat/completions",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				StatusCode:           resp.StatusCode,
+				DurationMs:           durationMs,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/chat/completions",
+				UpstreamEndpoint:     "/v1/responses",
+				Stream:               isStream,
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
+				IsRetryAttempt:       shouldRetry,
+				AttemptIndex:         attempt + 1,
+				UpstreamErrorKind:    errorKind,
+				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -3059,7 +3178,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
-		c.Set("x-model", model)
+		c.Set("x-model", logModel)
 		c.Set("x-reasoning-effort", reasoningEffort)
 		var firstTokenMs int
 		var usage *UsageInfo
@@ -3079,7 +3198,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		created := time.Now().Unix()
 
 		if isStream {
-			streamTranslator := NewStreamTranslator(chunkID, model, created)
+			streamTranslator := NewStreamTranslator(chunkID, responseModel, created)
 			c.Header("Content-Type", "text/event-stream")
 			c.Header("Cache-Control", "no-cache")
 			c.Header("Connection", "keep-alive")
@@ -3295,7 +3414,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return true
 			})
 
-			compactResult = BuildCompactResponse(chunkID, model, created, fullContent.String(), fullReasoning.String(), toolCalls, usage)
+			compactResult = BuildCompactResponse(chunkID, responseModel, created, fullContent.String(), fullReasoning.String(), toolCalls, usage)
 		}
 
 		// 断流检测 + token 估算
@@ -3369,23 +3488,25 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 		}
 
-		resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
-		billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
-		c.Set("x-service-tier", resolvedServiceTier)
+		usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
+		c.Set("x-service-tier", usageTiers.ServiceTier)
 
 		logInput := &database.UsageLogInput{
-			AccountID:          account.ID(),
-			Endpoint:           "/v1/chat/completions",
-			Model:              model,
-			StatusCode:         logStatusCode,
-			DurationMs:         totalDuration,
-			FirstTokenMs:       firstTokenMs,
-			ReasoningEffort:    reasoningEffort,
-			InboundEndpoint:    "/v1/chat/completions",
-			UpstreamEndpoint:   "/v1/responses",
-			Stream:             isStream,
-			ServiceTier:        resolvedServiceTier,
-			BillingServiceTier: billingServiceTier,
+			AccountID:            account.ID(),
+			Endpoint:             "/v1/chat/completions",
+			Model:                logModel,
+			EffectiveModel:       logEffectiveModel,
+			StatusCode:           logStatusCode,
+			DurationMs:           totalDuration,
+			FirstTokenMs:         firstTokenMs,
+			ReasoningEffort:      reasoningEffort,
+			InboundEndpoint:      "/v1/chat/completions",
+			UpstreamEndpoint:     "/v1/responses",
+			Stream:               isStream,
+			ServiceTier:          usageTiers.ServiceTier,
+			RequestedServiceTier: usageTiers.RequestedServiceTier,
+			ActualServiceTier:    usageTiers.ActualServiceTier,
+			BillingServiceTier:   usageTiers.BillingServiceTier,
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))

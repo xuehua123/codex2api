@@ -128,9 +128,20 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
 	}
 
+	supportedModels := h.supportedModelIDs(c.Request.Context())
+	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	c.Set("raw_body", rawBody)
+	if mappedModel != "" {
+		model = mappedModel
+	}
+	logModel := requestModel
+	if logModel == "" {
+		logModel = model
+	}
+
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(model)
-	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
+	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
 	if result := validator.ValidateRequest(rules); !result.Valid {
 		apiErr = validator.ToAPIError()
 		_ = writeResponsesWSError(conn, apiErr)
@@ -164,7 +175,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
-		c.Set("x-service-tier", serviceTier)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
 
 	codexBody, expandedInputRaw := PrepareResponsesWebSocketBody(rawBody)
@@ -174,6 +185,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, err)
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
+	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if status, msg := h.enforceAPIKeyLimits(c, effectiveModel); status != 0 {
 		errType := api.ErrorTypeRateLimit
 		errCode := api.ErrCodeRateLimitReached
@@ -295,25 +307,30 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("Responses WebSocket upstream returned error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
-			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
+			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          "/v1/responses",
-				Model:             model,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				ReasoningEffort:   reasoningEffort,
-				InboundEndpoint:   "/v1/responses",
-				UpstreamEndpoint:  "/v1/responses",
-				Stream:            true,
-				ServiceTier:       serviceTier,
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				StatusCode:           resp.StatusCode,
+				DurationMs:           durationMs,
+				ReasoningEffort:      reasoningEffort,
+				InboundEndpoint:      "/v1/responses",
+				UpstreamEndpoint:     "/v1/responses",
+				Stream:               true,
+				ServiceTier:          usageTiers.ServiceTier,
+				RequestedServiceTier: usageTiers.RequestedServiceTier,
+				ActualServiceTier:    usageTiers.ActualServiceTier,
+				BillingServiceTier:   usageTiers.BillingServiceTier,
+				IsRetryAttempt:       shouldRetry,
+				AttemptIndex:         attempt + 1,
+				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -327,7 +344,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, apiErr.Message, apiErr)
 		}
 
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, model, effectiveModel, reasoningEffort, serviceTier, expandedInputRaw, start); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, expandedInputRaw, start); err != nil {
 			if errors.Is(err, errResponsesWSClientGone) {
 				return err
 			}
@@ -349,6 +366,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	affinityKey string,
 	model string,
 	effectiveModel string,
+	logEffectiveModel string,
 	reasoningEffort string,
 	serviceTier string,
 	expandedInputRaw string,
@@ -427,22 +445,24 @@ func (h *Handler) streamResponsesWSUpstream(
 		}
 	}
 
-	resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
-	billingServiceTier := resolveBillingServiceTier(actualServiceTier, serviceTier)
-	c.Set("x-service-tier", resolvedServiceTier)
+	usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
+	c.Set("x-service-tier", usageTiers.ServiceTier)
 	logInput := &database.UsageLogInput{
-		AccountID:          account.ID(),
-		Endpoint:           "/v1/responses",
-		Model:              model,
-		StatusCode:         outcome.logStatusCode,
-		DurationMs:         totalDuration,
-		FirstTokenMs:       firstTokenMs,
-		ReasoningEffort:    reasoningEffort,
-		InboundEndpoint:    "/v1/responses",
-		UpstreamEndpoint:   "/v1/responses",
-		Stream:             true,
-		ServiceTier:        resolvedServiceTier,
-		BillingServiceTier: billingServiceTier,
+		AccountID:            account.ID(),
+		Endpoint:             "/v1/responses",
+		Model:                model,
+		EffectiveModel:       logEffectiveModel,
+		StatusCode:           outcome.logStatusCode,
+		DurationMs:           totalDuration,
+		FirstTokenMs:         firstTokenMs,
+		ReasoningEffort:      reasoningEffort,
+		InboundEndpoint:      "/v1/responses",
+		UpstreamEndpoint:     "/v1/responses",
+		Stream:               true,
+		ServiceTier:          usageTiers.ServiceTier,
+		RequestedServiceTier: usageTiers.RequestedServiceTier,
+		ActualServiceTier:    usageTiers.ActualServiceTier,
+		BillingServiceTier:   usageTiers.BillingServiceTier,
 	}
 	if outcome.logStatusCode != http.StatusOK {
 		logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))

@@ -100,6 +100,7 @@ func main() {
 			StreamIdleTimeoutSeconds:         120,
 			StreamKeepaliveIntervalSeconds:   10,
 			FirstTokenTimeoutSeconds:         0,
+			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
 			AccountAlertConfig:               alerting.AccountPoolConfigToJSON(alerting.DefaultAccountPoolConfig()),
 		}
@@ -137,12 +138,16 @@ func main() {
 			StreamIdleTimeoutSeconds:         120,
 			StreamKeepaliveIntervalSeconds:   10,
 			FirstTokenTimeoutSeconds:         0,
+			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
 			AccountAlertConfig:               alerting.AccountPoolConfigToJSON(alerting.DefaultAccountPoolConfig()),
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
 			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
+	}
+	if envPolicy := strings.TrimSpace(os.Getenv("CODEX_BILLING_TIER_POLICY")); envPolicy != "" {
+		settings.BillingTierPolicy = proxy.NormalizeBillingTierPolicy(envPolicy)
 	}
 
 	// 4. 初始化缓存（使用数据库中保存的连接池大小）
@@ -184,7 +189,7 @@ func main() {
 	}
 	db.SetUsageLogConfig(settings.UsageLogMode, settings.UsageLogBatchSize, settings.UsageLogFlushIntervalSeconds)
 	runtimeSettings := proxy.ApplyRuntimeSettingsFromSystem(settings)
-	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms stream_idle=%ds keepalive=%ds first_token_timeout=%ds",
+	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms first_token_timeout=%ds billing_tier_policy=%s stream_idle=%ds keepalive=%ds",
 		runtimeSettings.ClientCompatMode,
 		runtimeSettings.CodexMinCLIVersion,
 		db.GetUsageLogMode(),
@@ -192,9 +197,10 @@ func main() {
 		db.GetUsageLogFlushIntervalSeconds(),
 		runtimeSettings.StreamFlushPolicy,
 		runtimeSettings.StreamFlushIntervalMS,
+		runtimeSettings.FirstTokenTimeoutSec,
+		runtimeSettings.BillingTierPolicy,
 		runtimeSettings.StreamIdleTimeoutSeconds,
 		runtimeSettings.StreamKeepaliveIntervalSeconds,
-		runtimeSettings.FirstTokenTimeoutSec,
 	)
 
 	// 4b'. 应用图片存储后端配置

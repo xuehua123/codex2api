@@ -858,6 +858,9 @@ name = "OpenAI"
 base_url = "${baseUrl}"
 wire_api = "responses"
 requires_openai_auth = true
+
+[features]
+goals = true
 \`\`\`
 
 \`~/.codex/auth.json\`：

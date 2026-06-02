@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.2.5 - 2026-06-02
+
+### Features
+
+- **Codex model registry and reasoning models (#165).** Added system-setting controls for upstream-synced base models and reasoning-effort variants so model list entries can be configured from the admin UI.
+- **Codex model redirect mapping (#189, #190).** Added a dedicated Codex model redirect map that can route downstream model names to another Codex model while preserving request reasoning effort.
+- **Account quota auto-pause controls.** Added 5h/7d usage-threshold auto-pause controls with global defaults, per-account disables, edit-account controls, and batch editing.
+- **Compact request visibility.** Usage logs now detect compact requests and show a compact badge alongside request model/reasoning information.
+- **Email domain account tags (#191).** Account management now derives email domains, supports domain filtering with banned/total stats, searches by domain, and lets users show or hide domain badges.
+- **Configuration examples.** Updated Codex config examples to cover the current model mapping and reasoning-effort setup.
+
+### Fixes
+
+- **Service-tier billing semantics (#183).** Split requested, actual, and billing service-tier handling so billing policy stays explicit when upstream reports a different actual tier.
+- **SQLite and admin billing stability (#185, #186).** Stabilized account billing window reads and SQLite access paths so large account pools do not turn simple admin/API-key queries into transient 503s.
+- **Account status and probe handling.** Unauthorized account errors are recorded more consistently, and batch account rendering has less unnecessary work at scale.
+- **Refresh token reuse handling.** Reused refresh tokens are now treated as non-retryable credential errors instead of entering avoidable retry paths.
+
 ## v2.2.4 - 2026-05-28
 
 ### Features

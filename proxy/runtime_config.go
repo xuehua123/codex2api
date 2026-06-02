@@ -16,6 +16,9 @@ const (
 	StreamFlushPolicyImmediate = "immediate"
 	StreamFlushPolicyCoalesce  = "coalesce"
 
+	BillingTierPolicyActual    = "actual"
+	BillingTierPolicyRequested = "requested"
+
 	defaultClientCompatMode      = ClientCompatModePreserve
 	defaultCodexMinCLIVersion    = "0.118.0"
 	defaultStreamFlushPolicy     = StreamFlushPolicyImmediate
@@ -29,6 +32,7 @@ const (
 	maxStreamKeepaliveIntervalSeconds     = 300
 	defaultFirstTokenTimeoutSec           = 0
 	maxFirstTokenTimeoutSec               = 600
+	defaultBillingTierPolicy              = BillingTierPolicyActual
 )
 
 type RuntimeSettings struct {
@@ -39,6 +43,7 @@ type RuntimeSettings struct {
 	StreamIdleTimeoutSeconds       int
 	StreamKeepaliveIntervalSeconds int
 	FirstTokenTimeoutSec           int
+	BillingTierPolicy              string
 }
 
 var runtimeSettings atomic.Value // stores RuntimeSettings
@@ -56,6 +61,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		StreamIdleTimeoutSeconds:       defaultStreamIdleTimeoutSeconds,
 		StreamKeepaliveIntervalSeconds: defaultStreamKeepaliveIntervalSeconds,
 		FirstTokenTimeoutSec:           defaultFirstTokenTimeoutSec,
+		BillingTierPolicy:              defaultBillingTierPolicy,
 	}
 }
 
@@ -83,10 +89,22 @@ func NormalizeStreamFlushPolicy(policy string) string {
 	}
 }
 
+func NormalizeBillingTierPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "", BillingTierPolicyActual:
+		return BillingTierPolicyActual
+	case BillingTierPolicyRequested:
+		return BillingTierPolicyRequested
+	default:
+		return BillingTierPolicyActual
+	}
+}
+
 func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	defaults := DefaultRuntimeSettings()
 	settings.ClientCompatMode = NormalizeClientCompatMode(settings.ClientCompatMode)
 	settings.StreamFlushPolicy = NormalizeStreamFlushPolicy(settings.StreamFlushPolicy)
+	settings.BillingTierPolicy = NormalizeBillingTierPolicy(settings.BillingTierPolicy)
 	if strings.TrimSpace(settings.CodexMinCLIVersion) == "" {
 		settings.CodexMinCLIVersion = defaults.CodexMinCLIVersion
 	} else {
@@ -129,6 +147,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.StreamIdleTimeoutSeconds = settings.StreamIdleTimeoutSeconds
 		next.StreamKeepaliveIntervalSeconds = settings.StreamKeepaliveIntervalSeconds
 		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
+		next.BillingTierPolicy = settings.BillingTierPolicy
 	}
 	next = NormalizeRuntimeSettings(next)
 	runtimeSettings.Store(next)

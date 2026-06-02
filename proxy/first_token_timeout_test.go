@@ -67,3 +67,15 @@ func TestApplyRuntimeSettingsFromSystemFirstTokenTimeout(t *testing.T) {
 		t.Fatalf("currentFirstTokenTimeout() = %s, want 42s", got)
 	}
 }
+
+func TestNormalizeBillingTierPolicy(t *testing.T) {
+	if got := NormalizeBillingTierPolicy(""); got != BillingTierPolicyActual {
+		t.Fatalf("empty policy = %q, want actual", got)
+	}
+	if got := NormalizeBillingTierPolicy("requested"); got != BillingTierPolicyRequested {
+		t.Fatalf("requested policy = %q, want requested", got)
+	}
+	if got := NormalizeBillingTierPolicy("invalid"); got != BillingTierPolicyActual {
+		t.Fatalf("invalid policy = %q, want actual", got)
+	}
+}

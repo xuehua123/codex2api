@@ -29,15 +29,25 @@ import { cn } from '@/lib/utils'
 import { ExternalLink, RefreshCw, Save, Send, Trash2, Upload, X } from 'lucide-react'
 
 type ModelMappingEntry = [string, string]
+const EMPTY_MODEL_MAPPING_ENTRIES: ModelMappingEntry[] = []
+type ReasoningEffortModelEntry = {
+  model: string
+  effort: string
+}
+const EMPTY_REASONING_EFFORT_MODEL_ENTRIES: ReasoningEffortModelEntry[] = []
+const REASONING_EFFORT_OPTIONS = ['low', 'medium', 'high', 'xhigh'].map((effort) => ({
+  label: effort,
+  value: effort,
+}))
 
 const getDefaultModelMappingEntries = (): ModelMappingEntry[] =>
   Object.entries(DEFAULT_CLAUDE_MODEL_MAP) as ModelMappingEntry[]
 
-const parseModelMappingEntries = (value: string): ModelMappingEntry[] => {
+const parseModelMappingEntries = (value: string, fallbackEntries: ModelMappingEntry[] = []): ModelMappingEntry[] => {
   try {
     const parsed = JSON.parse(value || '{}')
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return getDefaultModelMappingEntries()
+      return fallbackEntries
     }
 
     const entries = Object.entries(parsed).map(([key, model]) => [
@@ -45,10 +55,10 @@ const parseModelMappingEntries = (value: string): ModelMappingEntry[] => {
       typeof model === 'string' ? model : String(model ?? ''),
     ]) as ModelMappingEntry[]
 
-    // 如果数据库中为空，用默认值填充
-    return entries.length > 0 ? entries : getDefaultModelMappingEntries()
+    // 如果数据库中为空，按调用方提供的默认值填充
+    return entries.length > 0 ? entries : fallbackEntries
   } catch {
-    return getDefaultModelMappingEntries()
+    return fallbackEntries
   }
 }
 
@@ -62,16 +72,100 @@ const serializeModelMappingEntries = (entries: ModelMappingEntry[]) => {
   return JSON.stringify(obj)
 }
 
+const normalizeReasoningEffortValue = (effort: string) => {
+  const value = effort.trim().toLowerCase()
+  if (value === 'max') return 'xhigh'
+  return ['low', 'medium', 'high', 'xhigh'].includes(value) ? value : 'xhigh'
+}
+
+const parseReasoningEffortModelEntries = (value: string): ReasoningEffortModelEntry[] => {
+  try {
+    const parsed = JSON.parse(value || '[]')
+    if (!Array.isArray(parsed)) return EMPTY_REASONING_EFFORT_MODEL_ENTRIES
+    return parsed
+      .map((entry) => ({
+        model: typeof entry?.model === 'string' ? entry.model : '',
+        effort: normalizeReasoningEffortValue(typeof entry?.effort === 'string' ? entry.effort : 'xhigh'),
+      }))
+      .filter((entry) => entry.model.trim())
+  } catch {
+    return EMPTY_REASONING_EFFORT_MODEL_ENTRIES
+  }
+}
+
+const serializeReasoningEffortModelEntries = (entries: ReasoningEffortModelEntry[]) => {
+  const seen = new Set<string>()
+  const normalized: ReasoningEffortModelEntry[] = []
+  for (const entry of entries) {
+    const model = entry.model.trim()
+    const effort = normalizeReasoningEffortValue(entry.effort)
+    if (!model) continue
+    const key = `${model.toLowerCase()}(${effort})`
+    if (seen.has(key)) continue
+    seen.add(key)
+    normalized.push({ model, effort })
+  }
+  return JSON.stringify(normalized)
+}
+
+const reasoningEffortAlias = (entry: ReasoningEffortModelEntry) => {
+  const model = entry.model.trim()
+  const effort = normalizeReasoningEffortValue(entry.effort)
+  return model ? `${model}(${effort})` : ''
+}
+
 // 模型映射编辑器组件
-function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+function ModelMappingEditor({
+  value,
+  onChange,
+  fallbackEntries = EMPTY_MODEL_MAPPING_ENTRIES,
+  sourceOptions,
+  targetOptions,
+  sourceLabel,
+  targetLabel,
+  sourcePlaceholder,
+  targetPlaceholder,
+}: {
+  value: string
+  onChange: (v: string) => void
+  fallbackEntries?: ModelMappingEntry[]
+  sourceOptions?: Array<{ label: string; value: string }>
+  targetOptions?: Array<{ label: string; value: string }>
+  sourceLabel: string
+  targetLabel: string
+  sourcePlaceholder: string
+  targetPlaceholder: string
+}) {
   const { t } = useTranslation()
-  const [mappings, setMappings] = useState<ModelMappingEntry[]>(() => parseModelMappingEntries(value))
+  const [mappings, setMappings] = useState<ModelMappingEntry[]>(() => parseModelMappingEntries(value, fallbackEntries))
   const lastEmittedValueRef = useRef<string | null>(null)
+  const sourceSelectOptions = useMemo(() => {
+    if (!sourceOptions) return []
+    const byValue = new Map(sourceOptions.map((option) => [option.value, option]))
+    for (const [source] of mappings) {
+      const value = source.trim()
+      if (value && !byValue.has(value)) {
+        byValue.set(value, { label: value, value })
+      }
+    }
+    return [...byValue.values()]
+  }, [mappings, sourceOptions])
+  const targetSelectOptions = useMemo(() => {
+    if (!targetOptions) return []
+    const byValue = new Map(targetOptions.map((option) => [option.value, option]))
+    for (const [, target] of mappings) {
+      const value = target.trim()
+      if (value && !byValue.has(value)) {
+        byValue.set(value, { label: value, value })
+      }
+    }
+    return [...byValue.values()]
+  }, [mappings, targetOptions])
 
   useEffect(() => {
     if (value === lastEmittedValueRef.current) return
-    setMappings(parseModelMappingEntries(value))
-  }, [value])
+    setMappings(parseModelMappingEntries(value, fallbackEntries))
+  }, [fallbackEntries, value])
 
   const updateMappings = (entries: ModelMappingEntry[]) => {
     setMappings(entries)
@@ -93,31 +187,56 @@ function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: 
   }
 
   const handleAdd = () => {
-    updateMappings([...mappings, ['', '']])
+    const defaultSource = sourceOptions && targetOptions
+      ? sourceOptions[1]?.value ?? sourceOptions[0]?.value ?? ''
+      : sourceOptions?.[0]?.value ?? ''
+    updateMappings([...mappings, [defaultSource, targetOptions?.[0]?.value ?? '']])
   }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
       <div className="grid shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] gap-1.5 px-1 text-xs font-semibold text-muted-foreground">
-        <span>{t('settings2.anthropicModel')}</span>
-        <span>{t('settings2.codexModel')}</span>
+        <span>{sourceLabel}</span>
+        <span>{targetLabel}</span>
         <span />
       </div>
       <div className="min-h-[180px] flex-1 space-y-1.5 overflow-y-auto pr-1">
         {mappings.map(([k, v], i) => (
           <div key={i} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] items-center gap-1.5">
-            <Input
-              className="h-8 px-2 font-mono text-xs"
-              placeholder="claude-opus-4-6"
-              value={k}
-              onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
-            />
-            <Input
-              className="h-8 px-2 font-mono text-xs"
-              placeholder="gpt-5.5"
-              value={v}
-              onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
-            />
+            {sourceOptions ? (
+              <Select
+                compact
+                value={k.trim()}
+                options={sourceSelectOptions}
+                placeholder={sourcePlaceholder}
+                disabled={sourceSelectOptions.length === 0}
+                onValueChange={(next) => handleChange(i, 0, next)}
+              />
+            ) : (
+              <Input
+                className="h-8 px-2 font-mono text-xs"
+                placeholder={sourcePlaceholder}
+                value={k}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
+              />
+            )}
+            {targetOptions ? (
+              <Select
+                compact
+                value={v.trim()}
+                options={targetSelectOptions}
+                placeholder={targetPlaceholder}
+                disabled={targetSelectOptions.length === 0}
+                onValueChange={(next) => handleChange(i, 1, next)}
+              />
+            ) : (
+              <Input
+                className="h-8 px-2 font-mono text-xs"
+                placeholder={targetPlaceholder}
+                value={v}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
+              />
+            )}
             <button
               type="button"
               onClick={() => handleRemove(i)}
@@ -131,6 +250,106 @@ function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: 
       </div>
       <Button type="button" variant="outline" size="sm" className="self-start" onClick={handleAdd}>
         + {t('settings2.addMapping')}
+      </Button>
+    </div>
+  )
+}
+
+function ReasoningEffortModelsEditor({
+  value,
+  onChange,
+  baseModelOptions,
+}: {
+  value: string
+  onChange: (v: string) => void
+  baseModelOptions: Array<{ label: string; value: string }>
+}) {
+  const { t } = useTranslation()
+  const [entries, setEntries] = useState<ReasoningEffortModelEntry[]>(() => parseReasoningEffortModelEntries(value))
+  const lastEmittedValueRef = useRef<string | null>(null)
+  const modelOptions = useMemo(() => {
+    const byValue = new Map(baseModelOptions.map((option) => [option.value, option]))
+    for (const entry of entries) {
+      const model = entry.model.trim()
+      if (model && !byValue.has(model)) {
+        byValue.set(model, { label: model, value: model })
+      }
+    }
+    return [...byValue.values()]
+  }, [baseModelOptions, entries])
+
+  useEffect(() => {
+    if (value === lastEmittedValueRef.current) return
+    setEntries(parseReasoningEffortModelEntries(value))
+  }, [value])
+
+  const updateEntries = (nextEntries: ReasoningEffortModelEntry[]) => {
+    setEntries(nextEntries)
+    const serialized = serializeReasoningEffortModelEntries(nextEntries)
+    lastEmittedValueRef.current = serialized
+    onChange(serialized)
+  }
+
+  const handleChange = (index: number, patch: Partial<ReasoningEffortModelEntry>) => {
+    const next = entries.map((entry, i) => (i === index ? { ...entry, ...patch } : entry))
+    updateEntries(next)
+  }
+
+  const handleRemove = (index: number) => {
+    updateEntries(entries.filter((_, i) => i !== index))
+  }
+
+  const handleAdd = () => {
+    updateEntries([...entries, { model: baseModelOptions[0]?.value ?? 'gpt-5.5', effort: 'xhigh' }])
+  }
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      <div className="overflow-x-auto pb-1">
+        <div className="w-fit min-w-[32rem]">
+          <div className="grid shrink-0 grid-cols-[minmax(0,13rem)_8rem_max-content_2rem] gap-2 px-1 text-xs font-semibold text-muted-foreground">
+            <span>{t('settings2.baseModel')}</span>
+            <span>{t('settings2.reasoningEffort')}</span>
+            <span>{t('settings2.generatedModel')}</span>
+            <span />
+          </div>
+          <div className="mt-2 max-h-[220px] space-y-1.5 overflow-y-auto pr-1">
+            {entries.map((entry, i) => (
+              <div key={i} className="grid grid-cols-[minmax(0,13rem)_8rem_max-content_2rem] items-center gap-2">
+                <Select
+                  compact
+                  value={entry.model.trim()}
+                  options={modelOptions}
+                  placeholder={t('settings2.selectBaseModel')}
+                  disabled={modelOptions.length === 0}
+                  onValueChange={(model) => handleChange(i, { model })}
+                />
+                <Select
+                  compact
+                  value={normalizeReasoningEffortValue(entry.effort)}
+                  options={REASONING_EFFORT_OPTIONS}
+                  onValueChange={(effort) => handleChange(i, { effort })}
+                />
+                <div className="flex min-w-0">
+                  <Badge variant="secondary" className="max-w-full px-2 py-1 font-mono text-[11px]">
+                    <span className="truncate">{reasoningEffortAlias(entry) || '-'}</span>
+                  </Badge>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleRemove(i)}
+                  aria-label={t('common.delete')}
+                  className="flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-500/10"
+                >
+                  <Trash2 className="size-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <Button type="button" variant="outline" size="sm" className="self-start" onClick={handleAdd}>
+        + {t('settings2.addReasoningModel')}
       </Button>
     </div>
   )
@@ -354,6 +573,7 @@ async function compressSiteLogoFile(file: File, mimeType: string) {
 export default function Settings() {
   const { t } = useTranslation()
   const { applyBranding } = useBranding()
+  const defaultClaudeModelMappingEntries = useMemo(() => getDefaultModelMappingEntries(), [])
   const booleanOptions = [
     { label: t('common.disabled'), value: 'false' },
     { label: t('common.enabled'), value: 'true' },
@@ -432,6 +652,8 @@ export default function Settings() {
     cache_driver: 'redis',
     cache_label: 'Redis',
     model_mapping: '{}',
+    codex_model_mapping: '{}',
+    reasoning_effort_models: '[]',
     resin_url: '',
     resin_platform_name: '',
     prompt_filter_enabled: false,
@@ -453,6 +675,7 @@ export default function Settings() {
     stream_idle_timeout_seconds: 120,
     stream_keepalive_interval_seconds: 10,
     first_token_timeout_seconds: 0,
+    billing_tier_policy: 'actual',
     show_full_usage_numbers: false,
     image_storage_backend: 'local',
     image_s3_endpoint: '',
@@ -728,8 +951,21 @@ export default function Settings() {
       api_key_auth_available: id !== 'gpt-5.5',
     }))
   }, [modelItems, modelList])
+  const codexModelOptions = visibleModelItems
+    .filter((model) =>
+      model.enabled &&
+      !model.id.includes('(') &&
+      !model.id.includes(')')
+    )
+    .map((model) => ({ label: model.id, value: model.id }))
   const textModelOptions = visibleModelItems
-    .filter((model) => model.enabled && model.category !== 'image' && !model.id.includes('image'))
+    .filter((model) =>
+      model.enabled &&
+      model.category !== 'image' &&
+      !model.id.includes('image') &&
+      !model.id.includes('(') &&
+      !model.id.includes(')')
+    )
     .map((model) => ({ label: model.id, value: model.id }))
   const enabledModelCount = visibleModelItems.filter((model) => model.enabled).length
   const modelsLastSyncedLabel = modelsLastSyncedAt ? formatBeijingTime(modelsLastSyncedAt) : t('settings.modelsNeverSynced')
@@ -1595,7 +1831,11 @@ export default function Settings() {
                     <div key={model.id} className="flex h-fit flex-wrap items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1.5">
                       <span className="font-mono text-xs font-semibold text-foreground">{model.id}</span>
                       <Badge variant={model.source === 'official_codex_docs' ? 'default' : 'secondary'} className="text-[11px]">
-                        {model.source === 'official_codex_docs' ? t('settings.modelSourceOfficial') : t('settings.modelSourceBuiltin')}
+                        {model.source === 'official_codex_docs'
+                          ? t('settings.modelSourceOfficial')
+                          : model.source === 'reasoning_effort'
+                            ? t('settings.modelSourceReasoning')
+                            : t('settings.modelSourceBuiltin')}
                       </Badge>
                       {model.pro_only ? <Badge variant="outline" className="text-[11px]">{t('settings.modelProOnly')}</Badge> : null}
                       {model.category === 'image' ? <Badge variant="outline" className="text-[11px]">{t('settings.modelImage')}</Badge> : null}
@@ -1606,14 +1846,50 @@ export default function Settings() {
             </SettingsCard>
 
             <SettingsCard
-              title={t('settings2.modelMapping')}
-              description={t('settings2.modelMappingDesc')}
+              title={t('settings2.anthropicModelMapping')}
+              description={t('settings2.anthropicModelMappingDesc')}
               className="h-full xl:h-[430px]"
               contentClassName="flex h-full min-h-0 flex-col"
             >
               <ModelMappingEditor
                 value={settingsForm.model_mapping}
                 onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
+                fallbackEntries={defaultClaudeModelMappingEntries}
+                sourceLabel={t('settings2.anthropicModel')}
+                targetLabel={t('settings2.codexModel')}
+                sourcePlaceholder="claude-opus-4-6"
+                targetPlaceholder="gpt-5.5"
+              />
+            </SettingsCard>
+
+            <SettingsCard
+              title={t('settings2.codexModelMapping')}
+              description={t('settings2.codexModelMappingDesc')}
+              className="h-full xl:h-[430px]"
+              contentClassName="flex h-full min-h-0 flex-col"
+            >
+              <ModelMappingEditor
+                value={settingsForm.codex_model_mapping}
+                onChange={(v) => setSettingsForm(f => ({ ...f, codex_model_mapping: v }))}
+                sourceOptions={codexModelOptions}
+                targetOptions={codexModelOptions}
+                sourceLabel={t('settings2.requestedModel')}
+                targetLabel={t('settings2.targetModel')}
+                sourcePlaceholder="gpt-5.2"
+                targetPlaceholder="gpt-5.5"
+              />
+            </SettingsCard>
+
+            <SettingsCard
+              title={t('settings2.reasoningEffortModels')}
+              description={t('settings2.reasoningEffortModelsDesc')}
+              className="h-full xl:h-[430px]"
+              contentClassName="flex h-full min-h-0 flex-col"
+            >
+              <ReasoningEffortModelsEditor
+                value={settingsForm.reasoning_effort_models}
+                onChange={(v) => setSettingsForm(f => ({ ...f, reasoning_effort_models: v }))}
+                baseModelOptions={textModelOptions}
               />
             </SettingsCard>
           </div>

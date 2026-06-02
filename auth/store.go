@@ -75,6 +75,10 @@ type Account struct {
 	UsageUpdatedAt        time.Time
 	usageProbeInFlight    bool
 	recoveryProbeInFlight bool
+	AutoPause5hThreshold  float64 // 0..1, 0 = disabled
+	AutoPause7dThreshold  float64 // 0..1, 0 = disabled
+	AutoPause5hDisabled   bool
+	AutoPause7dDisabled   bool
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -768,6 +772,9 @@ func (a *Account) dispatchBonusEligibleLocked(now time.Time, tier AccountHealthT
 	if a.usageExhaustedLocked() {
 		return false
 	}
+	if a.quotaAutoPausedLocked(now) {
+		return false
+	}
 	if !a.hasDispatchCredentialLocked() {
 		return false
 	}
@@ -911,11 +918,43 @@ func (a *Account) IsAvailable() bool {
 	if a.premium5hRateLimitedLocked(time.Now()) {
 		return false
 	}
+	now := time.Now()
+	if a.quotaAutoPausedLocked(now) {
+		return false
+	}
 	// 冷却期过了自动恢复
-	if a.Status == StatusCooldown && !time.Now().Before(a.CooldownUtil) {
+	if a.Status == StatusCooldown && !now.Before(a.CooldownUtil) {
 		return a.hasDispatchCredentialLocked()
 	}
 	return a.hasDispatchCredentialLocked()
+}
+
+func normalizeQuotaAutoPauseThreshold(value float64) float64 {
+	switch {
+	case value <= 0:
+		return 0
+	case value > 1:
+		return 1
+	default:
+		return value
+	}
+}
+
+func quotaAutoPausedByWindow(usage float64, valid bool, resetAt time.Time, threshold float64, disabled bool, now time.Time) bool {
+	if disabled || threshold <= 0 || !valid {
+		return false
+	}
+	if !resetAt.IsZero() && !now.Before(resetAt) {
+		return false
+	}
+	return usage/100 >= threshold
+}
+
+func (a *Account) quotaAutoPausedLocked(now time.Time) bool {
+	if quotaAutoPausedByWindow(a.UsagePercent5h, a.UsagePercent5hValid, a.Reset5hAt, a.AutoPause5hThreshold, a.AutoPause5hDisabled, now) {
+		return true
+	}
+	return quotaAutoPausedByWindow(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, a.AutoPause7dThreshold, a.AutoPause7dDisabled, now)
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -1546,13 +1585,15 @@ type Store struct {
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
 
-	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
-	modelMapping         atomic.Value // 模型映射 JSON 字符串
-	schedulerMode        atomic.Value // string: "round_robin" or "remaining_quota"
-	affinityMode         atomic.Value // string: "bounded" / "off" / "strict"
-	promptFilterConfig   atomic.Value // promptfilter.Config
-	sessionMu            sync.RWMutex
-	sessionBindings      map[string]sessionAffinity
+	allowRemoteMigration  atomic.Bool  // 是否允许远程迁移拉取账号
+	modelMapping          atomic.Value // 模型映射 JSON 字符串
+	codexModelMapping     atomic.Value // Codex 模型映射 JSON 字符串
+	reasoningEffortModels atomic.Value // 带思考强度的模型别名 JSON 数组
+	schedulerMode         atomic.Value // string: "round_robin" or "remaining_quota"
+	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
+	promptFilterConfig    atomic.Value // promptfilter.Config
+	sessionMu             sync.RWMutex
+	sessionBindings       map[string]sessionAffinity
 
 	// Negative cache for runtime model-cooldown misses. The dispatch hot path can
 	// scan many accounts under load; caching misses prevents repeated Redis GETs
@@ -2012,6 +2053,12 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.SetAffinityMode(settings.AffinityMode)
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
+	}
+	if settings.CodexModelMapping != "" {
+		s.codexModelMapping.Store(settings.CodexModelMapping)
+	}
+	if settings.ReasoningEffortModels != "" {
+		s.reasoningEffortModels.Store(settings.ReasoningEffortModels)
 	}
 	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
 	// 环境变量优先，否则读数据库设置
@@ -2545,6 +2592,14 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 				account.SetUsageSnapshot5h(parsed, resetAt)
 			}
 		}
+		if threshold, ok := row.GetCredentialFloat64("auto_pause_5h_threshold"); ok {
+			account.AutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(threshold)
+		}
+		if threshold, ok := row.GetCredentialFloat64("auto_pause_7d_threshold"); ok {
+			account.AutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(threshold)
+		}
+		account.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
+		account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 		for _, cooldown := range modelCooldowns[row.ID] {
 			account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
 		}
@@ -2734,7 +2789,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		for attempts := 0; attempts < 16; attempts++ {
 			acc := scheduler.AcquireExcludingWithFilter(apiKeyID, exclude, filter)
 			if acc == nil {
-				return nil
+				break
 			}
 			if s.accountHasCachedCooldown(acc) {
 				scheduler.Release(acc)
@@ -2742,7 +2797,6 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 			}
 			return acc
 		}
-		return nil
 	}
 
 	for attempts := 0; attempts < 16; attempts++ {
@@ -2826,6 +2880,9 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 		return false
 	}
 	if acc.premium5hRateLimitedLocked(now) {
+		return false
+	}
+	if acc.quotaAutoPausedLocked(now) {
 		return false
 	}
 	if acc.isOpenAIResponsesAPILocked() {
@@ -3451,6 +3508,32 @@ func (s *Store) GetModelMapping() string {
 	return "{}"
 }
 
+// SetCodexModelMapping 动态更新 Codex 模型映射 JSON
+func (s *Store) SetCodexModelMapping(mapping string) {
+	s.codexModelMapping.Store(mapping)
+}
+
+// GetCodexModelMapping 获取当前 Codex 模型映射 JSON
+func (s *Store) GetCodexModelMapping() string {
+	if v, ok := s.codexModelMapping.Load().(string); ok && v != "" {
+		return v
+	}
+	return "{}"
+}
+
+// SetReasoningEffortModels 动态更新带思考强度的模型别名 JSON 数组。
+func (s *Store) SetReasoningEffortModels(value string) {
+	s.reasoningEffortModels.Store(value)
+}
+
+// GetReasoningEffortModels 获取当前带思考强度的模型别名 JSON 数组。
+func (s *Store) GetReasoningEffortModels() string {
+	if v, ok := s.reasoningEffortModels.Load().(string); ok && v != "" {
+		return v
+	}
+	return "[]"
+}
+
 // GetSchedulerMode 获取当前调度模式
 func (s *Store) GetSchedulerMode() string {
 	if v, ok := s.schedulerMode.Load().(string); ok {
@@ -3599,6 +3682,31 @@ func (s *Store) ApplyAccountAllowedAPIKeys(dbID int64, allowedAPIKeyIDs []int64)
 
 	acc.mu.Lock()
 	acc.setAllowedAPIKeyIDsLocked(allowedAPIKeyIDs)
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
+func (s *Store) ApplyAccountQuotaAutoPauseConfig(dbID int64, threshold5h, threshold7d *float64, disabled5h, disabled7d *bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	if threshold5h != nil {
+		acc.AutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(*threshold5h)
+	}
+	if threshold7d != nil {
+		acc.AutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(*threshold7d)
+	}
+	if disabled5h != nil {
+		acc.AutoPause5hDisabled = *disabled5h
+	}
+	if disabled7d != nil {
+		acc.AutoPause7dDisabled = *disabled7d
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	return true

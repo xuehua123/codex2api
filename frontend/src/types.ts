@@ -27,6 +27,7 @@ export interface AccountRow {
   id: number
   name: string
   email: string
+  email_domain?: string
   plan_type: string
   subscription_expires_at?: string
   status: AccountStatus
@@ -78,6 +79,10 @@ export interface AccountRow {
   rate_limit_attempts?: number
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
+  auto_pause_5h_threshold?: number | null
+  auto_pause_7d_threshold?: number | null
+  auto_pause_5h_disabled?: boolean
+  auto_pause_7d_disabled?: boolean
   usage_5h_detail?: AccountUsageWindow
   usage_7d_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
@@ -154,6 +159,10 @@ export interface UpdateAccountSchedulerRequest {
   proxy_url?: string | null
   tags?: string[] | null
   group_ids?: number[] | null
+  auto_pause_5h_threshold?: number | null
+  auto_pause_7d_threshold?: number | null
+  auto_pause_5h_disabled?: boolean
+  auto_pause_7d_disabled?: boolean
 }
 
 export interface AccountGroup {
@@ -539,6 +548,8 @@ export interface SystemSettings {
   cache_label: string
   expired_cleaned?: number
   model_mapping: string
+  codex_model_mapping: string
+  reasoning_effort_models: string
   resin_url: string
   resin_platform_name: string
   prompt_filter_enabled: boolean
@@ -560,6 +571,7 @@ export interface SystemSettings {
   stream_idle_timeout_seconds: number
   stream_keepalive_interval_seconds: number
   first_token_timeout_seconds: number
+  billing_tier_policy: 'actual' | 'requested' | string
   show_full_usage_numbers: boolean
   image_storage_backend: 'local' | 's3' | string
   image_s3_endpoint: string
@@ -820,8 +832,12 @@ export interface UsageLog {
   inbound_endpoint: string
   upstream_endpoint: string
   stream: boolean
+  compact: boolean
   cached_tokens: number
   service_tier: string
+  requested_service_tier: string
+  actual_service_tier: string
+  billing_service_tier: string
   api_key_id: number
   api_key_name: string
   api_key_masked: string

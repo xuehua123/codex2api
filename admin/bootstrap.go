@@ -365,6 +365,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		StreamKeepaliveIntervalSeconds:   10,
 		AccountAlertConfig:               alerting.AccountPoolConfigToJSON(alerting.DefaultAccountPoolConfig()),
 		FirstTokenTimeoutSeconds:         0,
+		BillingTierPolicy:                proxy.BillingTierPolicyActual,
 		AffinityMode:                     "bounded",
 	}
 }
