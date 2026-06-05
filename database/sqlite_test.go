@@ -842,6 +842,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		AffinityMode:                     "bounded",
 		BackgroundConfig:                 "{}",
 		ShowFullUsageNumbers:             true,
+		CodexWSHideUpstreamErrors:        true,
+		CodexWSSilentRetryEnabled:        true,
+		CodexWSSilentMaxRetries:          4,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -867,6 +870,15 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.ReasoningEffortModels != `[{"model":"gpt-5.5","effort":"xhigh"}]` {
 		t.Fatalf("ReasoningEffortModels = %q, want gpt-5.5 xhigh entry", settings.ReasoningEffortModels)
+	}
+	if !settings.CodexWSHideUpstreamErrors {
+		t.Fatal("CodexWSHideUpstreamErrors = false, want true")
+	}
+	if !settings.CodexWSSilentRetryEnabled {
+		t.Fatal("CodexWSSilentRetryEnabled = false, want true")
+	}
+	if settings.CodexWSSilentMaxRetries != 4 {
+		t.Fatalf("CodexWSSilentMaxRetries = %d, want 4", settings.CodexWSSilentMaxRetries)
 	}
 }
 

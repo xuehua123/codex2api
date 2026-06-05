@@ -626,10 +626,11 @@ export default function Settings() {
     global_rpm: 0,
     test_model: '',
     test_concurrency: 50,
-    background_refresh_interval_minutes: 2,
-    usage_probe_max_age_minutes: 10,
-    usage_probe_concurrency: 16,
-    recovery_probe_interval_minutes: 30,
+	    background_refresh_interval_minutes: 2,
+	    usage_probe_max_age_minutes: 10,
+	    usage_probe_concurrency: 16,
+	    usage_probe_responses_fallback_enabled: true,
+	    recovery_probe_interval_minutes: 30,
     lazy_mode: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
@@ -645,6 +646,9 @@ export default function Settings() {
     codex_force_websocket: false,
     codex_ws_keepalive_enabled: false,
     codex_ws_keepalive_interval_sec: 60,
+    codex_ws_hide_upstream_errors: true,
+    codex_ws_silent_retry_enabled: true,
+    codex_ws_silent_max_retries: 2,
     scheduler_mode: 'round_robin',
     affinity_mode: 'bounded',
     max_retries: 2,
@@ -1183,18 +1187,16 @@ export default function Settings() {
                     type="number"
                     min={1}
                     max={1440}
-                    value={lazyModeActive ? 0 : settingsForm.background_refresh_interval_minutes}
-                    disabled={lazyModeActive}
+                    value={settingsForm.background_refresh_interval_minutes}
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_refresh_interval_minutes: parseInt(e.target.value) || 1 }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.usageProbeMaxAge')} description={t('settings.usageProbeMaxAgeDesc')}>
                   <Input
-                    type={lazyModeActive ? 'text' : 'number'}
+                    type="number"
                     min={1}
                     max={10080}
-                    value={lazyModeActive ? '∞' : settingsForm.usage_probe_max_age_minutes}
-                    disabled={lazyModeActive}
+                    value={settingsForm.usage_probe_max_age_minutes}
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: parseInt(e.target.value) || 1 }))}
                   />
                 </SettingField>
@@ -1204,8 +1206,14 @@ export default function Settings() {
                     min={1}
                     max={128}
                     value={settingsForm.usage_probe_concurrency}
-                    disabled={lazyModeActive}
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_concurrency: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.usageProbeResponsesFallback')} description={t('settings.usageProbeResponsesFallbackDesc')}>
+                  <Select
+                    value={settingsForm.usage_probe_responses_fallback_enabled ? 'true' : 'false'}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, usage_probe_responses_fallback_enabled: value === 'true' }))}
+                    options={booleanOptions}
                   />
                 </SettingField>
                 <SettingField label={t('settings.recoveryProbeInterval')} description={t('settings.recoveryProbeIntervalDesc')}>
@@ -1294,6 +1302,29 @@ export default function Settings() {
                   max={600}
                   value={settingsForm.codex_ws_keepalive_interval_sec}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_ws_keepalive_interval_sec: parseInt(e.target.value) || 60 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexWSHideUpstreamErrors')} description={t('settings.codexWSHideUpstreamErrorsDesc')}>
+                <Select
+                  value={settingsForm.codex_ws_hide_upstream_errors ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, codex_ws_hide_upstream_errors: value === 'true' }))}
+                  options={booleanOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexWSSilentRetryEnabled')} description={t('settings.codexWSSilentRetryEnabledDesc')}>
+                <Select
+                  value={settingsForm.codex_ws_silent_retry_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, codex_ws_silent_retry_enabled: value === 'true' }))}
+                  options={booleanOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexWSSilentMaxRetries')} description={t('settings.codexWSSilentMaxRetriesDesc')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={10}
+                  value={settingsForm.codex_ws_silent_max_retries}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_ws_silent_max_retries: parseInt(e.target.value) || 0 }))}
                 />
               </SettingField>
             </div>

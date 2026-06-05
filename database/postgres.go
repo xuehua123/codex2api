@@ -706,10 +706,11 @@ func (db *DB) migrate(ctx context.Context) error {
 			redis_pool_size    INT DEFAULT 30,
 			auto_clean_unauthorized BOOLEAN DEFAULT FALSE,
 			auto_clean_rate_limited BOOLEAN DEFAULT FALSE,
-			background_refresh_interval_minutes INT DEFAULT 2,
-			usage_probe_max_age_minutes INT DEFAULT 10,
-			usage_probe_concurrency INT DEFAULT 16,
-			recovery_probe_interval_minutes INT DEFAULT 30,
+				background_refresh_interval_minutes INT DEFAULT 2,
+				usage_probe_max_age_minutes INT DEFAULT 10,
+				usage_probe_concurrency INT DEFAULT 16,
+				usage_probe_responses_fallback_enabled BOOLEAN DEFAULT TRUE,
+				recovery_probe_interval_minutes INT DEFAULT 30,
 			scheduler_mode VARCHAR(20) DEFAULT 'round_robin'
 		);
 	CREATE TABLE IF NOT EXISTS account_model_cooldowns (
@@ -744,6 +745,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_refresh_interval_minutes INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_max_age_minutes INT DEFAULT 10;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_concurrency INT DEFAULT 16;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_responses_fallback_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_mode VARCHAR(20) DEFAULT 'round_robin';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS affinity_mode VARCHAR(16) DEFAULT 'bounded';
@@ -775,6 +777,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_force_websocket BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_interval_sec INT DEFAULT 60;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_hide_upstream_errors BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_silent_retry_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_silent_max_retries INT DEFAULT 2;
 
 			CREATE TABLE IF NOT EXISTS prompt_filter_logs (
 				id               SERIAL PRIMARY KEY,
@@ -1264,65 +1269,69 @@ func NormalizeSiteName(value string) string {
 
 // SystemSettings 运行时设置项
 type SystemSettings struct {
-	SiteName                         string
-	SiteLogo                         string
-	BackgroundConfig                 string // JSON: {"image":"...","opacity":18,"blur":0}
-	MaxConcurrency                   int
-	GlobalRPM                        int
-	TestModel                        string
-	TestConcurrency                  int
-	ProxyURL                         string
-	PgMaxConns                       int
-	RedisPoolSize                    int
-	AutoCleanUnauthorized            bool
-	AutoCleanRateLimited             bool
-	AdminSecret                      string
-	AutoCleanFullUsage               bool
-	AutoCleanError                   bool
-	AutoCleanExpired                 bool
-	LazyMode                         bool
-	ProxyPoolEnabled                 bool
-	FastSchedulerEnabled             bool
-	MaxRetries                       int
-	MaxRateLimitRetries              int
-	AllowRemoteMigration             bool
-	ModelMapping                     string // JSON: {"anthropic_model": "codex_model", ...}
-	CodexModelMapping                string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
-	ReasoningEffortModels            string // JSON: [{"model":"gpt-5.5","effort":"xhigh"}, ...]
-	BackgroundRefreshIntervalMinutes int
-	UsageProbeMaxAgeMinutes          int
-	UsageProbeConcurrency            int
-	RecoveryProbeIntervalMinutes     int
-	SchedulerMode                    string
-	AffinityMode                     string // session 粘性模式: bounded / off / strict
-	ResinURL                         string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
-	ResinPlatformName                string // Resin 平台标识，例如 codex2api
-	PromptFilterEnabled              bool
-	PromptFilterMode                 string
-	PromptFilterThreshold            int
-	PromptFilterStrictThreshold      int
-	PromptFilterLogMatches           bool
-	PromptFilterMaxTextLength        int
-	PromptFilterSensitiveWords       string
-	PromptFilterCustomPatterns       string
-	PromptFilterDisabledPatterns     string
-	ClientCompatMode                 string
-	CodexMinCLIVersion               string
-	UsageLogMode                     string
-	UsageLogBatchSize                int
-	UsageLogFlushIntervalSeconds     int
-	StreamFlushPolicy                string
-	StreamFlushIntervalMS            int
-	StreamIdleTimeoutSeconds         int
-	StreamKeepaliveIntervalSeconds   int
-	FirstTokenTimeoutSeconds         int
-	BillingTierPolicy                string
-	ImageStorageConfig               string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
-	AccountAlertConfig               string // JSON: 企业微信账号池告警配置
-	ShowFullUsageNumbers             bool
-	CodexForceWebsocket              bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
-	CodexWSKeepaliveEnabled          bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
-	CodexWSKeepaliveIntervalSec      int  // WS 保活 Ping 间隔（秒），默认 60
+	SiteName                           string
+	SiteLogo                           string
+	BackgroundConfig                   string // JSON: {"image":"...","opacity":18,"blur":0}
+	MaxConcurrency                     int
+	GlobalRPM                          int
+	TestModel                          string
+	TestConcurrency                    int
+	ProxyURL                           string
+	PgMaxConns                         int
+	RedisPoolSize                      int
+	AutoCleanUnauthorized              bool
+	AutoCleanRateLimited               bool
+	AdminSecret                        string
+	AutoCleanFullUsage                 bool
+	AutoCleanError                     bool
+	AutoCleanExpired                   bool
+	LazyMode                           bool
+	ProxyPoolEnabled                   bool
+	FastSchedulerEnabled               bool
+	MaxRetries                         int
+	MaxRateLimitRetries                int
+	AllowRemoteMigration               bool
+	ModelMapping                       string // JSON: {"anthropic_model": "codex_model", ...}
+	CodexModelMapping                  string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
+	ReasoningEffortModels              string // JSON: [{"model":"gpt-5.5","effort":"xhigh"}, ...]
+	BackgroundRefreshIntervalMinutes   int
+	UsageProbeMaxAgeMinutes            int
+	UsageProbeConcurrency              int
+	UsageProbeResponsesFallbackEnabled bool
+	RecoveryProbeIntervalMinutes       int
+	SchedulerMode                      string
+	AffinityMode                       string // session 粘性模式: bounded / off / strict
+	ResinURL                           string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
+	ResinPlatformName                  string // Resin 平台标识，例如 codex2api
+	PromptFilterEnabled                bool
+	PromptFilterMode                   string
+	PromptFilterThreshold              int
+	PromptFilterStrictThreshold        int
+	PromptFilterLogMatches             bool
+	PromptFilterMaxTextLength          int
+	PromptFilterSensitiveWords         string
+	PromptFilterCustomPatterns         string
+	PromptFilterDisabledPatterns       string
+	ClientCompatMode                   string
+	CodexMinCLIVersion                 string
+	UsageLogMode                       string
+	UsageLogBatchSize                  int
+	UsageLogFlushIntervalSeconds       int
+	StreamFlushPolicy                  string
+	StreamFlushIntervalMS              int
+	StreamIdleTimeoutSeconds           int
+	StreamKeepaliveIntervalSeconds     int
+	FirstTokenTimeoutSeconds           int
+	BillingTierPolicy                  string
+	ImageStorageConfig                 string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
+	AccountAlertConfig                 string // JSON: 企业微信账号池告警配置
+	ShowFullUsageNumbers               bool
+	CodexForceWebsocket                bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
+	CodexWSKeepaliveEnabled            bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
+	CodexWSKeepaliveIntervalSec        int  // WS 保活 Ping 间隔（秒），默认 60
+	CodexWSHideUpstreamErrors          bool // 隐藏上游 WS 原始错误，默认 true
+	CodexWSSilentRetryEnabled          bool // 首包前 WS 上游错误静默换号重试，默认 true
+	CodexWSSilentMaxRetries            int  // WS 静默换号最大重试次数，默认 2
 }
 
 // GetSystemSettings 加载全局设置
@@ -1342,10 +1351,11 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(lazy_mode, false),
 		       COALESCE(model_mapping, '{}'),
 		       COALESCE(codex_model_mapping, '{}'),
-		       COALESCE(background_refresh_interval_minutes, 2),
-		       COALESCE(usage_probe_max_age_minutes, 10),
-		       COALESCE(usage_probe_concurrency, 16),
-		       COALESCE(recovery_probe_interval_minutes, 30),
+			       COALESCE(background_refresh_interval_minutes, 2),
+			       COALESCE(usage_probe_max_age_minutes, 10),
+			       COALESCE(usage_probe_concurrency, 16),
+			       COALESCE(usage_probe_responses_fallback_enabled, true),
+			       COALESCE(recovery_probe_interval_minutes, 30),
 		       COALESCE(scheduler_mode, 'round_robin'),
 		       COALESCE(affinity_mode, 'bounded'),
 		       COALESCE(resin_url, ''),
@@ -1374,18 +1384,21 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(account_alert_config, '{}'),
 		       COALESCE(background_config, '{}'),
 		       COALESCE(show_full_usage_numbers, false),
-		       COALESCE(reasoning_effort_models, '[]'),
-		       COALESCE(codex_force_websocket, false),
-		       COALESCE(codex_ws_keepalive_enabled, false),
-		       COALESCE(codex_ws_keepalive_interval_sec, 60)
-		FROM system_settings WHERE id = 1
-	`).Scan(
+			       COALESCE(reasoning_effort_models, '[]'),
+			       COALESCE(codex_force_websocket, false),
+			       COALESCE(codex_ws_keepalive_enabled, false),
+			       COALESCE(codex_ws_keepalive_interval_sec, 60),
+			       COALESCE(codex_ws_hide_upstream_errors, true),
+			       COALESCE(codex_ws_silent_retry_enabled, true),
+			       COALESCE(codex_ws_silent_max_retries, 2)
+			FROM system_settings WHERE id = 1
+		`).Scan(
 		&s.SiteName, &s.SiteLogo,
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping, &s.CodexModelMapping,
-		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.UsageProbeConcurrency, &s.RecoveryProbeIntervalMinutes,
+		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.UsageProbeConcurrency, &s.UsageProbeResponsesFallbackEnabled, &s.RecoveryProbeIntervalMinutes,
 		&s.SchedulerMode,
 		&s.AffinityMode,
 		&s.ResinURL, &s.ResinPlatformName,
@@ -1403,6 +1416,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexForceWebsocket,
 		&s.CodexWSKeepaliveEnabled,
 		&s.CodexWSKeepaliveIntervalSec,
+		&s.CodexWSHideUpstreamErrors,
+		&s.CodexWSSilentRetryEnabled,
+		&s.CodexWSSilentMaxRetries,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1426,8 +1442,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				id, site_name, site_logo, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
 				fast_scheduler_enabled, max_retries, max_rate_limit_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, lazy_mode, model_mapping, codex_model_mapping,
-				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
-				usage_probe_concurrency,
+				background_refresh_interval_minutes, usage_probe_max_age_minutes, usage_probe_concurrency,
+				usage_probe_responses_fallback_enabled, recovery_probe_interval_minutes,
 				resin_url, resin_platform_name, prompt_filter_enabled, prompt_filter_mode, prompt_filter_threshold,
 				prompt_filter_strict_threshold, prompt_filter_log_matches, prompt_filter_max_text_length,
 				prompt_filter_sensitive_words, prompt_filter_custom_patterns, prompt_filter_disabled_patterns,
@@ -1444,9 +1460,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				reasoning_effort_models,
 				codex_force_websocket,
 				codex_ws_keepalive_enabled,
-				codex_ws_keepalive_interval_sec
+				codex_ws_keepalive_interval_sec,
+				codex_ws_hide_upstream_errors,
+				codex_ws_silent_retry_enabled,
+				codex_ws_silent_max_retries
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63)
 			ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1474,6 +1493,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				background_refresh_interval_minutes = EXCLUDED.background_refresh_interval_minutes,
 				usage_probe_max_age_minutes = EXCLUDED.usage_probe_max_age_minutes,
 				usage_probe_concurrency = EXCLUDED.usage_probe_concurrency,
+				usage_probe_responses_fallback_enabled = EXCLUDED.usage_probe_responses_fallback_enabled,
 				recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
 				resin_url               = EXCLUDED.resin_url,
 				resin_platform_name     = EXCLUDED.resin_platform_name,
@@ -1506,13 +1526,16 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				reasoning_effort_models = EXCLUDED.reasoning_effort_models,
 				codex_force_websocket = EXCLUDED.codex_force_websocket,
 				codex_ws_keepalive_enabled = EXCLUDED.codex_ws_keepalive_enabled,
-				codex_ws_keepalive_interval_sec = EXCLUDED.codex_ws_keepalive_interval_sec
-		`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
+				codex_ws_keepalive_interval_sec = EXCLUDED.codex_ws_keepalive_interval_sec,
+				codex_ws_hide_upstream_errors = EXCLUDED.codex_ws_hide_upstream_errors,
+				codex_ws_silent_retry_enabled = EXCLUDED.codex_ws_silent_retry_enabled,
+				codex_ws_silent_max_retries = EXCLUDED.codex_ws_silent_max_retries
+			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping, s.CodexModelMapping,
-		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
-		s.UsageProbeConcurrency,
+		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.UsageProbeConcurrency,
+		s.UsageProbeResponsesFallbackEnabled, s.RecoveryProbeIntervalMinutes,
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
 		s.PromptFilterStrictThreshold, s.PromptFilterLogMatches, s.PromptFilterMaxTextLength,
 		s.PromptFilterSensitiveWords, s.PromptFilterCustomPatterns, s.PromptFilterDisabledPatterns,
@@ -1521,7 +1544,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.StreamIdleTimeoutSeconds, s.StreamKeepaliveIntervalSeconds, s.FirstTokenTimeoutSeconds,
 		s.BillingTierPolicy, s.ImageStorageConfig, s.AccountAlertConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode),
 		s.BackgroundConfig, s.ShowFullUsageNumbers, reasoningEffortModels,
-		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec))
+		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec),
+		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries))
 	return err
 }
 
@@ -1531,6 +1555,17 @@ func normalizeCodexWSKeepaliveInterval(sec int) int {
 		return 60
 	}
 	return sec
+}
+
+// normalizeCodexWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
+func normalizeCodexWSSilentMaxRetries(retries int) int {
+	if retries < 0 {
+		return 0
+	}
+	if retries > 10 {
+		return 10
+	}
+	return retries
 }
 
 // normalizeAffinityMode 把 SystemSettings.AffinityMode 落库前归一,空字符串 → "bounded"。

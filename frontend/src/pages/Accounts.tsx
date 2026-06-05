@@ -2576,7 +2576,7 @@ export default function Accounts() {
 
   return (
     <div
-      className="relative"
+      className="relative @container/accounts"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -2857,8 +2857,8 @@ export default function Accounts() {
             </div>
           ) : null}
 
-          <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1fr)_max-content]">
-            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:flex-wrap max-lg:overflow-visible xl:flex-nowrap">
+          <div className="mb-3 grid gap-3 @min-[1600px]/accounts:grid-cols-[minmax(0,1fr)_max-content]">
+            <div className="toolbar-surface flex flex-wrap items-center gap-1.5 overflow-visible @min-[1600px]/accounts:flex-nowrap">
               <span className="shrink-0 whitespace-nowrap font-semibold text-foreground">
                 {t("accounts.filter")}
               </span>
@@ -2906,7 +2906,7 @@ export default function Accounts() {
               ))}
             </div>
 
-            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:flex-wrap max-lg:overflow-visible xl:flex-nowrap">
+            <div className="toolbar-surface flex flex-wrap items-center gap-1.5 overflow-visible @min-[1600px]/accounts:flex-nowrap">
               <span className="shrink-0 whitespace-nowrap font-semibold text-foreground">
                 {t("accounts.schedulerView")}
               </span>
@@ -2933,7 +2933,7 @@ export default function Accounts() {
             </div>
           </div>
 
-          <div className="mb-4 flex items-center gap-2 overflow-visible max-lg:flex-wrap max-lg:overflow-visible">
+          <div className="mb-4 flex flex-wrap items-center gap-2 overflow-visible @min-[1600px]/accounts:flex-nowrap">
             <div className="relative w-64 shrink-0 max-sm:w-full">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
               <Input
@@ -3047,7 +3047,7 @@ export default function Accounts() {
               <FolderOpen className="size-3.5" />
               {t("accounts.groupManage")}
             </Button>
-            <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            <div className="flex w-full shrink-0 items-center gap-1.5 @min-[1600px]/accounts:ml-auto @min-[1600px]/accounts:w-auto">
               <div className="hidden lg:inline-flex items-center rounded-md border border-border bg-muted/50 p-0.5">
                 <button
                   type="button"
